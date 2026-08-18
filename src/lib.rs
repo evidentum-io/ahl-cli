@@ -3,7 +3,9 @@
 pub mod cache;
 pub mod checkpoint;
 pub mod commands;
+pub mod corpus;
 pub mod duration;
+pub mod enumerate;
 pub mod error;
 pub mod evaluation;
 pub mod governance;
@@ -16,3 +18,4 @@ pub mod profile;
 pub mod report;
 pub mod secure;
 pub mod transcript;
+pub mod witness;
