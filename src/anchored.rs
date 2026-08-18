@@ -729,6 +729,34 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_by_entry_id_is_content_checked_against_the_id_requested() {
+        // Adaptor §10.1.1 verifier duty 1: recompute the digest and reject unless it equals the
+        // requested id. That makes retrieval self-checking — a deployment cannot substitute a
+        // different entry, and the bytes need not be trusted because of their source.
+        let fixture = MirrorFixture::conformance();
+        let mirror = Mirror::new(
+            &fixture,
+            crate::testing::MIRROR,
+            crate::checkpoint::TEST_LOG_PROFILE,
+            crate::policy::NetworkLimits::default(),
+        )
+        .expect("known profile");
+        let identity = crate::testing::identity_at(&fixture, 8);
+
+        let anchored = fixture.establish(8).expect("established");
+        let (_, envelope) = &anchored.entries[1];
+        let entry_id = ahl_core::entry_id(envelope);
+        assert_eq!(&mirror.entry_by_id(&entry_id, &identity).expect("retrieved"), envelope);
+
+        // Absence is unavailability, never a negative result about the corpus.
+        let error = mirror
+            .entry_by_id(&format!("sha256:{}", "aa".repeat(32)), &identity)
+            .expect_err("absent");
+        assert!(error.to_string().contains("never a negative result"), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+    }
+
+    #[test]
     fn required_tree_roots_are_collected_before_traversal_begins() {
         let fixture = MirrorFixture::conformance();
         let anchored = fixture.establish(fixture.newest_tree_size()).expect("established");
