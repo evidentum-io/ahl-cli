@@ -58,6 +58,11 @@ ureq = { version = "3.4", default-features = false, features = ["rustls", "gzip"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [dev-dependencies]
+# The same pinned revision the library depends on, so cargo unifies them; the integration
+# tests need it to recompute the published Merkle vectors the way a foreign implementer would.
+atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }
+# Only for the decompression-bomb fixture: `ureq`'s `gzip` feature already brings it in, so
+# this adds no new entry to the dependency tree.
 flate2 = "1.1.9"
 hex = "0.4.3"
 tempfile = "3.27.0"

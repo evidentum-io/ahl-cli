@@ -380,3 +380,53 @@ fn the_published_malformed_statements_are_reported_when_walked() {
         run.output()
     );
 }
+
+#[test]
+fn the_published_log_tree_vector_recomputes_under_the_profile_leaf_construction() {
+    // The log tree is the one tree that uses the adaptor's own leaf construction; the
+    // record-sorted trees of §9 use plain leaf hashing, and applying one to the other is the
+    // asymmetry the profile calls out. Recomputing every published root from the published
+    // entries is what proves this build applies the right one.
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("vectors/merkle/log-tree.json")).expect("vector"),
+    )
+    .expect("parses");
+
+    let mut leaves: Vec<atl_core::core::merkle::Hash> = Vec::new();
+    for entry in vector["entries"].as_array().expect("entries") {
+        let published = entry["leaf_hash"].as_str().expect("leaf hash");
+        let leaf = ahl_core::parse_hash_hex(published).expect("family string");
+        leaves.push(leaf);
+    }
+    assert!(leaves.len() >= 25);
+
+    for member in vector["roots"].as_array().expect("roots") {
+        let tree_size = usize::try_from(member["tree_size"].as_u64().expect("tree size"))
+            .expect("small test size");
+        let recomputed = atl_core::core::merkle::compute_root(&leaves[..tree_size]);
+        assert_eq!(
+            ahl_core::hash_hex(&recomputed),
+            member["root"].as_str().expect("root"),
+            "{} did not recompute",
+            member["name"]
+        );
+    }
+
+    // And the published inclusion path opens the checkpoint it names.
+    let inclusion = &vector["inclusion"];
+    let leaf_index = inclusion["leaf_index"].as_u64().expect("leaf index");
+    let tree_size = inclusion["tree_size"].as_u64().expect("tree size");
+    let path: Vec<String> = inclusion["path"]
+        .as_array()
+        .expect("path")
+        .iter()
+        .filter_map(|hash| hash.as_str().map(str::to_owned))
+        .collect();
+    let proof = ahl_core::proof_from_hex(leaf_index, tree_size, &path).expect("path");
+    let root = ahl_core::parse_hash_hex(inclusion["root"].as_str().expect("root")).expect("root");
+    let leaf = leaves[usize::try_from(leaf_index).expect("small test size")];
+    assert!(
+        atl_core::core::merkle::verify_inclusion(&leaf, &proof, &root).expect("well-formed"),
+        "the published inclusion path must open its published root"
+    );
+}
