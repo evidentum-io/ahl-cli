@@ -1,0 +1,109 @@
+{
+  "sha256:3c7e01dcfdc73cca9c6030d1acee992a1682f1f9beef3f539f41edd8227a1c33": [
+    {
+      "dataset": "customers",
+      "record": "hmac-sha256:04de2effaa7ad9f21761b7338449a4aba8c9edb59a90fd96236c31fdcd8ab46d",
+      "role": "reference",
+      "statement": "sha256:939f1c1358227b5c86ca12167927b06f5d867b19eeab99737dad78dc667ac882"
+    },
+    {
+      "dataset": "customers",
+      "record": "hmac-sha256:a2d4ab5d728fa03cd366fac0f6b4d65c419c353f56521302926604f11d3471c1",
+      "role": "feature",
+      "statement": "sha256:f706aea0d65088ad9d4b8b4c2b86e72dc03af7eca6dc9d309af5e532ce96ed74"
+    },
+    {
+      "dataset": "scores",
+      "record": "sha256:8465148cf16c5b91c0e6001f3e3a985ae456890500745f5893a60c0692bb1d7c",
+      "role": "feature",
+      "statement": "sha256:c046d7ab3d6c8dc58ae3792edc2104d2782996f4ba0fecffd156198f1a9d674f"
+    }
+  ],
+  "sha256:5a40fa564bc4d3d9d87ef1a09b0187ae44bbe919ef6abaa6fc1274d937f0f7d6": [
+    {
+      "dataset": "scores",
+      "disposition": "invalidated",
+      "record": "sha256:a37addcc94a342604dc765939fb85c71dd0f21a1906bbf62d64a77f4cb25e233"
+    }
+  ],
+  "sha256:a19b569a95b55531bf4df657e6e03bc15258ce9b3f693e8692d5a4602dcf53f1": [
+    {
+      "assessment": "sha256:81af6cfe105fb10380549c7290b09c7910c90cd3e860777ab7bbccc5b91be396",
+      "dataset": "scores",
+      "disposition": "assessed_unaffected",
+      "record": "sha256:250be06f68500436146b6cd0da75987c8eb1902e1ee650d52d4e368c8dabcdf5"
+    },
+    {
+      "dataset": "scores",
+      "disposition": "invalidated",
+      "record": "sha256:54805948541052fc8111ac220cbdd5bcb3892e9899ffb96697b76aa7b7d42798"
+    },
+    {
+      "dataset": "scores",
+      "disposition": "recomputed",
+      "record": "sha256:7f706bff69ab07703a27a6770f401c2b302e9bca264129e57d517a10a54f25d1",
+      "successor_statement": "sha256:c046d7ab3d6c8dc58ae3792edc2104d2782996f4ba0fecffd156198f1a9d674f"
+    },
+    {
+      "dataset": "scores",
+      "disposition": "invalidated",
+      "record": "sha256:df31b93a28e3de74b910bd72977edd310e9d4dfd2c8e66d38eab5c7303d6abfe"
+    }
+  ],
+  "sha256:a6971f6e1a190eeaedfe7a0dc4e50d5a63a0ff7715059ad2e4474b477e46d78f": [
+    {
+      "dataset": "scores",
+      "inputs": {
+        "input_set_count": 3,
+        "input_set_root": "sha256:3c7e01dcfdc73cca9c6030d1acee992a1682f1f9beef3f539f41edd8227a1c33"
+      },
+      "record": "sha256:2fa4f863cc3d704bd6db36bcb152e8fbbc3773cc36f5594074cecd9c016916b0"
+    },
+    {
+      "dataset": "scores",
+      "inputs": {
+        "input_set_count": 3,
+        "input_set_root": "sha256:3c7e01dcfdc73cca9c6030d1acee992a1682f1f9beef3f539f41edd8227a1c33"
+      },
+      "record": "sha256:5929597d694c6d57301d1d81edac6047f0676abc36fc7560d6ce0b74e5bd777c"
+    }
+  ],
+  "sha256:e7d5c31308ceff47b34c2f8f4dce9b90f2f54197c27e32432b2bd8625e3ae51a": [
+    {
+      "dataset": "scores",
+      "inputs": [
+        {
+          "dataset": "customers",
+          "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
+          "role": "feature",
+          "statement": "sha256:38fb4ddd5f69483d2a9fc18226e290f8aa5951bacf7c49220ee1d36355acffd5"
+        }
+      ],
+      "record": "sha256:250be06f68500436146b6cd0da75987c8eb1902e1ee650d52d4e368c8dabcdf5"
+    },
+    {
+      "dataset": "scores",
+      "inputs": [
+        {
+          "dataset": "customers",
+          "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
+          "role": "feature",
+          "statement": "sha256:38fb4ddd5f69483d2a9fc18226e290f8aa5951bacf7c49220ee1d36355acffd5"
+        }
+      ],
+      "record": "sha256:54805948541052fc8111ac220cbdd5bcb3892e9899ffb96697b76aa7b7d42798"
+    },
+    {
+      "dataset": "scores",
+      "inputs": [
+        {
+          "dataset": "customers",
+          "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
+          "role": "feature",
+          "statement": "sha256:38fb4ddd5f69483d2a9fc18226e290f8aa5951bacf7c49220ee1d36355acffd5"
+        }
+      ],
+      "record": "sha256:df31b93a28e3de74b910bd72977edd310e9d4dfd2c8e66d38eab5c7303d6abfe"
+    }
+  ]
+}

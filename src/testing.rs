@@ -385,6 +385,11 @@ impl MirrorFixture {
         if let Some(entry_id) = path.strip_prefix("/v1/entries/") {
             return self.entry(entry_id);
         }
+        if witness_path.starts_with("/v1/logs/") && witness_path.ends_with("/checkpoints") {
+            let history: Vec<Value> =
+                self.published_sizes().into_iter().map(|size| self.cosigned(size)).collect();
+            return ok(&history);
+        }
         if witness_path.starts_with("/v1/logs/") && witness_path.ends_with("/checkpoint") {
             return ok(&self.cosigned(self.newest_tree_size()));
         }
@@ -557,6 +562,45 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
     }
 }
 
+/// The corpus's committed tree material, as the root-to-leaves map a closure needs.
+///
+/// Adaptor profile §9 makes the complete leaf material of every committed tree corpus material
+/// that a deployment MUST publish, but neither the profile nor `ahl-mirror` defines an
+/// interface for serving it, so a client is handed it out of band. The conformance corpus
+/// publishes it as merkle vectors; this assembles them into the map the CLI accepts.
+#[must_use]
+pub fn tree_material(root: &Path) -> Value {
+    let dir = root.join("vectors/merkle");
+    let mut material = serde_json::Map::new();
+    for (file, root_member) in [
+        ("batch-tree.json", "outputs_root"),
+        ("wide-outputs-tree.json", "outputs_root"),
+        ("input-set-tree.json", "input_set_root"),
+        ("disposition-tree.json", "affected_root"),
+        ("challenge-disposition-tree.json", "affected_root"),
+    ] {
+        let Ok(bytes) = std::fs::read(dir.join(file)) else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let (Some(anchored_root), Some(leaves)) =
+            (value.get(root_member).and_then(Value::as_str), value.get("leaves"))
+        else {
+            continue;
+        };
+        material.insert(anchored_root.to_owned(), leaves.clone());
+    }
+    Value::Object(material)
+}
+
+/// Write [`tree_material`] into `dir` and return the path.
+#[must_use]
+pub fn tree_material_file(dir: &Path) -> PathBuf {
+    let path = dir.join("tree-material.json");
+    let bytes = serde_json::to_vec(&tree_material(&MirrorFixture::corpus_root()))
+        .unwrap_or_else(|_| b"{}".to_vec());
+    let _ = std::fs::write(&path, bytes);
+    path
+}
+
 /// The identity of the fixture's checkpoint at `tree_size`, for cache-key construction.
 #[must_use]
 pub fn identity_at(fixture: &MirrorFixture, tree_size: u64) -> CheckpointIdentity {
@@ -632,10 +676,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tampered_entry_changes_the_served_bytes_and_the_root() {
+    fn a_tampered_entry_changes_the_served_bytes_but_never_the_committed_root() {
         let clean = MirrorFixture::conformance();
         let tampered = MirrorFixture::conformance().with_tampered_entry(3);
-        assert_ne!(clean.root_at(8), tampered.root_at(8));
+        // The log signed one tree; the mirror serves another. That mismatch is the whole
+        // scenario, so the committed root must stay put while the bytes change.
+        assert_eq!(clean.root_at(8), tampered.root_at(8));
+        assert_ne!(clean.entry_bytes(3), tampered.entry_bytes(3));
+        assert_ne!(clean.leaf_hashes(8), tampered.leaf_hashes(8));
     }
 
     #[test]

@@ -152,6 +152,15 @@ pub struct Report {
     /// omit real ones, so this is not a subset of the true closure and is never a partial one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology_affected: Option<Vec<RecordOut>>,
+    /// The evidenced assertion set. Present only on `reconstruct`.
+    ///
+    /// §6 fixes the top-level field set for the verdict surface and does not name a member for
+    /// a reconstruction result, which the command nevertheless has to return. It is added
+    /// here on the same footing as `affected` and `topology_affected` — present only for the
+    /// command that produces it — and the addition is recorded in the crate README rather than
+    /// made silently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconstruction: Option<crate::commands::reconstruct::ReconstructionOut>,
 }
 
 impl Report {
@@ -182,6 +191,7 @@ impl Report {
             receipt_note: None,
             affected: None,
             topology_affected: None,
+            reconstruction: None,
         }
     }
 

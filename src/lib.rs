@@ -3,6 +3,7 @@
 pub mod anchored;
 pub mod cache;
 pub mod checkpoint;
+pub mod cli;
 pub mod commands;
 pub mod corpus;
 pub mod duration;

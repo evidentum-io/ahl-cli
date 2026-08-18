@@ -166,6 +166,12 @@ pub trait Fetcher: std::fmt::Debug {
     fn fetch(&self, request: &Request) -> Result<Response, FetchFailure>;
 }
 
+impl Fetcher for Box<dyn Fetcher> {
+    fn fetch(&self, request: &Request) -> Result<Response, FetchFailure> {
+        (**self).fetch(request)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Budget wrapper
 // ---------------------------------------------------------------------------
