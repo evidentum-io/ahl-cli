@@ -1,5 +1,6 @@
 //! placeholder
 #![forbid(unsafe_code)]
+pub mod anchored;
 pub mod cache;
 pub mod checkpoint;
 pub mod commands;
@@ -17,5 +18,6 @@ pub mod policy;
 pub mod profile;
 pub mod report;
 pub mod secure;
+pub mod testing;
 pub mod transcript;
 pub mod witness;
