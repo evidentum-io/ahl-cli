@@ -192,6 +192,10 @@ pub fn load_tree_material(path: &Path, limits: LocalLimits) -> CliResult<TreeMat
 /// Nothing here adjudicates: the corpus is unauthenticated input, so a violation found in it
 /// says something about the file the operator handed over and nothing about the log.
 #[must_use]
+// One pass over one corpus, raising every finding it can. Splitting the per-statement checks
+// out would hide that they are exhaustive over one entry, which is the property that matters:
+// a violation is never skipped because an earlier one fired.
+#[allow(clippy::too_many_lines)]
 pub fn walk(corpus: &Corpus) -> Vec<Finding> {
     let mut findings = corpus.findings.clone();
     let mut statement_ids: BTreeMap<String, u64> = BTreeMap::new();
@@ -242,7 +246,9 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
             // Never skipped, never inert.
             findings.push(Finding::new(
                 "unknown-statement-type",
-                format!("entry {index} declares statement type `{kind}`, which is not one of the seven"),
+                format!(
+                    "entry {index} declares statement type `{kind}`, which is not one of the seven"
+                ),
             ));
         }
 
@@ -250,7 +256,9 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
         if kind == "manifest" && carries_manifest {
             findings.push(Finding::new(
                 "manifest-statement-carries-manifest-member",
-                format!("entry {index} is a manifest statement and must carry no `manifest` member"),
+                format!(
+                    "entry {index} is a manifest statement and must carry no `manifest` member"
+                ),
             ));
         } else if kind != "manifest" && !carries_manifest && STATEMENT_TYPES.contains(&kind) {
             findings.push(Finding::new(
@@ -262,7 +270,9 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
         if matches!(kind, "retraction" | "correction") && payload.get("scope").is_none() {
             findings.push(Finding::new(
                 "trigger-without-scope",
-                format!("entry {index} is a trigger with no `scope`; scopeless triggers are malformed"),
+                format!(
+                    "entry {index} is a trigger with no `scope`; scopeless triggers are malformed"
+                ),
             ));
         }
         if kind == "correction" && payload.get("replacement").is_none() {
@@ -278,11 +288,15 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
         match envelope.get("signatures").and_then(Value::as_array) {
             None => findings.push(Finding::new(
                 "statement-unsigned",
-                format!("entry {index} carries no signatures; unsigned objects are not AHL statements"),
+                format!(
+                    "entry {index} carries no signatures; unsigned objects are not AHL statements"
+                ),
             )),
             Some(signatures) if signatures.is_empty() => findings.push(Finding::new(
                 "statement-unsigned",
-                format!("entry {index} carries no signatures; unsigned objects are not AHL statements"),
+                format!(
+                    "entry {index} carries no signatures; unsigned objects are not AHL statements"
+                ),
             )),
             Some(_) => {
                 if let Ok(governance) = &governance {
@@ -317,7 +331,9 @@ fn derivation_findings(index: u64, payload: &Value) -> Vec<Finding> {
         match payload.get("outputs").and_then(Value::as_array) {
             None => findings.push(Finding::new(
                 "derivation-without-outputs",
-                format!("entry {index} is a derivation carrying neither `outputs` nor `outputs_root`"),
+                format!(
+                    "entry {index} is a derivation carrying neither `outputs` nor `outputs_root`"
+                ),
             )),
             Some(outputs) => {
                 for (position, output) in outputs.iter().enumerate() {
@@ -440,10 +456,10 @@ mod tests {
         })
     }
 
-    fn corpus_of(items: Vec<Value>) -> Corpus {
+    fn corpus_of(items: &[Value]) -> Corpus {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("c.json");
-        std::fs::write(&path, serde_json::to_vec(&items).expect("serialize")).expect("write");
+        std::fs::write(&path, serde_json::to_vec(items).expect("serialize")).expect("write");
         load(&path, limits()).expect("loads")
     }
 
@@ -451,7 +467,7 @@ mod tests {
     fn every_rule_violation_in_a_hostile_corpus_is_reported_and_none_is_skipped() {
         let key = producer();
         let stranger = TestKey::from_seed_hex("stranger", &"09".repeat(32)).expect("seed");
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             genesis(),
             json!({ "entry_index": 1, "envelope": ahl_core::envelope(
                 json!({ "type": "attestation", "manifest": "sha256:aa" }), &key) }),
@@ -494,7 +510,7 @@ mod tests {
 
     #[test]
     fn findings_are_ordered_and_duplicate_free() {
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             genesis(),
             json!({ "entry_index": 1, "envelope": ahl_core::envelope(
                 json!({ "type": "attestation", "manifest": "sha256:aa" }), &producer()) }),
@@ -510,7 +526,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_entry_index_is_reported_rather_than_silently_overwriting() {
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             genesis(),
             json!({ "entry_index": 1, "envelope": ahl_core::envelope(
                 json!({ "type": "ingestion", "manifest": "sha256:aa" }), &producer()) }),
@@ -526,7 +542,7 @@ mod tests {
         let key = producer();
         let payload = json!({ "type": "ingestion", "manifest": "sha256:aa", "dataset": "d",
                               "record": "sha256:bb" });
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             genesis(),
             json!({ "entry_index": 1, "envelope": ahl_core::envelope(payload.clone(), &key) }),
             json!({ "entry_index": 2, "envelope": ahl_core::envelope(payload, &key) }),
@@ -541,7 +557,7 @@ mod tests {
 
     #[test]
     fn an_unresolvable_governance_chain_is_reported_rather_than_skipping_signature_checks() {
-        let corpus = corpus_of(vec![json!({
+        let corpus = corpus_of(&[json!({
             "entry_index": 0,
             "envelope": ahl_core::envelope(
                 json!({ "type": "ingestion", "manifest": "sha256:aa" }), &producer()),
@@ -552,7 +568,7 @@ mod tests {
 
     #[test]
     fn malformed_elements_are_reported_rather_than_dropped_silently() {
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             json!({ "envelope": { "payload": {} } }),
             json!({ "entry_index": 1 }),
             json!({ "entry_index": 2, "envelope": "not an object" }),
@@ -565,7 +581,7 @@ mod tests {
 
     #[test]
     fn a_sparse_corpus_is_refused_rather_than_walked_with_invented_indexes() {
-        let corpus = corpus_of(vec![
+        let corpus = corpus_of(&[
             genesis(),
             json!({ "entry_index": 7, "envelope": ahl_core::envelope(
                 json!({ "type": "ingestion", "manifest": "sha256:aa" }), &producer()) }),

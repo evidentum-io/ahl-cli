@@ -63,10 +63,7 @@ fn resolve_configured(id: &str, configured: &ConfiguredProfile) -> CliResult<Res
         return Err(CliError::ProfileBroken {
             id: id.to_owned(),
             path: configured.path.display().to_string(),
-            detail: format!(
-                "document hashes to {computed}, policy pins {}",
-                configured.hash
-            ),
+            detail: format!("document hashes to {computed}, policy pins {}", configured.hash),
         });
     }
     Ok(ResolvedProfile { id: id.to_owned(), hash: computed, size: bytes.len() })

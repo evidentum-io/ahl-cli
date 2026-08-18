@@ -51,7 +51,8 @@ fn output_error(path: &Path, detail: impl Into<String>) -> CliError {
 /// [`CliError::Output`] if the parent is not a directory, the destination exists (and
 /// `force` is [`Force::No`]), or no no-replace primitive is available on this platform.
 pub fn install(path: &Path, bytes: &[u8], force: Force) -> CliResult<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent =
+        path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .ok_or_else(|| output_error(path, "destination has no file name component"))?

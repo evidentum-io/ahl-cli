@@ -6,6 +6,11 @@
 //! binary and not only through the library, and an exit-code contract that is only ever
 //! asserted in-process is not an exit-code contract.
 
+// Shared by four integration-test binaries, each of which uses a different subset.
+#![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::missing_panics_doc)]
+
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -92,9 +97,10 @@ impl Default for PolicySpec<'_> {
 
 /// Write a policy file into `dir` and return its path.
 pub fn policy(dir: &Path, spec: &PolicySpec<'_>) -> PathBuf {
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(corpus().join("receipts/index.json")).expect("index"))
-            .expect("index parses");
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("receipts/index.json")).expect("index"),
+    )
+    .expect("index parses");
     let block = &index["policy"];
     let hash = block["adaptor_profiles"]["ahl-test-log-v1"]["hash"].as_str().unwrap_or_default();
     let key_ids: Vec<String> = block["genesis_key_ids"]
@@ -118,10 +124,11 @@ pub fn policy(dir: &Path, spec: &PolicySpec<'_>) -> PathBuf {
         } else {
             corpus().join("adaptor/ahl-test-log-v1.md")
         };
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "[policy.adaptor_profiles.ahl-test-log-v1]\nhash = \"{hash}\"\npath = \"{}\"\n\n",
             document.display()
-        ));
+        );
     }
     if spec.dataset_key {
         let key = dir.join("customers.key");
@@ -132,15 +139,15 @@ pub fn policy(dir: &Path, spec: &PolicySpec<'_>) -> PathBuf {
     if spec.mirror.is_some() || spec.witness.is_some() {
         text.push_str("[endpoints]\n");
         if let Some(mirror) = spec.mirror {
-            text.push_str(&format!("mirror = \"{mirror}\"\n"));
+            let _ = writeln!(text, "mirror = \"{mirror}\"");
         }
         if let Some(witness) = spec.witness {
-            text.push_str(&format!("witness = \"{witness}\"\n"));
+            let _ = writeln!(text, "witness = \"{witness}\"");
         }
         text.push('\n');
     }
     if let Some(limits) = spec.network_limits {
-        text.push_str(&format!("[limits.network]\n{limits}\n"));
+        let _ = writeln!(text, "[limits.network]\n{limits}");
     }
 
     let path = dir.join("policy.toml");

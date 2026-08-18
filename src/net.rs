@@ -11,7 +11,7 @@
 //!
 //! * **HTTPS only.** `--insecure` does not exist. Plain `http://` is accepted only when the
 //!   **resolved peer address** is loopback — checked on the address actually connected to, not
-//!   on the hostname text. [`PinningResolver`] resolves once and hands the connector exactly
+//!   on the hostname text. The pinning resolver resolves once and hands the connector exactly
 //!   those addresses, so the name cannot be re-resolved to something else between the check
 //!   and the connection; that is what closes DNS rebinding.
 //! * **Redirects are not followed at all.** A redirect is a fetch failure naming the location.
@@ -245,11 +245,16 @@ impl<F: Fetcher> Fetcher for Budgeted<F> {
 
         let response = self.inner.fetch(request)?;
 
-        let mut state = self.state.lock().map_err(|_| {
-            FetchFailure::Budget("network budget accounting is unusable".to_owned())
-        })?;
-        state.total_bytes = state.total_bytes.saturating_add(response.body.len() as u64);
-        if state.total_bytes > self.limits.max_total_bytes {
+        let spent = {
+            let mut state = self.state.lock().map_err(|_| {
+                FetchFailure::Budget("network budget accounting is unusable".to_owned())
+            })?;
+            state.total_bytes = state
+                .total_bytes
+                .saturating_add(u64::try_from(response.body.len()).unwrap_or(u64::MAX));
+            state.total_bytes
+        };
+        if spent > self.limits.max_total_bytes {
             return Err(FetchFailure::Budget(format!(
                 "total response budget of {} bytes exhausted",
                 self.limits.max_total_bytes
@@ -282,8 +287,10 @@ impl Resolver for PinningResolver {
         _timeout: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
         let key = authority_key(uri).ok_or(ureq::Error::HostNotFound)?;
-        let pinned = self.pinned.lock().map_err(|_| ureq::Error::HostNotFound)?;
-        let addresses = pinned.get(&key).ok_or(ureq::Error::HostNotFound)?;
+        let addresses = {
+            let pinned = self.pinned.lock().map_err(|_| ureq::Error::HostNotFound)?;
+            pinned.get(&key).cloned().ok_or(ureq::Error::HostNotFound)?
+        };
         let first = *addresses.first().ok_or(ureq::Error::HostNotFound)?;
         let mut out: ResolvedSocketAddrs = ArrayVec::from_fn(|_| first);
         for address in addresses.iter().take(16) {
@@ -357,11 +364,13 @@ impl HttpFetcher {
             detail: "URL carries no host".to_owned(),
         })?;
 
-        let addresses: Vec<std::net::SocketAddr> =
-            key.to_socket_addrs().map_err(|source| FetchFailure::Unreachable {
+        let addresses: Vec<std::net::SocketAddr> = key
+            .to_socket_addrs()
+            .map_err(|source| FetchFailure::Unreachable {
                 url: url.to_owned(),
                 detail: format!("cannot resolve `{key}`: {source}"),
-            })?.collect();
+            })?
+            .collect();
         if addresses.is_empty() {
             return Err(FetchFailure::Unreachable {
                 url: url.to_owned(),
@@ -386,11 +395,14 @@ impl HttpFetcher {
             }
         }
 
-        let mut map = self.resolver.pinned.lock().map_err(|_| FetchFailure::Unreachable {
-            url: url.to_owned(),
-            detail: "resolver state is unusable".to_owned(),
-        })?;
-        map.insert(key, addresses);
+        self.resolver
+            .pinned
+            .lock()
+            .map_err(|_| FetchFailure::Unreachable {
+                url: url.to_owned(),
+                detail: "resolver state is unusable".to_owned(),
+            })?
+            .insert(key, addresses);
         Ok(())
     }
 }
@@ -425,8 +437,8 @@ fn classify_redirect(from: &Uri, url: &str, location: Option<&str>) -> FetchFail
         // A relative `Location` has no authority and therefore cannot leave the origin.
         let host_matches = target.host().is_none() || target.host() == from.host();
         let scheme_ok = match target.scheme_str() {
-            None => true,
-            Some("https") => true,
+            // No scheme is relative; `https` never downgrades; `http` only stays `http`.
+            None | Some("https") => true,
             Some("http") => from.scheme_str() == Some("http"),
             Some(_) => false,
         };
@@ -480,8 +492,7 @@ impl Fetcher for HttpFetcher {
 
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
-            let location =
-                response.headers().get("location").and_then(|value| value.to_str().ok());
+            let location = response.headers().get("location").and_then(|value| value.to_str().ok());
             return Err(classify_redirect(&uri, &request.url, location));
         }
 
@@ -592,11 +603,8 @@ mod tests {
 
     #[test]
     fn a_same_origin_redirect_is_a_fetch_failure_naming_the_location() {
-        let (url, handle) = one_shot(http_response(
-            "302 Found",
-            "location: /v1/elsewhere\r\n",
-            b"",
-        ));
+        let (url, handle) =
+            one_shot(http_response("302 Found", "location: /v1/elsewhere\r\n", b""));
         let fetcher = HttpFetcher::new(limits());
         let failure = fetcher.fetch(&Request::get(format!("{url}/v1/range"))).expect_err("302");
         assert!(matches!(failure, FetchFailure::Unreachable { .. }), "{failure}");
@@ -632,8 +640,7 @@ mod tests {
     fn an_oversized_response_exhausts_the_per_response_budget() {
         let body = vec![b'x'; 4096];
         let (url, handle) = one_shot(http_response("200 OK", "", &body));
-        let fetcher =
-            HttpFetcher::new(NetworkLimits { max_response_bytes: 128, ..limits() });
+        let fetcher = HttpFetcher::new(NetworkLimits { max_response_bytes: 128, ..limits() });
         let failure = fetcher.fetch(&Request::get(format!("{url}/big"))).expect_err("oversized");
         assert!(matches!(failure, FetchFailure::Budget(_)), "{failure}");
         assert!(failure.to_string().contains("after decompression"), "{failure}");
@@ -645,16 +652,14 @@ mod tests {
         // A megabyte of zeroes compresses to about a kilobyte. `Content-Length` is a hint:
         // the budget is spent on what comes out of the decompressor.
         let payload = vec![0u8; 1 << 20];
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&payload).expect("compress");
         let compressed = encoder.finish().expect("finish");
         assert!(compressed.len() < 8192, "test fixture must be small on the wire");
 
         let (url, handle) =
             one_shot(http_response("200 OK", "content-encoding: gzip\r\n", &compressed));
-        let fetcher =
-            HttpFetcher::new(NetworkLimits { max_response_bytes: 65_536, ..limits() });
+        let fetcher = HttpFetcher::new(NetworkLimits { max_response_bytes: 65_536, ..limits() });
         let failure = fetcher.fetch(&Request::get(format!("{url}/bomb"))).expect_err("bomb");
         assert!(matches!(failure, FetchFailure::Budget(_)), "{failure}");
         handle.join().expect("server thread");
@@ -663,8 +668,7 @@ mod tests {
     #[test]
     fn a_compressed_response_within_budget_is_decompressed_and_returned() {
         let payload = b"{\"entries\":[]}".repeat(64);
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&payload).expect("compress");
         let compressed = encoder.finish().expect("finish");
         let (url, handle) =

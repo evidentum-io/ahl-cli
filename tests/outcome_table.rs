@@ -5,10 +5,20 @@
 //! than reasoned about. The two rows that need a hostile or divergent server are driven from
 //! the recorded transcripts in `tests/fixtures/`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::multiple_crate_versions
+)]
+
 mod common;
 
-use common::{ahl_cli, corpus, exchange_body, fixtures, mutate_receipt, mutate_transcript, policy,
-             set_exchange_body, PolicySpec};
+use common::{
+    ahl_cli, corpus, exchange_body, fixtures, mutate_receipt, mutate_transcript, policy,
+    set_exchange_body, PolicySpec,
+};
 
 const AT: &str = "--evaluation-time";
 const FIXED: &str = "2026-08-16T12:00:00Z";
@@ -37,11 +47,7 @@ fn row_receipt_file_unreadable_is_error() {
 fn row_receipt_is_a_directory_not_a_regular_file_is_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = policy(dir.path(), &PolicySpec::default());
-    let run = verify(
-        &policy_path.display().to_string(),
-        &dir.path().display().to_string(),
-        &[],
-    );
+    let run = verify(&policy_path.display().to_string(), &dir.path().display().to_string(), &[]);
     assert_eq!(run.code, 2, "{}", run.stderr);
 }
 
@@ -206,11 +212,7 @@ fn row_unknown_claim_type_is_invalid_never_skipped() {
     let receipt = mutate_receipt(dir.path(), "statement-anchored-valid.ahl", |value| {
         value["claim"]["type"] = serde_json::json!("statement-blessed");
     });
-    let run = verify(
-        &policy_path.display().to_string(),
-        &receipt.display().to_string(),
-        &[],
-    );
+    let run = verify(&policy_path.display().to_string(), &receipt.display().to_string(), &[]);
     assert_eq!(run.code, 1, "an unknown claim type is never inert: {}", run.stderr);
 }
 
@@ -282,8 +284,8 @@ fn row_keyed_binding_without_an_authorized_dataset_key_is_unverifiable() {
 #[test]
 fn row_receipt_limit_exhausted_is_unverifiable() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut text = std::fs::read_to_string(policy(dir.path(), &PolicySpec::default()))
-        .expect("read policy");
+    let mut text =
+        std::fs::read_to_string(policy(dir.path(), &PolicySpec::default())).expect("read policy");
     text.push_str("\n[policy.limits]\nmax_decoded_bytes = 16\n");
     let path = dir.path().join("tiny.toml");
     std::fs::write(&path, text).expect("write");
@@ -366,18 +368,14 @@ fn row_mirror_unreachable_is_unverifiable() {
 fn row_a_malformed_mirror_response_is_unverifiable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path());
-    let transcript = mutate_transcript(
-        dir.path(),
-        "mirror-transcript.json",
-        "garbage.json",
-        |value| {
+    let transcript =
+        mutate_transcript(dir.path(), "mirror-transcript.json", "garbage.json", |value| {
             for exchange in value["exchanges"].as_array_mut().expect("array") {
                 if exchange["url"].as_str().unwrap_or_default().ends_with("/v1/checkpoints") {
                     exchange["body_base64"] = serde_json::json!("bm90IGpzb24=");
                 }
             }
-        },
-    );
+        });
     let run = ahl_cli(&[
         "--policy",
         &policy_path.display().to_string(),

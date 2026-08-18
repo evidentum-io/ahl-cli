@@ -9,7 +9,7 @@
 //! # The §6 mapping
 //!
 //! Every rejection `ahl-core` can produce is mapped explicitly to an outcome. A path not in
-//! that mapping is a defect, not a default, so [`classify`] is a total match over
+//! that mapping is a defect, not a default, so the classifier is a total match over
 //! `ReceiptError` with no wildcard.
 //!
 //! The one mapping that reads oddly is [`ReceiptError::ContentBindingMismatch`], which
@@ -20,7 +20,6 @@
 //! `ahl-core`'s only signal, and the sentinel is pinned by a test here so a change upstream
 //! fails loudly rather than silently turning a `3` into a `1`.
 
-
 use ahl_core::receipt::{verify_receipt, ReceiptError, Verdict};
 use serde_json::Value;
 
@@ -30,9 +29,7 @@ use crate::governance::Governance;
 use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
 use crate::profile;
-use crate::report::{
-    AssuranceOut, CheckpointOut, Completeness, Finding, Report,
-};
+use crate::report::{AssuranceOut, CheckpointOut, Completeness, Finding, Report};
 use crate::secure;
 
 /// The sentinel `ahl-core` puts in `ContentBindingMismatch::recomputed` when the verifier holds
@@ -72,8 +69,7 @@ fn verify(
     options: &Options,
 ) -> CliResult<Report> {
     // Unreadable, absent, or not a regular file: the CLI could not begin (exit 2).
-    let bytes =
-        secure::read_regular("receipt", &options.receipt, policy.local.max_file_bytes)?;
+    let bytes = secure::read_regular("receipt", &options.receipt, policy.local.max_file_bytes)?;
 
     // Bytes present but malformed, non-canonical or structurally invalid: a rule fired against
     // the artifact (exit 1).
@@ -200,7 +196,9 @@ fn succeeded(
                         findings.push(finding);
                     }
                     Ok(None) => {}
-                    Err(detail) => findings.push(Finding::new("witness-freshness-unavailable", detail)),
+                    Err(detail) => {
+                        findings.push(Finding::new("witness-freshness-unavailable", detail));
+                    }
                 }
             }
         }
@@ -213,13 +211,8 @@ fn succeeded(
     };
     let reason_code = if outcome == Outcome::Valid { "verified" } else { "witness-stale" };
 
-    let mut report = Report::new(
-        outcome,
-        reason_code,
-        reason,
-        evaluation.rendered.clone(),
-        evaluation.source,
-    );
+    let mut report =
+        Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
     report.claim_type = Some(verdict.claim_type.clone());
     // Never stronger than the boundary `ahl_core::receipt::Verdict` carries.
     report.boundary = Some(verdict.boundary.clone());
@@ -253,7 +246,10 @@ fn succeeded(
     report.with_findings(findings)
 }
 
-fn chain_entries(receipt: &Value) -> Result<Vec<(u64, Value)>, ()> {
+/// `(entry_index, envelope)` pairs, as the governance resolver takes them.
+type ChainEntries = Vec<(u64, Value)>;
+
+fn chain_entries(receipt: &Value) -> Result<ChainEntries, ()> {
     let chain = receipt
         .get("governance")
         .and_then(|governance| governance.get("chain"))
@@ -286,7 +282,8 @@ fn freshness(
         .get("checkpoint_time")
         .and_then(Value::as_str)
         .ok_or_else(|| "the checkpoint carries no `checkpoint_time`".to_owned())?;
-    let instant = parse_artifact_time("checkpoint_time", time).map_err(|error| error.to_string())?;
+    let instant =
+        parse_artifact_time("checkpoint_time", time).map_err(|error| error.to_string())?;
     let (cadence, grace) =
         governance.cadence_and_grace_for(tree_size).map_err(|error| error.to_string())?;
 
@@ -308,7 +305,6 @@ fn freshness(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-
 
     use ahl_core::receipt::{AdaptorProfile, TrustPolicy};
     use serde_json::json;
@@ -339,8 +335,7 @@ mod tests {
         if with_dataset_key {
             let raw = std::fs::read_to_string(corpus().join("keys/dataset_customers.key"))
                 .expect("dataset key");
-            dataset_keys
-                .insert("customers".to_owned(), hex::decode(raw.trim()).expect("hex key"));
+            dataset_keys.insert("customers".to_owned(), hex::decode(raw.trim()).expect("hex key"));
         }
 
         LoadedPolicy {
@@ -554,16 +549,12 @@ mod tests {
         let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
         let path = corpus().join("receipts/statement-anchored-valid.ahl");
 
-        let finding_only = run(
-            &policy,
-            &much_later,
-            &Options { receipt: path.clone(), require_fresh: false },
-        );
+        let finding_only =
+            run(&policy, &much_later, &Options { receipt: path.clone(), require_fresh: false });
         assert_eq!(finding_only.status, "valid", "staleness is never by itself a disproof");
         assert!(finding_only.findings.iter().any(|f| f.code == "witness-stale"));
 
-        let promoted =
-            run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
+        let promoted = run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
         assert_eq!(promoted.status, "unverifiable");
         assert!(promoted.findings.iter().any(|f| f.code == "witness-stale"));
     }
@@ -651,15 +642,9 @@ mod tests {
             .outcome(),
             Outcome::Unverifiable
         );
-        assert_eq!(
-            classify(ReceiptError::CheckpointSignatureInvalid).outcome(),
-            Outcome::Invalid
-        );
+        assert_eq!(classify(ReceiptError::CheckpointSignatureInvalid).outcome(), Outcome::Invalid);
         assert_eq!(classify(ReceiptError::GenesisAnchorMismatch).outcome(), Outcome::Invalid);
-        assert_eq!(
-            classify(ReceiptError::Malformed("x".to_owned())).outcome(),
-            Outcome::Invalid
-        );
+        assert_eq!(classify(ReceiptError::Malformed("x".to_owned())).outcome(), Outcome::Invalid);
     }
 
     #[test]

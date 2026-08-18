@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
     for fixture in [&honest, &equivocating, &foreign_key, &tampered] {
         // Drive every request path the integration tests replay: an authenticated closure at
         // several checkpoints, and a reconstruction, which additionally reads the witness.
-        for tree_size in [8_u64, 13, 32] {
+        for tree_size in ahl_cli::testing::CHECKPOINT_SIZES {
             let _ = closure::run(
                 &fixture.policy,
                 &evaluation,

@@ -164,9 +164,7 @@ impl<'a, F: Fetcher> Mirror<'a, F> {
         value
             .get("consistency_path")
             .and_then(Value::as_array)
-            .map(|path| {
-                path.iter().filter_map(|hash| hash.as_str().map(str::to_owned)).collect()
-            })
+            .map(|path| path.iter().filter_map(|hash| hash.as_str().map(str::to_owned)).collect())
             .ok_or_else(|| {
                 CliError::EvidenceMissing(format!(
                     "the mirror served no `consistency_path` for {from}→{to}"
@@ -180,13 +178,15 @@ impl<'a, F: Fetcher> Mirror<'a, F> {
     /// # Errors
     ///
     /// [`CliError::EvidenceMissing`] when the bytes are absent or do not digest to the id.
-    pub fn entry_by_id(&self, entry_id: &str, identity: &cache::CheckpointIdentity) -> CliResult<Value> {
+    pub fn entry_by_id(
+        &self,
+        entry_id: &str,
+        identity: &cache::CheckpointIdentity,
+    ) -> CliResult<Value> {
         let request = Request::get(format!("{}/v1/entries/{entry_id}", self.base));
         let key = cache::request_key(identity, &request);
-        let response = self
-            .fetcher
-            .fetch(&request.cached_under(key))
-            .map_err(FetchFailure::into_cli_error)?;
+        let response =
+            self.fetcher.fetch(&request.cached_under(key)).map_err(FetchFailure::into_cli_error)?;
         if response.status != 200 {
             // Absence is a fact about the interface, not about the corpus: it is never read as
             // evidence that no such entry was ever anchored.
@@ -225,11 +225,8 @@ pub fn establish<F: Fetcher>(
 
     // --- the observed series, and divergence over EVERY authenticated member -----------
     let series = mirror.series()?;
-    let selected = series
-        .iter()
-        .find(|member| member.tree_size == tree_size)
-        .cloned()
-        .ok_or_else(|| {
+    let selected =
+        series.iter().find(|member| member.tree_size == tree_size).cloned().ok_or_else(|| {
             CliError::EvidenceMissing(format!(
                 "the mirror published no checkpoint at tree_size {tree_size}; checkpoint \
                  selection is explicit and is never inferred"
@@ -273,10 +270,7 @@ pub fn establish<F: Fetcher>(
     // detection indefinitely by never recomputing the branch it dislikes (adaptor §6.6.1).
     let mut authenticated = Vec::new();
     for member in &series {
-        let keys = match governance.log_keys_for(member.tree_size) {
-            Ok(keys) => keys,
-            Err(_) => continue,
-        };
+        let Ok(keys) = governance.log_keys_for(member.tree_size) else { continue };
         if member.signature_verifies(mirror.signing_form, &keys).unwrap_or(false) {
             authenticated.push(member.clone());
         }
@@ -327,9 +321,9 @@ pub fn establish<F: Fetcher>(
 /// A failure while reading remote material is missing evidence, never a disproved artifact.
 fn remote_candidate(error: CliError) -> CliError {
     match error.outcome() {
-        crate::outcome::Outcome::Invalid => {
-            CliError::EvidenceMissing(format!("the material the mirror served is unusable: {error}"))
-        }
+        crate::outcome::Outcome::Invalid => CliError::EvidenceMissing(format!(
+            "the material the mirror served is unusable: {error}"
+        )),
         _ => error,
     }
 }
@@ -474,18 +468,15 @@ pub fn governing_trigger(
         }
 
         // Every candidate's signature is verified BEFORE authority is compared.
-        match anchored.governance.envelope_verifies_at(envelope, *index) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                findings.push(Finding::new(
-                    "trigger-signature-does-not-verify",
-                    format!(
-                        "the candidate trigger at entry index {index} carries a signature that \
-                         does not verify; an invalid signature never governs"
-                    ),
-                ));
-                continue;
-            }
+        if !anchored.governance.envelope_verifies_at(envelope, *index).unwrap_or(false) {
+            findings.push(Finding::new(
+                "trigger-signature-does-not-verify",
+                format!(
+                    "the candidate trigger at entry index {index} carries a signature that does \
+                     not verify; an invalid signature never governs"
+                ),
+            ));
+            continue;
         }
 
         let signers = signer_key_ids(envelope);
@@ -582,9 +573,7 @@ fn signer_key_ids(envelope: &Value) -> BTreeSet<String> {
         .map(|signatures| {
             signatures
                 .iter()
-                .filter_map(|signature| {
-                    signature.get("key_id")?.as_str().map(str::to_owned)
-                })
+                .filter_map(|signature| signature.get("key_id")?.as_str().map(str::to_owned))
                 .collect()
         })
         .unwrap_or_default()
@@ -680,10 +669,7 @@ mod tests {
     fn a_result_grounded_at_or_beyond_an_equivocation_floor_is_positive_proof_of_misbehaviour() {
         let fixture = MirrorFixture::conformance().with_equivocation_at(13);
         let error = fixture.establish(13).expect_err("at the floor");
-        assert!(
-            matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }),
-            "{error}"
-        );
+        assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid);
     }
 
@@ -691,10 +677,7 @@ mod tests {
     fn a_result_grounded_below_the_floor_keeps_its_outcome_and_carries_the_divergence() {
         let fixture = MirrorFixture::conformance().with_equivocation_at(13);
         let anchored = fixture.establish(8).expect("below the floor");
-        assert!(anchored
-            .findings
-            .iter()
-            .any(|finding| finding.code == "divergence-below-floor"));
+        assert!(anchored.findings.iter().any(|finding| finding.code == "divergence-below-floor"));
     }
 
     #[test]

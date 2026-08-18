@@ -228,10 +228,7 @@ impl<'a, F: Fetcher> Enumerator<'a, F> {
     ///
     /// As [`Self::enumerate`], plus [`CliError::EvidenceMissing`] when the recomputed root
     /// differs from the one the checkpoint commits.
-    pub fn enumerate_and_recompute(
-        &self,
-        selected: &Checkpoint,
-    ) -> CliResult<Vec<(u64, Value)>> {
+    pub fn enumerate_and_recompute(&self, selected: &Checkpoint) -> CliResult<Vec<(u64, Value)>> {
         let entries = self.enumerate(selected, 0, selected.tree_size)?;
         let recomputed = recompute_root(self.leaf_form, &entries);
         let committed = ahl_core::parse_hash_hex(&selected.root_hash).map_err(|source| {
@@ -298,8 +295,8 @@ pub fn verify_range_response(
     let declared_to = range.get("to_index").and_then(Value::as_u64);
     if declared_from != Some(from) || declared_to != Some(to) {
         return Err(missing(format!(
-            "the range response declares [{:?}, {:?}) but [{from}, {to}) was requested",
-            declared_from, declared_to
+            "the range response declares [{declared_from:?}, {declared_to:?}) but [{from}, \
+             {to}) was requested"
         )));
     }
 
@@ -335,7 +332,9 @@ pub fn verify_range_response(
         .get("range_proof")
         .and_then(|proof| proof.get("adaptor_form"))
         .and_then(Value::as_str)
-        .ok_or_else(|| missing("range response carries no `range_proof.adaptor_form`".to_owned()))?;
+        .ok_or_else(|| {
+            missing("range response carries no `range_proof.adaptor_form`".to_owned())
+        })?;
     let proof = range_proof::decode(adaptor_form)
         .map_err(|source| missing(format!("range proof is unreadable: {source}")))?;
     if proof.tree_size != selected.tree_size || proof.from_index != from || proof.to_index != to {
@@ -403,7 +402,8 @@ mod tests {
         let proof = range_proof::generate(&hashes, from, to).expect("proof");
         json!({
             "range": { "from_index": from, "to_index": to },
-            "entries": entries[from as usize..to as usize]
+            "entries": entries[usize::try_from(from).unwrap_or(usize::MAX)
+                ..usize::try_from(to).unwrap_or(usize::MAX)]
                 .iter()
                 .enumerate()
                 .map(|(offset, envelope)| json!({
@@ -443,10 +443,7 @@ mod tests {
                 asked.push((from, to));
             }
             let response = range_response(self.form, &self.entries, from, to);
-            Ok(Response {
-                status: 200,
-                body: serde_json::to_vec(&response).expect("serialize"),
-            })
+            Ok(Response { status: 200, body: serde_json::to_vec(&response).expect("serialize") })
         }
     }
 
@@ -490,7 +487,10 @@ mod tests {
             let enumerator = Enumerator::new(&mirror, "https://m", form, limits(), 5);
             let entries = enumerator.enumerate_and_recompute(&selected).expect("enumerated");
             assert_eq!(entries.len(), 13);
-            assert_eq!(recompute_root(form, &entries), ahl_core::parse_hash_hex(&selected.root_hash).expect("root"));
+            assert_eq!(
+                recompute_root(form, &entries),
+                ahl_core::parse_hash_hex(&selected.root_hash).expect("root")
+            );
         }
     }
 
@@ -511,11 +511,11 @@ mod tests {
 
         let mut wrong_root = selected.clone();
         wrong_root.root_hash = format!("sha256:{}", "ee".repeat(32));
-        let error =
-            verify_range_response(&response, &wrong_root, LeafForm::Direct, 0, 8).expect_err("root");
+        let error = verify_range_response(&response, &wrong_root, LeafForm::Direct, 0, 8)
+            .expect_err("root");
         assert!(error.to_string().contains("locally selected"), "{error}");
 
-        let mut wrong_log = selected.clone();
+        let mut wrong_log = selected;
         wrong_log.log_id = format!("sha256:{}", "ff".repeat(32));
         assert!(verify_range_response(&response, &wrong_log, LeafForm::Direct, 0, 8).is_err());
     }
@@ -609,10 +609,7 @@ mod tests {
             let shift = (to - from).min(self.entries.len() as u64 - to);
             let response =
                 range_response(LeafForm::Direct, &self.entries, from + shift, to + shift);
-            Ok(Response {
-                status: 200,
-                body: serde_json::to_vec(&response).expect("serialize"),
-            })
+            Ok(Response { status: 200, body: serde_json::to_vec(&response).expect("serialize") })
         }
     }
 
@@ -703,7 +700,8 @@ mod tests {
     fn a_malformed_mirror_response_is_missing_evidence_not_a_disproved_artifact() {
         let entries = corpus(4);
         let selected = checkpoint(LeafForm::Direct, &entries);
-        let enumerator = Enumerator::new(&GarbageMirror, "https://m", LeafForm::Direct, limits(), 4);
+        let enumerator =
+            Enumerator::new(&GarbageMirror, "https://m", LeafForm::Direct, limits(), 4);
         let error = enumerator.enumerate(&selected, 0, 4).expect_err("garbage");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
     }

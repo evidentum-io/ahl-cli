@@ -29,14 +29,14 @@
 //! **`log_id`**, and `ahl-mirror` and `ahl-witness` both read that spelling. `ahl-core` reads
 //! **`log.id`**, and every manifest in the `ahl-core` conformance corpus carries `id`. Both
 //! spellings are therefore accepted here, `log_id` first; where only `id` is present a
-//! [`Finding`](crate::report::Finding) with code `manifest-log-id-legacy-spelling` is raised so
+//! [`Finding`] with code `manifest-log-id-legacy-spelling` is raised so
 //! the disagreement is reported rather than smoothed over. The same applies to the members
 //! core §7.3 makes REQUIRED that the corpus omits — see [`Governance::log_object_findings`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ahl_core::receipt::TrustPolicy;
 use ahl_core::entry_id;
+use ahl_core::receipt::TrustPolicy;
 use serde_json::Value;
 
 use crate::duration::parse_time_only_duration;
@@ -113,8 +113,7 @@ impl Governance {
                         }
                         (Some(_), None) => {
                             return Err(CliError::RuleFired(
-                                "a non-genesis manifest must reference its predecessor"
-                                    .to_owned(),
+                                "a non-genesis manifest must reference its predecessor".to_owned(),
                             ))
                         }
                         // By *entry* id: signature identity matters for chain links (§2.3.5),
@@ -178,21 +177,19 @@ impl Governance {
     /// [`CliError::RuleFired`] if the genesis manifest is not at index 0, its entry id is not
     /// the configured anchor, or its key fingerprints are not the configured ones.
     pub fn check_genesis(&self, entries: &[(u64, Value)], policy: &TrustPolicy) -> CliResult<()> {
-        let (index, _) = self.manifests.first().ok_or_else(|| {
-            CliError::RuleFired("no genesis manifest is anchored".to_owned())
-        })?;
+        let (index, _) = self
+            .manifests
+            .first()
+            .ok_or_else(|| CliError::RuleFired("no genesis manifest is anchored".to_owned()))?;
         if *index != 0 {
             return Err(CliError::RuleFired(format!(
                 "the genesis manifest must be anchored at entry index 0, found it at {index}"
             )));
         }
-        let genesis_envelope = entries
-            .iter()
-            .find(|(at, _)| *at == 0)
-            .map(|(_, envelope)| envelope)
-            .ok_or_else(|| {
-                CliError::RuleFired("entry index 0 is not present in the material".to_owned())
-            })?;
+        let genesis_envelope =
+            entries.iter().find(|(at, _)| *at == 0).map(|(_, envelope)| envelope).ok_or_else(
+                || CliError::RuleFired("entry index 0 is not present in the material".to_owned()),
+            )?;
         let anchor = entry_id(genesis_envelope);
         if anchor != policy.genesis_entry_id {
             return Err(CliError::RuleFired(format!(
@@ -312,9 +309,7 @@ impl Governance {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| {
-                CliError::RuleFired(
-                    "the active manifest's `log` object names no log id".to_owned(),
-                )
+                CliError::RuleFired("the active manifest's `log` object names no log id".to_owned())
             })
     }
 
@@ -385,12 +380,7 @@ impl Governance {
     #[must_use]
     pub fn dataset_commitment_mode(&self, index: u64, dataset: &str) -> Option<String> {
         let (_, manifest) = self.snapshot_manifest(index)?;
-        manifest
-            .get("datasets")?
-            .get(dataset)?
-            .get("commitment_mode")?
-            .as_str()
-            .map(str::to_owned)
+        manifest.get("datasets")?.get(dataset)?.get("commitment_mode")?.as_str().map(str::to_owned)
     }
 
     /// Verify every signature on `envelope` against the producer key set in force at `index`.
@@ -406,9 +396,8 @@ impl Governance {
     /// decoded.
     pub fn envelope_verifies_at(&self, envelope: &Value, index: u64) -> CliResult<bool> {
         let keys = self.producer_keys_at(index);
-        ahl_core::verify_envelope(envelope, |key_id| keys.get(key_id).cloned()).map_err(|source| {
-            CliError::Malformed { what: "envelope", detail: source.to_string() }
-        })
+        ahl_core::verify_envelope(envelope, |key_id| keys.get(key_id).cloned())
+            .map_err(|source| CliError::Malformed { what: "envelope", detail: source.to_string() })
     }
 
     /// Findings about every manifest version's `log` object, reported rather than adjudicated.
@@ -434,11 +423,17 @@ impl Governance {
                     ),
                 ));
             }
-            let missing: Vec<&str> = ["operator", "adaptor", "checkpoint_cadence", "cadence_epoch",
-                "witness_grace_period", "keys"]
-                .into_iter()
-                .filter(|member| log.get(*member).is_none())
-                .collect();
+            let missing: Vec<&str> = [
+                "operator",
+                "adaptor",
+                "checkpoint_cadence",
+                "cadence_epoch",
+                "witness_grace_period",
+                "keys",
+            ]
+            .into_iter()
+            .filter(|member| log.get(*member).is_none())
+            .collect();
             if !missing.is_empty() {
                 findings.insert(Finding::new(
                     "manifest-log-object-incomplete",
@@ -654,8 +649,7 @@ mod tests {
     #[test]
     fn a_non_genesis_manifest_without_a_predecessor_is_refused() {
         let key = producer(1);
-        let second =
-            ahl_core::envelope(json!({ "type": "manifest", "keys": [], "log": {} }), &key);
+        let second = ahl_core::envelope(json!({ "type": "manifest", "keys": [], "log": {} }), &key);
         let error = Governance::from_entries(&[(0, genesis("log_id")), (5, second)])
             .expect_err("no predecessor");
         assert!(error.to_string().contains("must reference its predecessor"), "{error}");
@@ -793,10 +787,7 @@ mod tests {
         let governance = Governance::from_entries(&entries).expect("chain");
         let authority = governance.dataset_authority(1, "customers").expect("declared");
         assert!(authority.contains(&producer(1).key_id()));
-        assert_eq!(
-            governance.dataset_commitment_mode(1, "customers").as_deref(),
-            Some("keyed")
-        );
+        assert_eq!(governance.dataset_commitment_mode(1, "customers").as_deref(), Some("keyed"));
         assert!(governance.dataset_authority(1, "absent").is_none());
     }
 

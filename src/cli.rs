@@ -95,6 +95,7 @@ pub enum Command {
     Emit {
         /// Path to the statement payload, as JSON.
         payload: PathBuf,
+        /// Where the signing seed comes from — a file or a named environment variable.
         #[command(flatten)]
         key: KeyArgs,
         /// Install the canonical envelope bytes here, atomically and without clobbering.
@@ -227,10 +228,8 @@ fn fetch_chain(cli: &Cli, policy: &LoadedPolicy) -> CliResult<Box<dyn Fetcher>> 
     };
     let mut chain: Box<dyn Fetcher> = Box::new(Budgeted::new(transport, policy.network));
     if let Some(dir) = &cli.cache_dir {
-        chain = Box::new(crate::cache::Caching::new(
-            chain,
-            Cache::open(dir, cli.cache_quota_bytes)?,
-        ));
+        chain =
+            Box::new(crate::cache::Caching::new(chain, Cache::open(dir, cli.cache_quota_bytes)?));
     }
     Ok(chain)
 }
@@ -254,8 +253,7 @@ fn dispatch(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             let outcome = inspect::outcome_of(&result);
             match result {
                 Ok(dump) => {
-                    let rendered =
-                        if cli.json { dump.to_json()? } else { dump.to_text() };
+                    let rendered = if cli.json { dump.to_json()? } else { dump.to_text() };
                     write_out(stdout, &rendered)?;
                     Ok(outcome)
                 }
@@ -265,12 +263,10 @@ fn dispatch(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
         Command::Emit { payload, key, out, force } => {
             // `emit` needs no trust policy: it establishes nothing about a log. Local limits
             // come from policy where one is configured, and from the defaults otherwise.
-            let limits = cli
-                .policy
-                .as_ref()
-                .map_or_else(|| Ok(crate::policy::LocalLimits::default()), |_| {
-                    load_policy(cli).map(|policy| policy.local)
-                })?;
+            let limits = cli.policy.as_ref().map_or_else(
+                || Ok(crate::policy::LocalLimits::default()),
+                |_| load_policy(cli).map(|policy| policy.local),
+            )?;
             let emitted = emit::run(
                 limits,
                 &emit::Options {
@@ -293,17 +289,16 @@ fn dispatch(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             checkpoint,
         } => {
             let policy = load_policy(cli)?;
-            let reference = match (trigger, trigger_index) {
-                (Some(id), None) => closure::TriggerRef::StatementId(id.clone()),
-                (None, Some(index)) => closure::TriggerRef::EntryIndex(*index),
-                _ => {
-                    return Err(CliError::Usage(
+            let reference =
+                match (trigger, trigger_index) {
+                    (Some(id), None) => closure::TriggerRef::StatementId(id.clone()),
+                    (None, Some(index)) => closure::TriggerRef::EntryIndex(*index),
+                    _ => return Err(CliError::Usage(
                         "exactly one of `--trigger <statement-id>` or `--trigger-index <n>` is \
                          required"
                             .to_owned(),
-                    ))
-                }
-            };
+                    )),
+                };
             let options = closure::Options {
                 trigger: reference,
                 unauthenticated: *unauthenticated,
@@ -369,9 +364,7 @@ mod tests {
     use crate::testing::MirrorFixture;
 
     fn argv(args: &[&str]) -> Vec<OsString> {
-        std::iter::once(OsString::from("ahl-cli"))
-            .chain(args.iter().map(OsString::from))
-            .collect()
+        std::iter::once(OsString::from("ahl-cli")).chain(args.iter().map(OsString::from)).collect()
     }
 
     struct Run {
@@ -565,12 +558,7 @@ mod tests {
         assert_eq!(run.outcome.exit_code(), 2);
 
         // There is no `--key`/`--seed` flag that would put material in `argv`.
-        let run = run_cli(&[
-            "emit",
-            &payload.display().to_string(),
-            "--key",
-            &"01".repeat(32),
-        ]);
+        let run = run_cli(&["emit", &payload.display().to_string(), "--key", &"01".repeat(32)]);
         assert_eq!(run.outcome.exit_code(), 2);
     }
 
@@ -642,8 +630,8 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let _ = run(argv(&["verify", "--help"]), &mut stdout, &mut stderr);
-        let help = String::from_utf8_lossy(&stdout).into_owned()
-            + &String::from_utf8_lossy(&stderr);
+        let help =
+            String::from_utf8_lossy(&stdout).into_owned() + &String::from_utf8_lossy(&stderr);
         assert!(help.contains("--require-fresh"));
         for forbidden in ["--fetch", "--online", "--refresh-witness", "--insecure"] {
             assert!(!help.contains(forbidden), "`verify` must not offer `{forbidden}`");
@@ -655,8 +643,8 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let _ = run(argv(&["--help"]), &mut stdout, &mut stderr);
-        let help = String::from_utf8_lossy(&stdout).into_owned()
-            + &String::from_utf8_lossy(&stderr);
+        let help =
+            String::from_utf8_lossy(&stdout).into_owned() + &String::from_utf8_lossy(&stderr);
         assert!(!help.contains("insecure"));
     }
 }

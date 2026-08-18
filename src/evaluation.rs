@@ -34,11 +34,7 @@ impl EvaluationTime {
     /// platform clock cannot produce.
     pub fn from_clock() -> CliResult<Self> {
         let instant = OffsetDateTime::now_utc();
-        Ok(Self {
-            rendered: render(instant)?,
-            instant,
-            source: TimeSource::Clock,
-        })
+        Ok(Self { rendered: render(instant)?, instant, source: TimeSource::Clock })
     }
 
     /// Take the instant from `--evaluation-time`.
@@ -50,11 +46,7 @@ impl EvaluationTime {
         let instant = OffsetDateTime::parse(value, &Rfc3339).map_err(|source| {
             CliError::Usage(format!("`--evaluation-time {value}` is not RFC 3339: {source}"))
         })?;
-        Ok(Self {
-            rendered: render(instant)?,
-            instant,
-            source: TimeSource::Override,
-        })
+        Ok(Self { rendered: render(instant)?, instant, source: TimeSource::Override })
     }
 
     /// Resolve from an optional override.

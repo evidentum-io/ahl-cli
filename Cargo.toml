@@ -59,4 +59,5 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 flate2 = "1.1.9"
+hex = "0.4.3"
 tempfile = "3.27.0"

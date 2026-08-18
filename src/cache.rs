@@ -286,10 +286,7 @@ mod tests {
         let request = Request::post("https://m/v1/range", b"{\"from\":0}".to_vec());
         let branch_a = request_key(&identity(&"aa".repeat(32)), &request);
         let branch_b = request_key(&identity(&"bb".repeat(32)), &request);
-        assert_ne!(
-            branch_a, branch_b,
-            "two roots at one tree_size must not share a cache entry"
-        );
+        assert_ne!(branch_a, branch_b, "two roots at one tree_size must not share a cache entry");
 
         let mut other_size = identity(&"aa".repeat(32));
         other_size.tree_size = 9;
@@ -377,13 +374,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::open(dir.path(), 300).expect("open cache");
         for n in 0u8..10 {
-            cache.put(&format!("k{n}"), &vec![n; 100]).expect("put");
+            cache.put(&format!("k{n}"), &[n; 100]).expect("put");
         }
-        assert!(
-            cache.size_bytes() <= 300,
-            "quota exceeded: {} bytes held",
-            cache.size_bytes()
-        );
+        assert!(cache.size_bytes() <= 300, "quota exceeded: {} bytes held", cache.size_bytes());
     }
 
     #[test]

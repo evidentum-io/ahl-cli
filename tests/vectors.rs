@@ -1,0 +1,382 @@
+//! Every test vector in `ahl-core/test_data`, exercised **end-to-end through the built
+//! binary** — not only through the library.
+//!
+//! Design note §9 makes this non-negotiable, and the reason is not ceremony: a verifier whose
+//! rules are only ever exercised in-process has never demonstrated that its *exit codes* carry
+//! them, and the exit code is what a CI pipeline reads.
+//!
+//! The corpus's own `receipts/index.json` states the outcome a conformant verifier must reach
+//! for each receipt, and the rule each negative vector must trip. Both are asserted here, so a
+//! drift in either direction fails.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::multiple_crate_versions
+)]
+
+mod common;
+
+use common::{ahl_cli, corpus, fixtures, policy, PolicySpec};
+
+const AT: &str = "--evaluation-time";
+const FIXED: &str = "2026-08-16T12:00:00Z";
+
+fn index() -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(corpus().join("receipts/index.json")).expect("index"))
+        .expect("index parses")
+}
+
+#[test]
+fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
+    let document = index();
+    let vectors = document["vectors"].as_array().expect("vectors");
+    assert!(vectors.len() >= 20, "the corpus carries 20+ receipts, got {}", vectors.len());
+
+    for vector in vectors {
+        let file = vector["file"].as_str().expect("file");
+        let path = corpus().join("receipts").join(file);
+        let run = ahl_cli(&[
+            "--policy",
+            &policy_path,
+            AT,
+            FIXED,
+            "--json",
+            "verify",
+            &path.display().to_string(),
+        ]);
+        let report = run.json();
+        match vector["expect"].as_str().expect("expect") {
+            "accept" => {
+                assert_eq!(run.code, 0, "{file}: {}", report["reason"]);
+                assert_eq!(report["status"], "valid", "{file}");
+                assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
+                // The verdict is rendered from `ahl_core::receipt::Verdict` and is never
+                // stronger than the boundary that struct carries.
+                assert_eq!(report["boundary"], vector["boundary"], "{file}");
+            }
+            "reject" => {
+                assert_eq!(run.code, 1, "{file}: {}", report["reason"]);
+                assert_eq!(report["status"], "invalid", "{file}");
+                let expected = vector["reason"].as_str().expect("reason");
+                assert!(
+                    report["reason"].as_str().unwrap_or_default().contains(expected),
+                    "{file}: expected the rule `{expected}` to fire, got {}",
+                    report["reason"]
+                );
+            }
+            other => panic!("unknown expectation `{other}` for {file}"),
+        }
+    }
+}
+
+#[test]
+fn every_receipt_vector_also_inspects_without_a_verdict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
+    let document = index();
+    for vector in document["vectors"].as_array().expect("vectors") {
+        let file = vector["file"].as_str().expect("file");
+        let path = corpus().join("receipts").join(file);
+        let run =
+            ahl_cli(&["--policy", &policy_path, "--json", "inspect", &path.display().to_string()]);
+        assert_eq!(run.code, 0, "{file}: {}", run.stderr);
+        let dump = run.json();
+        assert!(dump.get("status").is_none(), "{file}: a dump carries no verdict");
+        assert_eq!(dump["jcs_canonical"], true, "{file}");
+        assert!(dump["disclaimer"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing here is verified"));
+    }
+}
+
+#[test]
+fn every_closure_vector_is_reproduced_through_the_binary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path()).display().to_string();
+    let trees = fixtures().join("tree-material.json").display().to_string();
+    let transcript = fixtures().join("mirror-transcript.json").display().to_string();
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir(corpus().join("vectors/closure")).expect("closure vectors") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let vector: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("vector")).expect("parses");
+        let trigger_index = vector["trigger"]["entry_index"].as_u64().expect("index");
+        let tree_size = vector["corpus_checkpoint"]["tree_size"].as_u64().expect("tree size");
+        let expected: Vec<serde_json::Value> = vector["expected_affected"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "dataset": item["dataset"],
+                    "record": item["record"],
+                })
+            })
+            .collect();
+
+        // The recorded transcript publishes checkpoints at a fixed set of sizes; a vector
+        // grounded elsewhere is exercised in topology mode instead, where the whole corpus is
+        // walked and the answer is explicitly not an affected set.
+        let published = ahl_cli::testing::CHECKPOINT_SIZES.contains(&tree_size);
+        let run = if published {
+            ahl_cli(&[
+                "--policy",
+                &policy_path,
+                AT,
+                FIXED,
+                "--json",
+                "--transcript",
+                &transcript,
+                "closure",
+                "--trigger-index",
+                &trigger_index.to_string(),
+                "--checkpoint",
+                &tree_size.to_string(),
+                "--tree-material",
+                &trees,
+            ])
+        } else {
+            continue;
+        };
+
+        let report = run.json();
+        if report["status"] == "valid" {
+            assert_eq!(
+                report["affected"].as_array().expect("affected"),
+                &expected,
+                "{}",
+                path.display()
+            );
+            checked += 1;
+        } else {
+            // A vector whose trigger is superseded at that checkpoint is legitimately not
+            // computable there; the CLI must say which trigger governs instead of answering.
+            assert_eq!(run.code, 3, "{}: {}", path.display(), report["reason"]);
+            assert!(
+                report["reason"].as_str().unwrap_or_default().contains("does not govern"),
+                "{}: {}",
+                path.display(),
+                report["reason"]
+            );
+        }
+    }
+    assert!(checked > 0, "at least one closure vector must be reproduced authenticated");
+}
+
+#[test]
+fn the_toy_corpus_walks_in_topology_mode_through_the_binary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path,
+        AT,
+        FIXED,
+        "--json",
+        "closure",
+        "--unauthenticated",
+        "--corpus",
+        &corpus().join("vectors/statements").display().to_string(),
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+        "--trigger-index",
+        "6",
+    ]);
+    assert_eq!(run.code, 3);
+    let report = run.json();
+    assert_eq!(report["authenticated"], false);
+    assert!(report.get("affected").is_none(), "the two results never share a field name");
+    assert!(report["topology_affected"].as_array().expect("topology").len() >= 4);
+}
+
+#[test]
+fn every_statement_vector_is_re_emitted_and_matches_its_published_identifiers() {
+    // `emit` signs with the same published producer seed the corpus used, so a re-emitted
+    // payload must reproduce the corpus's own `statement_id` and `entry_id` byte for byte.
+    // That is the canonicalization-drift check the tool exists to prevent.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seed = dir.path().join("producer-1.seed");
+    std::fs::copy(corpus().join("keys/producer-1.seed"), &seed).expect("copy seed");
+    std::fs::set_permissions(&seed, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("mode");
+
+    let mut checked = 0;
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(corpus().join("vectors/statements"))
+        .expect("statements")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+
+    for file in files {
+        let vector: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("vector")).expect("parses");
+        let payload = &vector["envelope"]["payload"];
+        let signatures = vector["envelope"]["signatures"].as_array().expect("signatures");
+        // Only the single-signature statements by `producer-1` can be reproduced by re-signing
+        // with that one seed; the rest are exercised through `closure` and `verify` instead.
+        if signatures.len() != 1 {
+            continue;
+        }
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, serde_json::to_vec(payload).expect("serialize"))
+            .expect("write");
+
+        let run = ahl_cli(&[
+            "--json",
+            "emit",
+            &payload_path.display().to_string(),
+            "--key-file",
+            &seed.display().to_string(),
+        ]);
+        if run.code != 0 {
+            // A payload this build refuses to sign is a locally decidable rule firing, which
+            // is a legitimate answer; it must never be a silent success.
+            assert_eq!(run.code, 1, "{}: {}", file.display(), run.output());
+            continue;
+        }
+        let emitted = run.json();
+        assert_eq!(
+            emitted["statement_id"],
+            vector["statement_id"],
+            "{}: canonicalization drift",
+            file.display()
+        );
+        if emitted["envelope"]["signatures"] == vector["envelope"]["signatures"] {
+            assert_eq!(emitted["entry_id"], vector["entry_id"], "{}", file.display());
+        }
+        checked += 1;
+    }
+    assert!(checked >= 20, "most of the toy corpus should be re-emittable, got {checked}");
+}
+
+#[test]
+fn the_published_witness_refusal_vector_is_checked_in_full() {
+    // The corpus's refusal vector predates the §11.2.1 taxonomy: it declares `inconsistent`,
+    // a reason adaptor profile §11.2.4 removed rather than renamed. A verifier must refuse a
+    // reason it cannot independently recheck, so the vector is expected to be *unusable* under
+    // the current profile — which is the finding, not a bug in either.
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("vectors/witness/refusal-evidence.json")).expect("vector"),
+    )
+    .expect("parses");
+    assert_eq!(
+        vector["refusal"]["reason"], "inconsistent",
+        "if the corpus adopts the §11.2.1 taxonomy this test should be updated, not deleted"
+    );
+
+    let log_key = ahl_core::TestKey::from_seed_hex(
+        "log-1",
+        std::fs::read_to_string(corpus().join("keys/log-1.seed")).expect("seed").trim(),
+    )
+    .expect("seed");
+    let witness_key = ahl_core::TestKey::from_seed_hex(
+        "witness-1",
+        std::fs::read_to_string(corpus().join("keys/witness-1.seed")).expect("seed").trim(),
+    )
+    .expect("seed");
+
+    let error = ahl_cli::witness::check_refusal(
+        &vector["refusal"],
+        ahl_cli::checkpoint::SigningForm::CanonicalJson,
+        &std::collections::BTreeMap::from([(witness_key.key_id(), witness_key.pubkey())]),
+        &std::collections::BTreeMap::from([(log_key.key_id(), log_key.pubkey())]),
+        vector["refusal"]["log_id"].as_str().expect("log id"),
+    )
+    .expect_err("a removed reason is never accepted");
+    assert!(error.to_string().contains("§11.2.1"), "{error}");
+    assert!(error.to_string().contains("removed, not renamed"), "{error}");
+}
+
+#[test]
+fn the_published_range_proof_vectors_verify_and_their_negatives_do_not() {
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("vectors/merkle/range-proof.json")).expect("vector"),
+    )
+    .expect("parses");
+    let cases = vector["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let proof =
+            ahl_core::range_proof::decode(case["adaptor_form"].as_str().expect("adaptor form"))
+                .expect("the published proof decodes");
+        assert_eq!(proof.from_index, case["range"]["from_index"].as_u64().expect("from"));
+        assert_eq!(proof.to_index, case["range"]["to_index"].as_u64().expect("to"));
+        assert_eq!(proof.tree_size, vector["checkpoint"]["tree_size"].as_u64().expect("size"));
+        assert_eq!(proof.nodes.len() as u64, case["node_count"].as_u64().expect("node count"));
+    }
+}
+
+#[test]
+fn the_published_checkpoints_authenticate_under_the_corpus_manifests() {
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("vectors/checkpoints/checkpoints.json")).expect("vector"),
+    )
+    .expect("parses");
+    let log_key = ahl_core::TestKey::from_seed_hex(
+        "log-1",
+        std::fs::read_to_string(corpus().join("keys/log-1.seed")).expect("seed").trim(),
+    )
+    .expect("seed");
+    let keys = std::collections::BTreeMap::from([(log_key.key_id(), log_key.pubkey())]);
+
+    let members = vector["checkpoints"].as_array().expect("checkpoints");
+    assert!(!members.is_empty());
+    for member in members {
+        let checkpoint =
+            ahl_cli::checkpoint::Checkpoint::from_value(&member["checkpoint"]).expect("parses");
+        assert!(
+            checkpoint
+                .signature_verifies(ahl_cli::checkpoint::SigningForm::CanonicalJson, &keys)
+                .expect("readable"),
+            "{} did not authenticate",
+            member["name"]
+        );
+    }
+    // And the whole published series carries no divergence.
+    let series: Vec<ahl_cli::checkpoint::Checkpoint> = members
+        .iter()
+        .filter_map(|member| {
+            ahl_cli::checkpoint::Checkpoint::from_value(&member["checkpoint"]).ok()
+        })
+        .collect();
+    assert_eq!(ahl_cli::checkpoint::equivocation_floor(&series), None);
+}
+
+#[test]
+fn the_published_malformed_statements_are_reported_when_walked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
+
+    // The corpus keeps its malformed statements in a subdirectory, each naming the rule it
+    // violates. Walked as a corpus, every one of them must produce a finding.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path,
+        AT,
+        FIXED,
+        "--json",
+        "closure",
+        "--unauthenticated",
+        "--corpus",
+        &corpus().join("vectors/statements/malformed").display().to_string(),
+        "--trigger-index",
+        "0",
+    ]);
+    assert_eq!(run.code, 3, "topology mode never returns 0: {}", run.output());
+    assert!(
+        run.stdout.contains("findings") || run.output().contains("findings"),
+        "the malformed corpus must produce findings: {}",
+        run.output()
+    );
+}

@@ -140,9 +140,9 @@ impl CliError {
             | Self::Output { .. }
             | Self::RefusedTarget { .. }
             | Self::Internal(_) => Outcome::Error,
-            Self::Malformed { .. } | Self::RuleFired(_) | Self::EquivocationAtOrBeyondFloor { .. } => {
-                Outcome::Invalid
-            }
+            Self::Malformed { .. }
+            | Self::RuleFired(_)
+            | Self::EquivocationAtOrBeyondFloor { .. } => Outcome::Invalid,
             Self::ProfileNotPossessed { .. }
             | Self::ProfileLimitation(_)
             | Self::DatasetKeyNotHeld { .. }
@@ -235,6 +235,9 @@ mod tests {
             CliError::EvidenceMissing("bad remote checkpoint".to_owned()).outcome(),
             Outcome::Unverifiable
         );
-        assert_eq!(CliError::RuleFired("bad subject signature".to_owned()).outcome(), Outcome::Invalid);
+        assert_eq!(
+            CliError::RuleFired("bad subject signature".to_owned()).outcome(),
+            Outcome::Invalid
+        );
     }
 }

@@ -42,6 +42,10 @@ const MAX_FRACTIONAL_DIGITS: usize = 9;
 /// // Five months, not five minutes: prohibited in these fields.
 /// assert!(parse_time_only_duration("cadence", "P5M").is_err());
 /// ```
+// A grammar, parsed in one pass. The date part and the time part are deliberately not two
+// functions: the prohibition on `Y` and date-part `M` is only meaningful against the position
+// the character occupies, and that position is what this single pass tracks.
+#[allow(clippy::too_many_lines)]
 pub fn parse_time_only_duration(field: &'static str, value: &str) -> CliResult<u64> {
     let malformed = |detail: String| CliError::Malformed { what: field, detail };
 
@@ -74,9 +78,11 @@ pub fn parse_time_only_duration(field: &'static str, value: &str) -> CliResult<u
             'D' => {
                 let days = take_number(&mut number, value, 'D', field)?;
                 nanos = nanos
-                    .checked_add(days.checked_mul(86_400).and_then(|s| s.checked_mul(NANOS_PER_SECOND)).ok_or_else(
-                        || malformed(format!("`{value}` overflows")),
-                    )?)
+                    .checked_add(
+                        days.checked_mul(86_400)
+                            .and_then(|s| s.checked_mul(NANOS_PER_SECOND))
+                            .ok_or_else(|| malformed(format!("`{value}` overflows")))?,
+                    )
                     .ok_or_else(|| malformed(format!("`{value}` overflows")))?;
             }
             'W' => {
@@ -84,9 +90,7 @@ pub fn parse_time_only_duration(field: &'static str, value: &str) -> CliResult<u
                     "`{value}` carries a week designator, which {field} does not permit"
                 )))
             }
-            other => {
-                return Err(malformed(format!("`{value}` carries an unexpected `{other}`")))
-            }
+            other => return Err(malformed(format!("`{value}` carries an unexpected `{other}`"))),
         }
     }
     if !number.is_empty() {
@@ -216,7 +220,10 @@ mod tests {
         assert_eq!(parse("PT15M").expect("valid"), 900 * NANOS_PER_SECOND);
         assert_eq!(parse("PT30S").expect("valid"), 30 * NANOS_PER_SECOND);
         assert_eq!(parse("P1D").expect("valid"), 86_400 * NANOS_PER_SECOND);
-        assert_eq!(parse("P1DT2H3M4S").expect("valid"), (86_400 + 7_200 + 180 + 4) * NANOS_PER_SECOND);
+        assert_eq!(
+            parse("P1DT2H3M4S").expect("valid"),
+            (86_400 + 7_200 + 180 + 4) * NANOS_PER_SECOND
+        );
     }
 
     #[test]
@@ -253,17 +260,17 @@ mod tests {
     #[test]
     fn structural_malformations_are_rejected_by_name() {
         for value in [
-            "1H",          // no leading P
-            "P",           // no components
-            "PT",          // T with nothing after it
-            "PTH",         // designator with no number
-            "PT1",         // number with no designator
-            "P1",          // date number with no designator
-            "P1W",         // weeks
-            "PT1.2.3S",    // two separators
-            "PT1.S",       // separator with no digits
-            "P1X",         // unexpected designator
-            "PT1X",        // unexpected time designator
+            "1H",       // no leading P
+            "P",        // no components
+            "PT",       // T with nothing after it
+            "PTH",      // designator with no number
+            "PT1",      // number with no designator
+            "P1",       // date number with no designator
+            "P1W",      // weeks
+            "PT1.2.3S", // two separators
+            "PT1.S",    // separator with no digits
+            "P1X",      // unexpected designator
+            "PT1X",     // unexpected time designator
         ] {
             assert!(parse(value).is_err(), "`{value}` must be rejected");
         }

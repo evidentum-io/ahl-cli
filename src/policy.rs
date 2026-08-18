@@ -63,6 +63,9 @@ impl Default for NetworkLimits {
 
 /// Bounds on local files and local traversal, so a hostile file cannot exhaust memory where a
 /// hostile server cannot.
+// The shared `max_` prefix is the operator-facing spelling: these field names are the TOML
+// keys under `[limits.local]`, and renaming them to satisfy a lint would rename configuration.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalLimits {
     /// Maximum bytes read from any one local file.
@@ -173,6 +176,9 @@ struct DatasetKeySection {
     hex: Option<String>,
 }
 
+// As above: these field names are the `[policy.limits]` TOML keys, and they mirror
+// `ahl_core::receipt::Limits` member for member.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptLimitsSection {
@@ -298,10 +304,14 @@ pub fn load(path: &Path) -> CliResult<LoadedPolicy> {
     let file: PolicyFile = toml::from_str(&text)
         .map_err(|source| CliError::Policy(format!("cannot parse policy: {source}")))?;
 
-    let base = path.parent().unwrap_or(Path::new("."));
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
     from_parsed(file, base)
 }
 
+// One ordered validation of one configuration file. Splitting it into helpers that each take
+// the growing set of partially validated sections would obscure the order, which is the part a
+// reader needs: the trust anchor is checked before anything derived from it is read.
+#[allow(clippy::too_many_lines)]
 fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
     require_family_string("policy.genesis_entry_id", &file.policy.genesis_entry_id)?;
     if file.policy.genesis_key_ids.is_empty() {
@@ -330,10 +340,8 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
             checkpoint_raw: section.checkpoint_raw,
             consistency_proofs: section.consistency_proofs,
         };
-        adaptor_profiles.insert(
-            id.clone(),
-            AdaptorProfile { hash: section.hash.clone(), capabilities },
-        );
+        adaptor_profiles
+            .insert(id.clone(), AdaptorProfile { hash: section.hash.clone(), capabilities });
         profiles.insert(
             id,
             ConfiguredProfile {
@@ -406,9 +414,7 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
     let local_defaults = LocalLimits::default();
     let local = file.limits.local.map_or(local_defaults, |section| LocalLimits {
         max_file_bytes: section.max_file_bytes.unwrap_or(local_defaults.max_file_bytes),
-        max_corpus_entries: section
-            .max_corpus_entries
-            .unwrap_or(local_defaults.max_corpus_entries),
+        max_corpus_entries: section.max_corpus_entries.unwrap_or(local_defaults.max_corpus_entries),
     });
 
     Ok(LoadedPolicy {
@@ -421,10 +427,7 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
             limits,
         },
         profiles,
-        endpoints: Endpoints {
-            mirror: file.endpoints.mirror,
-            witness: file.endpoints.witness,
-        },
+        endpoints: Endpoints { mirror: file.endpoints.mirror, witness: file.endpoints.witness },
         network,
         local,
     })
@@ -436,15 +439,11 @@ mod tests {
 
     use super::*;
 
-    const GENESIS: &str =
-        "sha256:be129d9d262de65c47eaad8d978ef54e87d5e1388182df53e036102816210a49";
-    const KEY_ID: &str =
-        "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e";
+    const GENESIS: &str = "sha256:be129d9d262de65c47eaad8d978ef54e87d5e1388182df53e036102816210a49";
+    const KEY_ID: &str = "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e";
 
     fn minimal() -> String {
-        format!(
-            "[policy]\ngenesis_entry_id = \"{GENESIS}\"\ngenesis_key_ids = [\"{KEY_ID}\"]\n"
-        )
+        format!("[policy]\ngenesis_entry_id = \"{GENESIS}\"\ngenesis_key_ids = [\"{KEY_ID}\"]\n")
     }
 
     fn write_policy(dir: &Path, text: &str) -> PathBuf {
@@ -497,8 +496,9 @@ mod tests {
     fn family_strings_are_validated_by_shape() {
         let dir = tempfile::tempdir().expect("tempdir");
         for anchor in ["not-a-digest", "sha256:XYZ", "sha256:00", "md5:aa"] {
-            let text =
-                format!("[policy]\ngenesis_entry_id = \"{anchor}\"\ngenesis_key_ids = [\"{KEY_ID}\"]\n");
+            let text = format!(
+                "[policy]\ngenesis_entry_id = \"{anchor}\"\ngenesis_key_ids = [\"{KEY_ID}\"]\n"
+            );
             let path = write_policy(dir.path(), &text);
             assert!(load(&path).is_err(), "`{anchor}` must be refused");
         }

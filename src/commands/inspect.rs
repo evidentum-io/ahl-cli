@@ -15,6 +15,7 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::fmt::Write as _;
 
 use crate::error::{CliError, CliResult};
 use crate::outcome::Outcome;
@@ -38,7 +39,7 @@ pub struct EmbeddedDump {
     /// Its subject entry index, as declared.
     pub declared_entry_index: Option<u64>,
     /// Receipts embedded inside it.
-    pub embedded: Vec<EmbeddedDump>,
+    pub embedded: Vec<Self>,
 }
 
 /// The structural dump. Deliberately carries no `status`, no boundary and no verdict.
@@ -166,10 +167,7 @@ fn sorted_strings(value: &Value, path: &[&str], member: &str) -> Vec<String> {
     let mut out: Vec<String> = at(value, path)
         .and_then(Value::as_array)
         .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get(member)?.as_str().map(str::to_owned))
-                .collect()
+            items.iter().filter_map(|item| item.get(member)?.as_str().map(str::to_owned)).collect()
         })
         .unwrap_or_default();
     out.sort_unstable();
@@ -230,9 +228,9 @@ impl Dump {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("{DISCLAIMER}\n\n"));
-        out.push_str(&format!("file bytes: {}\n", self.file_bytes));
-        out.push_str(&format!("JCS-canonical: {}\n", self.jcs_canonical));
+        let _ = writeln!(out, "{DISCLAIMER}\n");
+        let _ = writeln!(out, "file bytes: {}", self.file_bytes);
+        let _ = writeln!(out, "JCS-canonical: {}", self.jcs_canonical);
         for (label, value) in [
             ("declared receipt version", &self.declared_receipt_version),
             ("declared spec version", &self.declared_spec_version),
@@ -241,24 +239,25 @@ impl Dump {
             ("declared currency mode", &self.declared_currency_mode),
             ("declared genesis entry id", &self.declared_genesis_entry_id),
         ] {
-            out.push_str(&format!("{label}: {}\n", value.as_deref().unwrap_or("<absent>")));
+            let _ = writeln!(out, "{label}: {}", value.as_deref().unwrap_or("<absent>"));
         }
         if let Some(assurance) = &self.declared_assurance {
-            out.push_str(&format!("declared assurance (unverified): {assurance}\n"));
+            let _ = writeln!(out, "declared assurance (unverified): {assurance}");
         }
         if let Some(checkpoint) = &self.declared_checkpoint {
-            out.push_str(&format!("declared checkpoint: {checkpoint}\n"));
+            let _ = writeln!(out, "declared checkpoint: {checkpoint}");
         }
         if let Some(note) = &self.declared_note {
-            out.push_str(&format!("the receipt says (informative, not normative): \"{note}\"\n"));
+            let _ = writeln!(out, "the receipt says (informative, not normative): \"{note}\"");
         }
-        out.push_str(&format!("declared witness ids: {:?}\n", self.declared_witness_ids));
-        out.push_str(&format!(
-            "declared governance chain indexes: {:?}\n",
+        let _ = writeln!(out, "declared witness ids: {:?}", self.declared_witness_ids);
+        let _ = writeln!(
+            out,
+            "declared governance chain indexes: {:?}",
             self.declared_governance_indexes
-        ));
-        out.push_str(&format!("claim material members: {:?}\n", self.claim_material_members));
-        out.push_str(&format!("declared anchor types: {:?}\n", self.declared_anchor_types));
+        );
+        let _ = writeln!(out, "claim material members: {:?}", self.claim_material_members);
+        let _ = writeln!(out, "declared anchor types: {:?}", self.declared_anchor_types);
         render_embedded(&mut out, &self.embedded, 0);
         out
     }
@@ -266,14 +265,15 @@ impl Dump {
 
 fn render_embedded(out: &mut String, embedded: &[EmbeddedDump], depth: usize) {
     for item in embedded {
-        out.push_str(&format!(
-            "{:indent$}embedded `{}`: declared claim type {}, declared entry index {}\n",
+        let _ = writeln!(
+            out,
+            "{:indent$}embedded `{}`: declared claim type {}, declared entry index {}",
             "",
             item.slot,
             item.declared_claim_type.as_deref().unwrap_or("<absent>"),
             item.declared_entry_index.map_or_else(|| "<absent>".to_owned(), |i| i.to_string()),
             indent = depth * 2,
-        ));
+        );
         render_embedded(out, &item.embedded, depth + 1);
     }
 }

@@ -30,9 +30,7 @@ use crate::checkpoint::{Checkpoint, SigningForm, TEST_LOG_PROFILE};
 use crate::enumerate::LeafForm;
 use crate::error::CliResult;
 use crate::net::{FetchFailure, Fetcher, Request, Response};
-use crate::policy::{
-    ConfiguredProfile, Endpoints, LoadedPolicy, LocalLimits, NetworkLimits,
-};
+use crate::policy::{ConfiguredProfile, Endpoints, LoadedPolicy, LocalLimits, NetworkLimits};
 
 /// The mirror base URL the fixture answers on.
 pub const MIRROR: &str = "https://mirror.example";
@@ -42,7 +40,7 @@ pub const WITNESS: &str = "https://witness.example";
 pub const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
 
 /// The tree sizes the fixture publishes checkpoints at.
-pub const CHECKPOINT_SIZES: [u64; 5] = [8, 13, 20, 26, 32];
+pub const CHECKPOINT_SIZES: [u64; 5] = [8, 13, 20, 28, 32];
 
 /// One recorded exchange, in the shape [`crate::transcript`] replays.
 #[derive(Debug, Clone)]
@@ -79,11 +77,12 @@ pub struct MirrorFixture {
 fn seed(path: &Path, name: &'static str) -> TestKey {
     let hex = std::fs::read_to_string(path.join("keys").join(format!("{name}.seed")))
         .unwrap_or_else(|_| "00".repeat(32));
-    TestKey::from_seed_hex(name, hex.trim())
-        .unwrap_or_else(|_| TestKey::from_seed_hex(name, &"00".repeat(32)).unwrap_or_else(|_| {
+    TestKey::from_seed_hex(name, hex.trim()).unwrap_or_else(|_| {
+        TestKey::from_seed_hex(name, &"00".repeat(32)).unwrap_or_else(|_| {
             // Unreachable for a 32-byte constant; the fallback keeps this helper total.
             TestKey::from_seed_hex(name, &"01".repeat(32)).unwrap_or_else(|_| unreachable())
-        }))
+        })
+    })
 }
 
 fn unreachable() -> TestKey {
@@ -150,21 +149,21 @@ impl MirrorFixture {
 
     /// Publish a second, diverging checkpoint at `tree_size`.
     #[must_use]
-    pub fn with_equivocation_at(mut self, tree_size: u64) -> Self {
+    pub const fn with_equivocation_at(mut self, tree_size: u64) -> Self {
         self.equivocate_at = Some(tree_size);
         self
     }
 
     /// Sign the checkpoint at `tree_size` with a key no manifest version declares.
     #[must_use]
-    pub fn with_foreign_log_key(mut self, tree_size: u64) -> Self {
+    pub const fn with_foreign_log_key(mut self, tree_size: u64) -> Self {
         self.foreign_key_at = Some(tree_size);
         self
     }
 
     /// Serve different bytes for the entry at `index`, so root recomputation fails.
     #[must_use]
-    pub fn with_tampered_entry(mut self, index: usize) -> Self {
+    pub const fn with_tampered_entry(mut self, index: usize) -> Self {
         self.tampered = Some(index);
         self
     }
@@ -176,7 +175,7 @@ impl MirrorFixture {
     }
 
     fn published_sizes(&self) -> Vec<u64> {
-        let total = self.entries.len() as u64;
+        let total = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect()
     }
 
@@ -189,7 +188,7 @@ impl MirrorFixture {
     }
 
     fn leaf_hashes(&self, upto: u64) -> Vec<Hash> {
-        (0..upto as usize)
+        (0..usize::try_from(upto).unwrap_or(usize::MAX))
             .map(|index| LeafForm::Direct.leaf_hash(&self.entry_bytes(index)))
             .collect()
     }
@@ -200,7 +199,7 @@ impl MirrorFixture {
     /// which is the whole point: a checkpoint that commits one tree while the mirror serves
     /// another is exactly the substitution root recomputation exists to catch.
     fn root_at(&self, tree_size: u64) -> String {
-        let hashes: Vec<Hash> = (0..tree_size as usize)
+        let hashes: Vec<Hash> = (0..usize::try_from(tree_size).unwrap_or(usize::MAX))
             .map(|index| {
                 LeafForm::Direct.leaf_hash(self.entries.get(index).map_or(&[][..], Vec::as_slice))
             })
@@ -286,30 +285,30 @@ impl MirrorFixture {
     ///
     /// Whatever [`establish`] reports.
     pub fn establish(&self, tree_size: u64) -> CliResult<Anchored> {
-        let mirror = Mirror::new(self, MIRROR, TEST_LOG_PROFILE, NetworkLimits::default())?
-            .with_chunk(5);
+        let mirror =
+            Mirror::new(self, MIRROR, TEST_LOG_PROFILE, NetworkLimits::default())?.with_chunk(5);
         establish(&mirror, &self.policy, tree_size)
     }
 
     /// `(dataset, record)` of the corpus record retracted at entries 22, 23, 28, 29 and 31.
     #[must_use]
     pub fn record_f(&self) -> (String, String) {
-        self.record_named("22-retraction-f-authorized")
+        Self::record_named("22-retraction-f-authorized")
     }
 
     /// `(dataset, record)` of a corpus record no trigger names.
     #[must_use]
     pub fn record_b(&self) -> (String, String) {
-        self.record_named("02-ingestion-customers-b")
+        Self::record_named("02-ingestion-customers-b")
     }
 
     /// `(dataset, record)` of the record the correction at entry 6 names.
     #[must_use]
     pub fn record_a(&self) -> (String, String) {
-        self.record_named("06-correction-a-to-a2")
+        Self::record_named("06-correction-a-to-a2")
     }
 
-    fn record_named(&self, file: &str) -> (String, String) {
+    fn record_named(file: &str) -> (String, String) {
         let path = Self::corpus_root().join("vectors/statements").join(format!("{file}.json"));
         std::fs::read(path)
             .ok()
@@ -400,10 +399,8 @@ impl MirrorFixture {
     }
 
     fn range(&self, request: &Request) -> Response {
-        let Some(body) = request
-            .body
-            .as_ref()
-            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        let Some(body) =
+            request.body.as_ref().and_then(|body| serde_json::from_slice::<Value>(body).ok())
         else {
             return Response { status: 400, body: b"{}".to_vec() };
         };
@@ -420,7 +417,7 @@ impl MirrorFixture {
         };
         let entries: Vec<Value> = (from..to)
             .map(|index| {
-                let bytes = self.entry_bytes(index as usize);
+                let bytes = self.entry_bytes(usize::try_from(index).unwrap_or(usize::MAX));
                 json!({
                     "entry_index": index,
                     "envelope": serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
@@ -452,13 +449,15 @@ impl MirrorFixture {
             }
         }
         let hashes = self.leaf_hashes(to);
-        let Ok(proof) = atl_core::core::merkle::generate_consistency_proof(from, to, |level, at| {
-            if level == 0 {
-                hashes.get(usize::try_from(at).ok()?).copied()
-            } else {
-                None
-            }
-        }) else {
+        let Ok(proof) =
+            atl_core::core::merkle::generate_consistency_proof(from, to, |level, at| {
+                if level == 0 {
+                    hashes.get(usize::try_from(at).ok()?).copied()
+                } else {
+                    None
+                }
+            })
+        else {
             return Response { status: 400, body: b"{}".to_vec() };
         };
         ok(&json!({
@@ -484,10 +483,7 @@ impl MirrorFixture {
 }
 
 fn ok<T: serde::Serialize>(value: &T) -> Response {
-    Response {
-        status: 200,
-        body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()),
-    }
+    Response { status: 200, body: serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec()) }
 }
 
 fn base64_of(bytes: &[u8]) -> String {
@@ -553,10 +549,7 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
                 capabilities: ahl_core::receipt::AdaptorCapabilities::default(),
             },
         )]),
-        endpoints: Endpoints {
-            mirror: Some(MIRROR.to_owned()),
-            witness: Some(WITNESS.to_owned()),
-        },
+        endpoints: Endpoints { mirror: Some(MIRROR.to_owned()), witness: Some(WITNESS.to_owned()) },
         network: NetworkLimits::default(),
         local: LocalLimits::default(),
     }
@@ -661,9 +654,8 @@ mod tests {
     #[test]
     fn unknown_routes_answer_with_a_status_rather_than_inventing_a_body() {
         let fixture = MirrorFixture::conformance();
-        let response = fixture
-            .fetch(&Request::get(format!("{MIRROR}/v1/nothing")))
-            .expect("fixture answers");
+        let response =
+            fixture.fetch(&Request::get(format!("{MIRROR}/v1/nothing"))).expect("fixture answers");
         assert_eq!(response.status, 404);
     }
 

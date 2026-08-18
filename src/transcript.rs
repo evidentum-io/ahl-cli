@@ -75,13 +75,16 @@ enum Recorded {
     Unreachable(String),
 }
 
+/// The lookup key: method, URL and request body — the same triple a cache key binds.
+type ExchangeKey = (String, String, Vec<u8>);
+
 /// A replayable transcript.
 #[derive(Debug)]
 pub struct TranscriptFetcher {
-    exchanges: HashMap<(String, String, Vec<u8>), Recorded>,
+    exchanges: HashMap<ExchangeKey, Recorded>,
 }
 
-fn key(method: &str, url: &str, body: &[u8]) -> (String, String, Vec<u8>) {
+fn key(method: &str, url: &str, body: &[u8]) -> ExchangeKey {
     (method.to_owned(), url.to_owned(), body.to_vec())
 }
 
@@ -280,8 +283,7 @@ mod tests {
 
     #[test]
     fn an_empty_transcript_is_reported_as_empty() {
-        let fetcher =
-            TranscriptFetcher::from_slice(br#"{"exchanges":[]}"#).expect("parses");
+        let fetcher = TranscriptFetcher::from_slice(br#"{"exchanges":[]}"#).expect("parses");
         assert!(fetcher.is_empty());
         assert_eq!(fetcher.len(), 0);
         assert_eq!(transcript().len(), 3);

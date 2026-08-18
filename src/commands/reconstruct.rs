@@ -44,9 +44,7 @@ use crate::evaluation::{parse_artifact_time, EvaluationTime};
 use crate::net::Fetcher;
 use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
-use crate::report::{
-    CheckpointOut, Completeness, Finding, ObservationBound, RecordOut, Report,
-};
+use crate::report::{CheckpointOut, Completeness, Finding, ObservationBound, RecordOut, Report};
 use crate::witness;
 
 /// Options for one `reconstruct` run.
@@ -175,11 +173,7 @@ fn reconstruct<F: Fetcher>(
     );
     report.authenticated = true;
     report.completeness = Completeness::Complete;
-    report.checkpoint = Some(CheckpointOut {
-        log_id: anchored.checkpoint.log_id.clone(),
-        tree_size: anchored.checkpoint.tree_size,
-        root_hash: anchored.checkpoint.root_hash.clone(),
-    });
+    report.checkpoint = Some(CheckpointOut::of(&anchored.checkpoint));
     report.series_usable_bound = Some(ObservationBound::RunObserved);
     report.continued_history_bound = Some(ObservationBound::RunObserved);
     report.reconstruction = Some(reconstruction);
@@ -197,6 +191,10 @@ fn reconstruct<F: Fetcher>(
 /// established at that member before its cosignature is checked. Resolving a later
 /// checkpoint's witness key from `C`'s governance would validate a cosignature under a key set
 /// the corpus had already replaced.
+// The §11 witness checks in the order they must run: `C` is witnessed, then the forward
+// consistency step, then the second view a later checkpoint's own governance requires. The
+// order is the content, so it stays in one place.
+#[allow(clippy::too_many_lines)]
 fn witnessed<F: Fetcher>(
     fetcher: &F,
     witness_base: &str,
@@ -357,13 +355,12 @@ fn assemble(
         let index = index as u64;
         let Some(payload) = envelope.get("payload") else { continue };
         match payload.get("type").and_then(Value::as_str) {
-            Some("ingestion") => {
-                if payload.get("dataset").and_then(Value::as_str) == Some(dataset)
-                    && payload.get("record").and_then(Value::as_str) == Some(record)
-                    && introduction.is_none()
-                {
-                    introduction = statement_ref(index, envelope);
-                }
+            Some("ingestion")
+                if introduction.is_none()
+                    && payload.get("dataset").and_then(Value::as_str) == Some(dataset)
+                    && payload.get("record").and_then(Value::as_str) == Some(record) =>
+            {
+                introduction = statement_ref(index, envelope);
             }
             Some("derivation") => {
                 let outputs = payload.get("outputs").and_then(Value::as_array);
@@ -619,7 +616,8 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let vector: Value = serde_json::from_slice(
             &std::fs::read(
-                MirrorFixture::corpus_root().join("vectors/closure/non-retroactive-retraction.json"),
+                MirrorFixture::corpus_root()
+                    .join("vectors/closure/non-retroactive-retraction.json"),
             )
             .expect("vector"),
         )

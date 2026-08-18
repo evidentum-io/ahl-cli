@@ -87,10 +87,8 @@ impl SigningMaterial {
     }
 
     fn from_hex(hex_text: &str) -> CliResult<Self> {
-        let malformed = |detail: &str| CliError::Malformed {
-            what: "signing key",
-            detail: detail.to_owned(),
-        };
+        let malformed =
+            |detail: &str| CliError::Malformed { what: "signing key", detail: detail.to_owned() };
         if hex_text.lines().count() > 1 {
             return Err(malformed(
                 "key material must be a single line of hex; no PKCS#8, no PEM, no headers",
@@ -188,10 +186,9 @@ mod tests {
 
     #[test]
     fn an_unset_environment_variable_is_a_usage_error() {
-        let error = SigningMaterial::load(&KeySource::Env(
-            "AHL_CLI_TEST_KEY_THAT_IS_NEVER_SET".to_owned(),
-        ))
-        .expect_err("unset");
+        let error =
+            SigningMaterial::load(&KeySource::Env("AHL_CLI_TEST_KEY_THAT_IS_NEVER_SET".to_owned()))
+                .expect_err("unset");
         assert!(matches!(error, CliError::Usage(_)), "{error}");
     }
 
@@ -213,10 +210,8 @@ mod tests {
         let envelope = material.envelope(serde_json::json!({ "type": "ingestion" }));
         let key_id = material.key_id();
         let pubkey = material.pubkey();
-        assert!(
-            ahl_core::verify_envelope(&envelope, |id| (id == key_id).then(|| pubkey.clone()))
-                .expect("well-formed envelope")
-        );
+        assert!(ahl_core::verify_envelope(&envelope, |id| (id == key_id).then(|| pubkey.clone()))
+            .expect("well-formed envelope"));
     }
 
     #[test]

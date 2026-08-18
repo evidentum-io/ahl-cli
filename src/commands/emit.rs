@@ -18,6 +18,7 @@
 //! conforming statement, so every surface repeats it.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -99,17 +100,17 @@ impl Emitted {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("{BOUNDARY}\n\n"));
-        out.push_str(&format!("statement type: {}\n", self.statement_type));
-        out.push_str(&format!("signed by key_id: {}\n", self.key_id));
-        out.push_str(&format!("statement id: {}\n", self.statement_id));
-        out.push_str(&format!("entry id: {}\n", self.entry_id));
+        let _ = writeln!(out, "{BOUNDARY}\n");
+        let _ = writeln!(out, "statement type: {}", self.statement_type);
+        let _ = writeln!(out, "signed by key_id: {}", self.key_id);
+        let _ = writeln!(out, "statement id: {}", self.statement_id);
+        let _ = writeln!(out, "entry id: {}", self.entry_id);
         if let Some(path) = &self.written_to {
-            out.push_str(&format!("canonical envelope bytes written to: {path}\n"));
+            let _ = writeln!(out, "canonical envelope bytes written to: {path}");
         }
         out.push_str("\nnot evaluated by this tool:\n");
         for rule in &self.not_evaluated {
-            out.push_str(&format!("  - {rule}\n"));
+            let _ = writeln!(out, "  - {rule}");
         }
         out
     }
@@ -137,11 +138,7 @@ pub fn run(limits: LocalLimits, options: &Options) -> CliResult<Emitted> {
 
     let written_to = match &options.out {
         Some(path) => {
-            install::install(
-                path,
-                &canonical,
-                if options.force { Force::Yes } else { Force::No },
-            )?;
+            install::install(path, &canonical, if options.force { Force::Yes } else { Force::No })?;
             Some(path.display().to_string())
         }
         None => None,
@@ -152,9 +149,9 @@ pub fn run(limits: LocalLimits, options: &Options) -> CliResult<Emitted> {
         not_evaluated: NOT_EVALUATED.to_vec(),
         statement_type,
         key_id: material.key_id(),
-        statement_id: ahl_core::statement_id(&envelope).map_err(|source| CliError::Internal(
-            format!("a freshly built envelope has no payload: {source}"),
-        ))?,
+        statement_id: ahl_core::statement_id(&envelope).map_err(|source| {
+            CliError::Internal(format!("a freshly built envelope has no payload: {source}"))
+        })?,
         entry_id: ahl_core::entry_id(&envelope),
         envelope,
         written_to,
@@ -262,7 +259,11 @@ fn check_valid_time(payload: &Value) -> CliResult<()> {
                 .ok_or_else(|| malformed("`valid_time.from` is absent or not a string"))?;
             parse_artifact_time("valid_time.from", from)?;
             match interval.get("to") {
-                None => return Err(malformed("`valid_time.to` is absent; use `null` for an open interval")),
+                None => {
+                    return Err(malformed(
+                        "`valid_time.to` is absent; use `null` for an open interval",
+                    ))
+                }
                 Some(Value::Null) => {}
                 Some(Value::String(to)) => {
                     parse_artifact_time("valid_time.to", to)?;
@@ -380,9 +381,7 @@ fn check_propagation(payload: &Value) -> CliResult<()> {
         return Err(malformed("`affected_count` is absent or not an integer"));
     }
     if payload.get("complete_relative_to_manifest").and_then(Value::as_bool).is_none() {
-        return Err(malformed(
-            "`complete_relative_to_manifest` is absent or not a boolean",
-        ));
+        return Err(malformed("`complete_relative_to_manifest` is absent or not a boolean"));
     }
     Ok(())
 }
@@ -588,10 +587,7 @@ mod tests {
                 "keys": [],
             },
         });
-        assert_eq!(
-            emit(dir.path(), &manifest, None).expect("emitted").statement_type,
-            "manifest"
-        );
+        assert_eq!(emit(dir.path(), &manifest, None).expect("emitted").statement_type, "manifest");
         manifest["manifest"] = json!(commitment(0x55));
         assert!(emit(dir.path(), &manifest, None).is_err());
     }
@@ -625,7 +621,7 @@ mod tests {
             assert!(error.to_string().contains(member), "{error}");
         }
         // The legacy `log.id` spelling is not accepted when producing a new manifest.
-        let mut legacy = base.clone();
+        let mut legacy = base;
         let log = legacy["log"].as_object_mut().expect("object");
         let value = log.remove("log_id").expect("present");
         log.insert("id".to_owned(), value);
@@ -771,7 +767,8 @@ mod tests {
         let mut payload = ingestion();
         payload["valid_time"] = json!({ "from": "2026-08-16T12:00:00Z", "to": null });
         assert!(emit(dir.path(), &payload, None).is_ok());
-        payload["valid_time"] = json!({ "from": "2026-08-16T12:00:00Z", "to": "2026-09-01T00:00:00Z" });
+        payload["valid_time"] =
+            json!({ "from": "2026-08-16T12:00:00Z", "to": "2026-09-01T00:00:00Z" });
         assert!(emit(dir.path(), &payload, None).is_ok());
 
         for bad in [
@@ -805,7 +802,8 @@ mod tests {
             payload["corpus_checkpoint"].as_object_mut().expect("object").remove(member);
             assert!(emit(dir.path(), &payload, None).is_err(), "`{member}` is required");
         }
-        for member in ["trigger", "affected_root", "affected_count", "complete_relative_to_manifest"]
+        for member in
+            ["trigger", "affected_root", "affected_count", "complete_relative_to_manifest"]
         {
             let mut payload = base.clone();
             payload.as_object_mut().expect("object").remove(member);
@@ -840,8 +838,7 @@ mod tests {
     fn output_is_installed_atomically_and_never_clobbers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("statement.json");
-        let emitted =
-            emit(dir.path(), &ingestion(), Some(out.clone())).expect("emitted");
+        let emitted = emit(dir.path(), &ingestion(), Some(out.clone())).expect("emitted");
         assert_eq!(emitted.written_to.as_deref(), Some(out.display().to_string().as_str()));
         // The file is exactly the canonical entry bytes: what the log anchors, nothing else.
         assert_eq!(std::fs::read(&out).expect("read"), ahl_core::jcs(&emitted.envelope));
@@ -858,12 +855,7 @@ mod tests {
             std::fs::write(&path, bytes).expect("write");
             let result = run(
                 LocalLimits::default(),
-                &Options {
-                    payload: path,
-                    key: key_source(dir.path()),
-                    out: None,
-                    force: false,
-                },
+                &Options { payload: path, key: key_source(dir.path()), out: None, force: false },
             );
             assert!(result.is_err());
         }

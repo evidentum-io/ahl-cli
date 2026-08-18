@@ -37,26 +37,19 @@ enum Strength {
 }
 
 fn open_checked(what: &'static str, path: &Path, strength: Strength) -> CliResult<File> {
-    let fail = |detail: String| CliError::Open {
-        what,
-        path: path.display().to_string(),
-        detail,
-    };
+    let fail = |detail: String| CliError::Open { what, path: path.display().to_string(), detail };
 
     // `NOFOLLOW` applies to the final component only; that is exactly where the swap this
     // guards against happens, and is what every platform this crate targets supports.
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| {
-        if errno == rustix::io::Errno::LOOP || errno == rustix::io::Errno::MLINK {
-            fail("final path component is a symbolic link".to_owned())
-        } else {
-            fail(errno.to_string())
-        }
-    })?;
+    let fd =
+        rustix::fs::open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+            .map_err(|errno| {
+                if errno == rustix::io::Errno::LOOP || errno == rustix::io::Errno::MLINK {
+                    fail("final path component is a symbolic link".to_owned())
+                } else {
+                    fail(errno.to_string())
+                }
+            })?;
 
     let stat = rustix::fs::fstat(&fd).map_err(|errno| fail(errno.to_string()))?;
 
@@ -84,17 +77,17 @@ fn open_checked(what: &'static str, path: &Path, strength: Strength) -> CliResul
     Ok(File::from(fd))
 }
 
-fn read_bounded(what: &'static str, path: &Path, file: &mut File, cap: usize) -> CliResult<Vec<u8>> {
+fn read_bounded(
+    what: &'static str,
+    path: &Path,
+    file: &mut File,
+    cap: usize,
+) -> CliResult<Vec<u8>> {
     let mut buffer = Vec::new();
     // `cap + 1` so an exactly-`cap`-byte file is accepted and a `cap + 1`-byte one is not.
-    let read = file
-        .take(cap as u64 + 1)
-        .read_to_end(&mut buffer)
-        .map_err(|source| CliError::Open {
-            what,
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    let read = file.take(cap as u64 + 1).read_to_end(&mut buffer).map_err(|source| {
+        CliError::Open { what, path: path.display().to_string(), detail: source.to_string() }
+    })?;
     if read > cap {
         return Err(CliError::LimitExhausted(format!(
             "{what} at `{}` exceeds the {cap}-byte budget for local files",

@@ -128,8 +128,7 @@ mod tests {
 
     #[test]
     fn combining_is_associative_over_the_whole_lattice() {
-        let all =
-            [Outcome::Valid, Outcome::Error, Outcome::Unverifiable, Outcome::Invalid];
+        let all = [Outcome::Valid, Outcome::Error, Outcome::Unverifiable, Outcome::Invalid];
         for a in all {
             for b in all {
                 for c in all {

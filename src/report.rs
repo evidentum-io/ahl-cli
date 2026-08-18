@@ -19,6 +19,7 @@
 //! `--evaluation-time`, stdout is byte-identical.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use serde::Serialize;
 
@@ -100,6 +101,18 @@ pub struct CheckpointOut {
     pub tree_size: u64,
     /// Root hash.
     pub root_hash: String,
+}
+
+impl CheckpointOut {
+    /// The identity fields of a checkpoint, which is all a result is grounded on.
+    #[must_use]
+    pub fn of(checkpoint: &crate::checkpoint::Checkpoint) -> Self {
+        Self {
+            log_id: checkpoint.log_id.clone(),
+            tree_size: checkpoint.tree_size,
+            root_hash: checkpoint.root_hash.clone(),
+        }
+    }
 }
 
 /// A `(dataset, record)` pair, the only identity closure traversal uses.
@@ -225,66 +238,68 @@ impl Report {
     #[allow(clippy::too_many_lines)]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("status: {}\n", self.status));
-        out.push_str(&format!("reason: [{}] {}\n", self.reason_code, self.reason));
+        let _ = writeln!(out, "status: {}", self.status);
+        let _ = writeln!(out, "reason: [{}] {}", self.reason_code, self.reason);
         if let Some(claim_type) = &self.claim_type {
-            out.push_str(&format!("claim type: {claim_type}\n"));
+            let _ = writeln!(out, "claim type: {claim_type}");
         }
         if let Some(boundary) = &self.boundary {
-            out.push_str(&format!("boundary: {boundary}\n"));
+            let _ = writeln!(out, "boundary: {boundary}");
         }
         if let Some(assurance) = &self.assurance {
             // Assurance fields print in full: `governance: declared` and
             // `governance: enumerated` are different results and never collapse to one glyph.
             out.push_str("assurance:\n");
-            out.push_str(&format!("  governance: {}\n", assurance.governance));
-            out.push_str(&format!("  competing_triggers: {}\n", assurance.competing_triggers));
-            out.push_str(&format!("  witnessed: {}\n", assurance.witnessed));
-            out.push_str(&format!("  continued_history: {}\n", assurance.continued_history));
-            out.push_str(&format!("  content_binding: {}\n", assurance.content_binding));
+            let _ = writeln!(out, "  governance: {}", assurance.governance);
+            let _ = writeln!(out, "  competing_triggers: {}", assurance.competing_triggers);
+            let _ = writeln!(out, "  witnessed: {}", assurance.witnessed);
+            let _ = writeln!(out, "  continued_history: {}", assurance.continued_history);
+            let _ = writeln!(out, "  content_binding: {}", assurance.content_binding);
         }
         if let Some(checkpoint) = &self.checkpoint {
-            out.push_str(&format!(
-                "checkpoint: log_id={} tree_size={} root_hash={}\n",
+            let _ = writeln!(
+                out,
+                "checkpoint: log_id={} tree_size={} root_hash={}",
                 checkpoint.log_id, checkpoint.tree_size, checkpoint.root_hash
-            ));
+            );
         }
-        out.push_str(&format!("authenticated: {}\n", self.authenticated));
-        out.push_str(&format!("completeness: {}\n", completeness_str(self.completeness)));
-        out.push_str(&format!(
-            "evaluation time: {} (source: {})\n",
+        let _ = writeln!(out, "authenticated: {}", self.authenticated);
+        let _ = writeln!(out, "completeness: {}", completeness_str(self.completeness));
+        let _ = writeln!(
+            out,
+            "evaluation time: {} (source: {})",
             self.evaluation_time,
             match self.evaluation_time_source {
                 TimeSource::Clock => "clock",
                 TimeSource::Override => "override",
             }
-        ));
+        );
         if let Some(bound) = self.series_usable_bound {
-            out.push_str(&format!("series usable bound: {}\n", bound_str(bound)));
+            let _ = writeln!(out, "series usable bound: {}", bound_str(bound));
         }
         if let Some(bound) = self.continued_history_bound {
-            out.push_str(&format!("continued history bound: {}\n", bound_str(bound)));
+            let _ = writeln!(out, "continued history bound: {}", bound_str(bound));
         }
         if let Some(note) = &self.receipt_note {
             // Attributed to the receipt, never presented as a finding.
-            out.push_str(&format!("the receipt says (informative, not a finding): \"{note}\"\n"));
+            let _ = writeln!(out, "the receipt says (informative, not a finding): \"{note}\"");
         }
         if !self.findings.is_empty() {
             out.push_str("findings:\n");
             for finding in &self.findings {
-                out.push_str(&format!("  [{}] {}\n", finding.code, finding.detail));
+                let _ = writeln!(out, "  [{}] {}", finding.code, finding.detail);
             }
         }
         if let Some(affected) = &self.affected {
-            out.push_str(&format!("affected ({}):\n", affected.len()));
+            let _ = writeln!(out, "affected ({}):", affected.len());
             for record in affected {
-                out.push_str(&format!("  {} {}\n", record.dataset, record.record));
+                let _ = writeln!(out, "  {} {}", record.dataset, record.record);
             }
         }
         if let Some(topology) = &self.topology_affected {
-            out.push_str(&format!("topology affected ({}), unauthenticated:\n", topology.len()));
+            let _ = writeln!(out, "topology affected ({}), unauthenticated:", topology.len());
             for record in topology {
-                out.push_str(&format!("  {} {}\n", record.dataset, record.record));
+                let _ = writeln!(out, "  {} {}", record.dataset, record.record);
             }
         }
         out
@@ -464,10 +479,8 @@ mod tests {
         let mut complete = report;
         complete.completeness = Completeness::Complete;
         complete.topology_affected = None;
-        complete.affected = Some(vec![RecordOut {
-            dataset: "scores".to_owned(),
-            record: "sha256:cc".to_owned(),
-        }]);
+        complete.affected =
+            Some(vec![RecordOut { dataset: "scores".to_owned(), record: "sha256:cc".to_owned() }]);
         let text = complete.to_text();
         assert!(text.contains("completeness: complete"));
         assert!(text.contains("affected (1)"));

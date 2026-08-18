@@ -133,8 +133,9 @@ pub fn check_refusal(
     log_keys: &BTreeMap<String, String>,
     bound_log_id: &str,
 ) -> CliResult<CheckedRefusal> {
-    let unusable =
-        |detail: String| CliError::EvidenceMissing(format!("witness refusal is unusable: {detail}"));
+    let unusable = |detail: String| {
+        CliError::EvidenceMissing(format!("witness refusal is unusable: {detail}"))
+    };
 
     if refusal.get("type").and_then(Value::as_str) != Some("witness-refusal") {
         return Err(unusable("`type` is not `witness-refusal`".to_owned()));
@@ -146,9 +147,9 @@ pub fn check_refusal(
     // --- §11.2.5 step 1: the witness signature ----------------------------------------
     let key_id = string(refusal, "key_id").map_err(&unusable)?;
     let signature = string(refusal, "signature").map_err(&unusable)?;
-    let pubkey = witness_keys
-        .get(&key_id)
-        .ok_or_else(|| unusable(format!("witness key `{key_id}` is not one this corpus declares")))?;
+    let pubkey = witness_keys.get(&key_id).ok_or_else(|| {
+        unusable(format!("witness key `{key_id}` is not one this corpus declares"))
+    })?;
     let signed_bytes = signing_bytes(refusal)?;
     let key = ahl_core::decode_pubkey(pubkey)
         .map_err(|source| unusable(format!("witness key is unreadable: {source}")))?;
@@ -335,9 +336,12 @@ pub fn cosignature_holds(
     let missing = |member: &str| {
         CliError::EvidenceMissing(format!("witness cosignature carries no `{member}`"))
     };
-    let witness_id =
-        cosignature.get("witness_id").and_then(Value::as_str).ok_or_else(|| missing("witness_id"))?;
-    let key_id = cosignature.get("key_id").and_then(Value::as_str).ok_or_else(|| missing("key_id"))?;
+    let witness_id = cosignature
+        .get("witness_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| missing("witness_id"))?;
+    let key_id =
+        cosignature.get("key_id").and_then(Value::as_str).ok_or_else(|| missing("key_id"))?;
     let signature = cosignature
         .get("cosignature")
         .and_then(Value::as_str)
@@ -412,13 +416,7 @@ mod tests {
     }
 
     fn check(refusal: &Value) -> CliResult<CheckedRefusal> {
-        check_refusal(
-            refusal,
-            SigningForm::CanonicalJson,
-            &witness_keys(),
-            &log_keys(),
-            LOG_ID,
-        )
+        check_refusal(refusal, SigningForm::CanonicalJson, &witness_keys(), &log_keys(), LOG_ID)
     }
 
     #[test]
@@ -521,7 +519,12 @@ mod tests {
         (root_of(4), root_of(8), path)
     }
 
-    fn extension_failed(from_size: u64, to_size: u64, path: Vec<String>, offered_root: &str) -> Value {
+    fn extension_failed(
+        from_size: u64,
+        to_size: u64,
+        path: &[String],
+        offered_root: &str,
+    ) -> Value {
         let (from_root, _, _) = real_roots();
         sign_refusal(json!({
             "type": "witness-refusal", "witness_id": "witness-1", "log_id": LOG_ID,
@@ -538,7 +541,7 @@ mod tests {
     fn an_extension_failed_refusal_is_supported_only_when_the_carried_proof_really_fails() {
         let (_, _, path) = real_roots();
         // A genuinely failing proof: the offered root is not the tree the proof extends to.
-        let checked = check(&extension_failed(4, 8, path.clone(), &root(0xee))).expect("verified");
+        let checked = check(&extension_failed(4, 8, &path, &root(0xee))).expect("verified");
         assert_eq!(checked.reason, RefusalReason::ExtensionFailed);
         assert!(
             checked.finding().detail.contains("not evidence that no valid extension exists"),
@@ -547,7 +550,7 @@ mod tests {
 
         // A proof that verifies: the refusal is baseless and is reported as unsupported.
         let (_, to_root, path) = real_roots();
-        assert!(check(&extension_failed(4, 8, path, &to_root)).is_err());
+        assert!(check(&extension_failed(4, 8, &path, &to_root)).is_err());
     }
 
     #[test]
@@ -555,8 +558,7 @@ mod tests {
         // §11.2.2: the binding equalities are checked BEFORE verification, so a structurally
         // valid, genuinely failing proof for another pair is rejected rather than accepted.
         let (_, _, path) = real_roots();
-        let error =
-            check(&extension_failed(2, 6, path, &root(0xee))).expect_err("unbound proof");
+        let error = check(&extension_failed(2, 6, &path, &root(0xee))).expect_err("unbound proof");
         assert!(error.to_string().contains("§11.2.2"), "{error}");
         assert!(error.to_string().contains("before it is verified"), "{error}");
     }

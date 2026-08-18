@@ -222,7 +222,9 @@ impl Checkpoint {
 
 fn raw_digest(field: &'static str, value: &str) -> CliResult<[u8; 32]> {
     ahl_core::parse_hash_hex(value).map_err(|source| {
-        CliError::EvidenceMissing(format!("checkpoint `{field}` is not a sha256 family string: {source}"))
+        CliError::EvidenceMissing(format!(
+            "checkpoint `{field}` is not a sha256 family string: {source}"
+        ))
     })
 }
 
@@ -251,10 +253,11 @@ pub fn parse_atl_time(value: &str) -> CliResult<u64> {
     if fraction.len() != 9 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return Err(reject("does not carry exactly nine fractional digits"));
     }
-    let instant = crate::evaluation::parse_artifact_time("checkpoint_time", &format!("{seconds_part}Z"))
-        .map_err(|_| reject("is not RFC 3339"))?;
-    let seconds = u64::try_from(instant.unix_timestamp())
-        .map_err(|_| reject("precedes the Unix epoch"))?;
+    let instant =
+        crate::evaluation::parse_artifact_time("checkpoint_time", &format!("{seconds_part}Z"))
+            .map_err(|_| reject("is not RFC 3339"))?;
+    let seconds =
+        u64::try_from(instant.unix_timestamp()).map_err(|_| reject("precedes the Unix epoch"))?;
     let nanos: u64 = fraction.parse().map_err(|_| reject("has an unparseable fractional part"))?;
     seconds
         .checked_mul(1_000_000_000)
@@ -305,7 +308,8 @@ pub fn consistency_verifies(
 ) -> CliResult<bool> {
     let unreadable =
         |what: &str| CliError::EvidenceMissing(format!("consistency proof {what} is unreadable"));
-    let old_root = ahl_core::parse_hash_hex(&from.root_hash).map_err(|_| unreadable("from-root"))?;
+    let old_root =
+        ahl_core::parse_hash_hex(&from.root_hash).map_err(|_| unreadable("from-root"))?;
     let new_root = ahl_core::parse_hash_hex(&to.root_hash).map_err(|_| unreadable("to-root"))?;
     let hashes = path
         .iter()
@@ -388,9 +392,7 @@ mod tests {
         let signed = signed(cp, SigningForm::AtlBlob);
         assert!(signed.signature_verifies(SigningForm::AtlBlob, &keys()).expect("readable"));
         // The two forms sign different bytes, so a signature over one never validates the other.
-        assert!(!signed
-            .signature_verifies(SigningForm::CanonicalJson, &keys())
-            .expect("readable"));
+        assert!(!signed.signature_verifies(SigningForm::CanonicalJson, &keys()).expect("readable"));
     }
 
     #[test]

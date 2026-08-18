@@ -37,9 +37,7 @@ use crate::evaluation::EvaluationTime;
 use crate::net::Fetcher;
 use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
-use crate::report::{
-    CheckpointOut, Completeness, Finding, ObservationBound, RecordOut, Report,
-};
+use crate::report::{CheckpointOut, Completeness, Finding, ObservationBound, RecordOut, Report};
 
 /// How the operator named the trigger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,11 +252,7 @@ fn authenticated<F: Fetcher>(
     );
     report.authenticated = true;
     report.completeness = Completeness::Complete;
-    report.checkpoint = Some(CheckpointOut {
-        log_id: anchored.checkpoint.log_id.clone(),
-        tree_size: anchored.checkpoint.tree_size,
-        root_hash: anchored.checkpoint.root_hash.clone(),
-    });
+    report.checkpoint = Some(CheckpointOut::of(&anchored.checkpoint));
     // Never "series-usable" unqualified: usability is claimed as of what this run observed.
     report.series_usable_bound = Some(ObservationBound::RunObserved);
     report.affected = Some(records(closure.affected.into_iter()));
@@ -292,21 +286,17 @@ fn establish_view<F: Fetcher>(
         .keys()
         .next()
         .cloned()
-        .ok_or_else(|| {
-            CliError::ProfileNotPossessed {
-                id: "<none configured>".to_owned(),
-            }
-        })?;
+        .ok_or_else(|| CliError::ProfileNotPossessed { id: "<none configured>".to_owned() })?;
     let mirror = Mirror::new(fetcher, base, &profile_id, policy.network)?;
     anchored::establish(&mirror, policy, tree_size)
 }
 
 fn trigger_record(anchored: &Anchored, index: u64) -> CliResult<(String, String)> {
-    let envelope = anchored
-        .statements
-        .get(usize::try_from(index).unwrap_or(usize::MAX))
-        .ok_or_else(|| {
-            CliError::EvidenceMissing(format!("entry index {index} is not committed by this checkpoint"))
+    let envelope =
+        anchored.statements.get(usize::try_from(index).unwrap_or(usize::MAX)).ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "entry index {index} is not committed by this checkpoint"
+            ))
         })?;
     let payload = envelope.get("payload").ok_or_else(|| {
         CliError::EvidenceMissing(format!("the entry at index {index} carries no payload"))
@@ -478,7 +468,7 @@ mod tests {
         let path = dir.path().join("corpus.json");
         std::fs::write(&path, b"{ this is not json").expect("write");
         let mut options = topology_options(TriggerRef::EntryIndex(0));
-        options.corpus = Some(path.clone());
+        options.corpus = Some(path);
         let report = run_topology(&options);
         assert_eq!(report.status, "unverifiable", "a parse failure inside topology mode");
 
@@ -525,10 +515,7 @@ mod tests {
         assert_eq!(report.series_usable_bound, Some(ObservationBound::RunObserved));
         assert!(report.affected.is_some());
         assert!(report.topology_affected.is_none());
-        assert_eq!(
-            report.checkpoint.as_ref().map(|checkpoint| checkpoint.tree_size),
-            Some(8)
-        );
+        assert_eq!(report.checkpoint.as_ref().map(|checkpoint| checkpoint.tree_size), Some(8));
     }
 
     #[test]
@@ -594,10 +581,8 @@ mod tests {
 
         let mut fixture = MirrorFixture::conformance();
         fixture.policy.endpoints.mirror = None;
-        let report = run_authenticated(
-            &fixture,
-            &authenticated_options(TriggerRef::EntryIndex(6), 8),
-        );
+        let report =
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(report.status, "error");
     }
 
