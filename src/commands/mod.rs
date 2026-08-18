@@ -4,4 +4,6 @@
 //! never adjudicates a log-position-dependent rule; `closure` and `reconstruct` refuse to
 //! produce an authenticated result until every element §3 requires is established.
 
+pub mod emit;
+pub mod inspect;
 pub mod verify;

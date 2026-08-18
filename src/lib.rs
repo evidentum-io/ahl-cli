@@ -1,6 +1,7 @@
 //! placeholder
 #![forbid(unsafe_code)]
 pub mod cache;
+pub mod checkpoint;
 pub mod commands;
 pub mod duration;
 pub mod error;
