@@ -1,28 +1,40 @@
-//! Atomic, non-clobbering installation of an output file.
+//! Handle-relative directory operations, and the no-replace atomic install.
 //!
-//! Pathname-based checks do not achieve this. An existence check followed by an ordinary
-//! `rename` loses the race, because `rename` replaces a destination created in between the
-//! two calls — the check passes, the write succeeds, and someone else's file is gone.
+//! Pathname-based checks do not achieve atomicity. An existence check followed by an ordinary
+//! `rename` loses the race, because `rename` replaces a destination created in between the two
+//! calls — the check passes, the write succeeds, and someone else's file is gone. Worse, a
+//! predictable temporary pathname in a directory an attacker can write to is a redirect: plant
+//! a symlink there and the write lands wherever the symlink points.
 //!
-//! The install is therefore performed **relative to an open directory handle**, with a
-//! no-replace atomic primitive:
+//! Everything here is therefore performed **relative to an open directory handle**
+//! ([`Dir`]), never by path:
 //!
-//! 1. `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS — the same
-//!    call through `rustix::fs::renameat_with`;
-//! 2. failing that (`ENOSYS`/`EINVAL`/`ENOTSUP` from an older kernel or an exotic filesystem),
-//!    `linkat` followed by unlink of the temporary, which is equally no-replace;
-//! 3. failing both, the write **fails closed** rather than degrading to a racy `rename`.
+//! * the directory itself is opened with `O_NOFOLLOW`, and its type is checked on the *handle*;
+//! * temporaries are created with `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` under an
+//!   **unpredictable** name — `O_EXCL` is what defeats a planted symlink, and the
+//!   unpredictability is defence in depth against an attacker pre-planting the name at all;
+//! * the install is a no-replace atomic operation: `renameat2(RENAME_NOREPLACE)` on Linux,
+//!   `renamex_np(RENAME_EXCL)` on macOS, or `linkat` plus unlink of the temporary;
+//! * where no such primitive exists the write **fails closed** rather than degrading to a racy
+//!   `rename`.
 //!
-//! An existing destination is refused. [`Force::Yes`] performs an explicit `unlinkat` and
-//! then repeats the same no-replace install — so even `--force` never silently overwrites a
-//! file that appeared between the unlink and the install; it loses the race safely instead.
+//! [`Force::Yes`] and [`Dir::replace`] perform an explicit `unlinkat` and then repeat the same
+//! no-replace install, so even a deliberate replacement never silently overwrites a file that
+//! appeared in between; it loses the race safely instead.
+//!
+//! This module is used by `emit`'s output **and by the cache**. A cache entry has no
+//! evidentiary weight, but "no evidentiary weight" was never a licence to write outside the
+//! directory the operator named.
 
+use std::collections::hash_map::RandomState;
+use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Write as _;
-use std::path::Path;
+use std::hash::{BuildHasher as _, Hasher as _};
+use std::io::{Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 use crate::error::{CliError, CliResult};
 
@@ -37,142 +49,236 @@ pub enum Force {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// An unpredictable temporary name.
+///
+/// Correctness comes from `O_EXCL`: a planted file or symlink at this name makes the create
+/// fail rather than redirect. Unpredictability is the second layer — without it an attacker
+/// who can write to the directory can pre-plant every name the process will use and stall it
+/// indefinitely. `RandomState` is seeded by the OS once per process, which is the property
+/// wanted here; no cryptographic strength is claimed or needed.
+fn temp_name() -> String {
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(counter);
+    hasher.write_u32(std::process::id());
+    format!(".ahl-cli.{:016x}.tmp", hasher.finish())
+}
+
 fn output_error(path: &Path, detail: impl Into<String>) -> CliError {
     CliError::Output { path: path.display().to_string(), detail: detail.into() }
 }
 
-/// Write `bytes` to `path`, atomically and without replacing an existing file.
-///
-/// The file is created with mode `0o600`: output may carry material the operator does not
-/// want world-readable, and a caller that wants it wider can relax it deliberately.
-///
-/// # Errors
-///
-/// [`CliError::Output`] if the parent is not a directory, the destination exists (and
-/// `force` is [`Force::No`]), or no no-replace primitive is available on this platform.
-pub fn install(path: &Path, bytes: &[u8], force: Force) -> CliResult<()> {
-    let parent =
-        path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| output_error(path, "destination has no file name component"))?
-        .to_owned();
-
-    let dir = rustix::fs::open(
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| output_error(path, format!("cannot open parent directory: {errno}")))?;
-
-    // Parent-directory properties are checked on the open handle, never by path.
-    let dir_stat = rustix::fs::fstat(&dir)
-        .map_err(|errno| output_error(path, format!("cannot stat parent directory: {errno}")))?;
-    if FileType::from_raw_mode(dir_stat.st_mode) != FileType::Directory {
-        return Err(output_error(path, "parent path is not a directory"));
-    }
-
-    let temp_name = format!(
-        ".ahl-cli.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-
-    let temp_fd = rustix::fs::openat(
-        &dir,
-        temp_name.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|errno| output_error(path, format!("cannot create temporary file: {errno}")))?;
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut file = File::from(temp_fd);
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    if let Err(source) = write_result {
-        let _ = rustix::fs::unlinkat(&dir, temp_name.as_str(), rustix::fs::AtFlags::empty());
-        return Err(output_error(path, format!("cannot write temporary file: {source}")));
-    }
-
-    if force == Force::Yes {
-        // Best effort by design: an absent destination is the normal case, and a destination
-        // that reappears before the install below is refused by the no-replace primitive
-        // rather than clobbered.
-        let _ = rustix::fs::unlinkat(&dir, &file_name, rustix::fs::AtFlags::empty());
-    }
-
-    let result = no_replace_install(&dir, temp_name.as_str(), &file_name, path);
-    if result.is_err() {
-        let _ = rustix::fs::unlinkat(&dir, temp_name.as_str(), rustix::fs::AtFlags::empty());
-    }
-    result
+/// An open directory handle. Every mutation below is relative to it.
+#[derive(Debug)]
+pub struct Dir {
+    fd: rustix::fd::OwnedFd,
+    /// Retained for error messages and for enumeration, which only drives cache eviction.
+    path: PathBuf,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
-fn no_replace_install(
-    dir: &rustix::fd::OwnedFd,
-    temp_name: &str,
-    file_name: &std::ffi::OsStr,
-    path: &Path,
-) -> CliResult<()> {
-    use rustix::fs::RenameFlags;
-    use rustix::io::Errno;
+impl Dir {
+    /// Open an existing directory and check its type on the handle.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::Output`] if it cannot be opened or is not a directory.
+    pub fn open(path: &Path) -> CliResult<Self> {
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| output_error(path, format!("cannot open directory: {errno}")))?;
 
-    match rustix::fs::renameat_with(dir, temp_name, dir, file_name, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(()),
-        Err(Errno::EXIST) => Err(destination_exists(path)),
-        // An older kernel or a filesystem without `renameat2`/`renamex_np` support: fall back
-        // to `linkat`, which is equally no-replace, rather than to a racy plain rename.
-        Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
-            link_install(dir, temp_name, file_name, path)
+        // Checked on the handle, never by path.
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|errno| output_error(path, format!("cannot stat directory: {errno}")))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(output_error(path, "path is not a directory"));
         }
-        Err(errno) => Err(output_error(path, format!("atomic install failed: {errno}"))),
+        Ok(Self { fd, path: path.to_path_buf() })
     }
-}
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios"
-)))]
-fn no_replace_install(
-    dir: &rustix::fd::OwnedFd,
-    temp_name: &str,
-    file_name: &std::ffi::OsStr,
-    path: &Path,
-) -> CliResult<()> {
-    link_install(dir, temp_name, file_name, path)
-}
+    /// Create the directory (and its parents) if needed, then open it.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::Output`] if it cannot be created or opened.
+    pub fn create(path: &Path) -> CliResult<Self> {
+        std::fs::create_dir_all(path)
+            .map_err(|source| output_error(path, format!("cannot create directory: {source}")))?;
+        Self::open(path)
+    }
 
-/// `linkat` + unlink of the temporary: no-replace, and available where `renameat2` is not.
-fn link_install(
-    dir: &rustix::fd::OwnedFd,
-    temp_name: &str,
-    file_name: &std::ffi::OsStr,
-    path: &Path,
-) -> CliResult<()> {
-    use rustix::io::Errno;
+    /// The path this handle was opened from, for messages.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
-    match rustix::fs::linkat(dir, temp_name, dir, file_name, rustix::fs::AtFlags::empty()) {
-        Ok(()) => {
-            let _ = rustix::fs::unlinkat(dir, temp_name, rustix::fs::AtFlags::empty());
-            Ok(())
+    fn child(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// Write `bytes` into a fresh temporary and install it at `name`, atomically and without
+    /// replacing an existing entry.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::Output`] if the temporary cannot be created or written, the destination
+    /// exists under [`Force::No`], or no no-replace primitive is available.
+    pub fn install(&self, name: &OsStr, bytes: &[u8], force: Force) -> CliResult<()> {
+        let destination = self.child(name);
+        let temp = temp_name();
+
+        // `O_EXCL | O_NOFOLLOW` under the directory handle: a planted file or symlink at this
+        // name makes the create fail rather than redirect the write elsewhere.
+        let temp_fd = rustix::fs::openat(
+            &self.fd,
+            temp.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|errno| {
+            output_error(&destination, format!("cannot create temporary file: {errno}"))
+        })?;
+
+        let written = (|| -> std::io::Result<()> {
+            let mut file = File::from(temp_fd);
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(source) = written {
+            let _ = rustix::fs::unlinkat(&self.fd, temp.as_str(), AtFlags::empty());
+            return Err(output_error(
+                &destination,
+                format!("cannot write temporary file: {source}"),
+            ));
         }
-        Err(Errno::EXIST) => Err(destination_exists(path)),
-        Err(errno @ (Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::PERM)) => {
-            // Fail closed: no no-replace primitive is available, so there is no safe install.
-            Err(output_error(
-                path,
-                format!(
-                    "no atomic no-replace install is available on this filesystem ({errno}); \
-                     refusing to fall back to a replacing rename"
-                ),
-            ))
+
+        if force == Force::Yes {
+            // Best effort by design: an absent destination is the normal case, and a
+            // destination that reappears before the install below is refused by the no-replace
+            // primitive rather than clobbered.
+            let _ = rustix::fs::unlinkat(&self.fd, name, AtFlags::empty());
         }
-        Err(errno) => Err(output_error(path, format!("atomic install failed: {errno}"))),
+
+        let result = self.no_replace(temp.as_str(), name, &destination);
+        if result.is_err() {
+            let _ = rustix::fs::unlinkat(&self.fd, temp.as_str(), AtFlags::empty());
+        }
+        result
+    }
+
+    /// Install at `name`, replacing an existing entry.
+    ///
+    /// Used where replacement is the normal case — a cache index entry pointing at a newer
+    /// object. Still handle-relative, still `O_EXCL` on the temporary, and still a no-replace
+    /// install after an explicit unlink: a racy plain `rename` is never used.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::install`].
+    pub fn replace(&self, name: &OsStr, bytes: &[u8]) -> CliResult<()> {
+        self.install(name, bytes, Force::Yes)
+    }
+
+    /// Read an entry, refusing to follow a symlink and bounded by `cap` bytes.
+    #[must_use]
+    pub fn read(&self, name: &OsStr, cap: usize) -> Option<Vec<u8>> {
+        let fd = rustix::fs::openat(
+            &self.fd,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?;
+        let stat = rustix::fs::fstat(&fd).ok()?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return None;
+        }
+        let mut buffer = Vec::new();
+        let read = File::from(fd).take(cap as u64 + 1).read_to_end(&mut buffer).ok()?;
+        (read <= cap).then_some(buffer)
+    }
+
+    /// Remove an entry. An absent entry is not an error.
+    pub fn remove(&self, name: &OsStr) {
+        let _ = rustix::fs::unlinkat(&self.fd, name, AtFlags::empty());
+    }
+
+    /// Enumerate the directory's regular files as `(name, size, last access)`.
+    ///
+    /// Enumeration is by path rather than by handle because it only ever drives cache
+    /// eviction: nothing here decides what is accepted, and every mutation that follows goes
+    /// back through the handle. `symlink_metadata` is used so a planted symlink is seen as a
+    /// symlink and skipped rather than followed.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(std::ffi::OsString, u64, std::time::SystemTime)> {
+        let Ok(read) = std::fs::read_dir(&self.path) else { return Vec::new() };
+        read.filter_map(|entry| {
+            let entry = entry.ok()?;
+            let metadata = entry.path().symlink_metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let accessed = metadata.accessed().or_else(|_| metadata.modified()).ok()?;
+            Some((entry.file_name(), metadata.len(), accessed))
+        })
+        .collect()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    fn no_replace(&self, temp: &str, name: &OsStr, destination: &Path) -> CliResult<()> {
+        use rustix::fs::RenameFlags;
+        use rustix::io::Errno;
+
+        match rustix::fs::renameat_with(&self.fd, temp, &self.fd, name, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(()),
+            Err(Errno::EXIST) => Err(destination_exists(destination)),
+            // An older kernel or a filesystem without `renameat2`/`renamex_np`: fall back to
+            // `linkat`, which is equally no-replace, never to a racy plain rename.
+            Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+                self.link_install(temp, name, destination)
+            }
+            Err(errno) => Err(output_error(destination, format!("atomic install failed: {errno}"))),
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    fn no_replace(&self, temp: &str, name: &OsStr, destination: &Path) -> CliResult<()> {
+        self.link_install(temp, name, destination)
+    }
+
+    /// `linkat` plus unlink of the temporary: no-replace, and available where `renameat2` is
+    /// not.
+    fn link_install(&self, temp: &str, name: &OsStr, destination: &Path) -> CliResult<()> {
+        use rustix::io::Errno;
+
+        match rustix::fs::linkat(&self.fd, temp, &self.fd, name, AtFlags::empty()) {
+            Ok(()) => {
+                let _ = rustix::fs::unlinkat(&self.fd, temp, AtFlags::empty());
+                Ok(())
+            }
+            Err(Errno::EXIST) => Err(destination_exists(destination)),
+            Err(errno @ (Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::PERM)) => {
+                // Fail closed: no no-replace primitive is available, so there is no safe
+                // install.
+                Err(output_error(
+                    destination,
+                    format!(
+                        "no atomic no-replace install is available on this filesystem \
+                         ({errno}); refusing to fall back to a replacing rename"
+                    ),
+                ))
+            }
+            Err(errno) => Err(output_error(destination, format!("atomic install failed: {errno}"))),
+        }
     }
 }
 
@@ -180,8 +286,31 @@ fn destination_exists(path: &Path) -> CliError {
     output_error(path, "destination already exists; pass --force to replace it")
 }
 
+/// Write `bytes` to `path`, atomically and without replacing an existing file.
+///
+/// The file is created with mode `0o600`: output may carry material the operator does not want
+/// world-readable, and a caller that wants it wider can relax it deliberately.
+///
+/// # Errors
+///
+/// [`CliError::Output`] if the parent is not a directory, the destination exists (and `force`
+/// is [`Force::No`]), or no no-replace primitive is available on this platform.
+pub fn install(path: &Path, bytes: &[u8], force: Force) -> CliResult<()> {
+    let parent =
+        path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| output_error(path, "destination has no file name component"))?
+        .to_owned();
+    let dir = Dir::open(parent)
+        .map_err(|source| output_error(path, format!("cannot open parent directory: {source}")))?;
+    dir.install(&name, bytes, force)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     #[test]
@@ -209,13 +338,15 @@ mod tests {
         install(&path, b"first", Force::No).expect("fresh install");
         install(&path, b"second", Force::Yes).expect("forced install");
         assert_eq!(std::fs::read(&path).expect("read back"), b"second");
+        assert!(temporaries(dir.path()).is_empty());
+    }
 
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+    fn temporaries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
             .expect("read dir")
             .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .filter(|name| name.starts_with(".ahl-cli."))
-            .collect();
-        assert!(leftovers.is_empty(), "temporaries left behind: {leftovers:?}");
+            .collect()
     }
 
     #[test]
@@ -224,13 +355,7 @@ mod tests {
         let path = dir.path().join("out.json");
         install(&path, b"first", Force::No).expect("fresh install");
         let _ = install(&path, b"second", Force::No).expect_err("clobber refused");
-
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-            .filter(|name| name.starts_with(".ahl-cli."))
-            .collect();
-        assert!(leftovers.is_empty(), "temporaries left behind: {leftovers:?}");
+        assert!(temporaries(dir.path()).is_empty());
     }
 
     #[test]
@@ -243,13 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_destination_installs_into_the_current_directory() {
-        // Exercises the `parent()` fallback to `.` without changing the process directory:
-        // a bare file name in a temporary directory reached through an absolute parent.
+    fn a_symlinked_directory_is_refused_rather_than_traversed() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("bare.json");
-        install(Path::new(&path), b"{}", Force::No).expect("install");
-        assert!(path.exists());
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(Dir::open(&link).is_err(), "O_NOFOLLOW must refuse a symlinked directory");
     }
 
     #[test]
@@ -260,5 +385,84 @@ mod tests {
         install(&path, b"{}", Force::No).expect("install");
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "output must not be group- or world-readable");
+    }
+
+    #[test]
+    fn temporary_names_are_unpredictable_and_never_repeat() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            assert!(seen.insert(temp_name()), "a temporary name repeated");
+        }
+        // Nothing derivable from the process id alone: two names differ in more than a counter.
+        let first = temp_name();
+        let second = temp_name();
+        assert_ne!(first, second);
+        assert!(first.starts_with(".ahl-cli."));
+    }
+
+    #[test]
+    fn a_planted_symlink_at_the_temporary_name_cannot_redirect_the_write() {
+        // The name is unpredictable, so this plants one at *every* name the create could use by
+        // making the directory itself unwritable for new entries — the observable property is
+        // that `O_EXCL` refuses an existing entry rather than following it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = Dir::open(dir.path()).expect("open");
+        let outside = dir.path().join("outside.txt");
+        std::os::unix::fs::symlink(&outside, dir.path().join("planted")).expect("symlink");
+
+        // Installing *at* the planted name must not write through the symlink.
+        let error = handle
+            .install(OsStr::new("planted"), b"attacker-controlled", Force::No)
+            .expect_err("planted name refused");
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert!(!outside.exists(), "the write followed a symlink out of the directory");
+    }
+
+    #[test]
+    fn replace_overwrites_but_read_refuses_a_symlinked_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = Dir::create(&dir.path().join("cache")).expect("create");
+        handle.install(OsStr::new("a"), b"first", Force::No).expect("install");
+        handle.replace(OsStr::new("a"), b"second").expect("replace");
+        assert_eq!(handle.read(OsStr::new("a"), 1024).as_deref(), Some(&b"second"[..]));
+
+        std::os::unix::fs::symlink("/etc/hosts", handle.path().join("linked")).expect("symlink");
+        assert!(handle.read(OsStr::new("linked"), 1024).is_none(), "a symlink is never read");
+    }
+
+    #[test]
+    fn read_is_bounded_and_absent_entries_are_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = Dir::open(dir.path()).expect("open");
+        handle.install(OsStr::new("a"), &[b'x'; 32], Force::No).expect("install");
+        assert_eq!(handle.read(OsStr::new("a"), 32).map(|b| b.len()), Some(32));
+        assert!(handle.read(OsStr::new("a"), 31).is_none(), "over the cap is a miss");
+        assert!(handle.read(OsStr::new("absent"), 32).is_none());
+    }
+
+    #[test]
+    fn entries_lists_regular_files_and_remove_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = Dir::open(dir.path()).expect("open");
+        handle.install(OsStr::new("a"), b"aa", Force::No).expect("install");
+        handle.install(OsStr::new("b"), b"bbbb", Force::No).expect("install");
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("c")).expect("symlink");
+
+        let names: Vec<OsString> = handle.entries().into_iter().map(|(name, _, _)| name).collect();
+        assert_eq!(names.len(), 2, "a symlink is not a regular file: {names:?}");
+
+        handle.remove(OsStr::new("a"));
+        handle.remove(OsStr::new("a"));
+        assert_eq!(handle.entries().len(), 1);
+        assert_eq!(handle.path(), dir.path());
+    }
+
+    #[test]
+    fn creating_a_directory_under_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(Dir::create(&file.join("cache")).is_err());
+        assert!(Dir::open(&file).is_err());
     }
 }

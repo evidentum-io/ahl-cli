@@ -24,6 +24,11 @@ use common::{ahl_cli, corpus, fixtures, policy, PolicySpec};
 const AT: &str = "--evaluation-time";
 const FIXED: &str = "2026-08-16T12:00:00Z";
 
+/// Collapse runs of whitespace, so a comparison is on the words rather than on the layout.
+fn words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn index() -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(corpus().join("receipts/index.json")).expect("index"))
         .expect("index parses")
@@ -56,8 +61,15 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
                 assert_eq!(report["status"], "valid", "{file}");
                 assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
                 // The verdict is rendered from `ahl_core::receipt::Verdict` and is never
-                // stronger than the boundary that struct carries.
-                assert_eq!(report["boundary"], vector["boundary"], "{file}");
+                // stronger than the boundary that struct carries. Compared on the words: the
+                // corpus index records one boundary with a run of spaces where its generator
+                // wrapped the line, and the rule under test is the strength of the claim, not
+                // its layout.
+                assert_eq!(
+                    words(report["boundary"].as_str().unwrap_or_default()),
+                    words(vector["boundary"].as_str().unwrap_or_default()),
+                    "{file}"
+                );
             }
             "reject" => {
                 assert_eq!(run.code, 1, "{file}: {}", report["reason"]);
@@ -262,17 +274,18 @@ fn every_statement_vector_is_re_emitted_and_matches_its_published_identifiers() 
 
 #[test]
 fn the_published_witness_refusal_vector_is_checked_in_full() {
-    // The corpus's refusal vector predates the §11.2.1 taxonomy: it declares `inconsistent`,
-    // a reason adaptor profile §11.2.4 removed rather than renamed. A verifier must refuse a
-    // reason it cannot independently recheck, so the vector is expected to be *unusable* under
-    // the current profile — which is the finding, not a bug in either.
+    // The corpus has adopted the §11.2.1 taxonomy: the vector now declares `equivocation`,
+    // which is the one self-contained reason — two signed checkpoints, one `tree_size`, two
+    // roots, no possible append-only tree. Every §11.2.5 step is run over it here, and it must
+    // verify.
     let vector: serde_json::Value = serde_json::from_slice(
         &std::fs::read(corpus().join("vectors/witness/refusal-evidence.json")).expect("vector"),
     )
     .expect("parses");
+    let refusal = &vector["refusal"];
     assert_eq!(
-        vector["refusal"]["reason"], "inconsistent",
-        "if the corpus adopts the §11.2.1 taxonomy this test should be updated, not deleted"
+        refusal["reason"], "equivocation",
+        "the removed reason `inconsistent` must never come back (§11.2.4)"
     );
 
     let log_key = ahl_core::TestKey::from_seed_hex(
@@ -285,17 +298,38 @@ fn the_published_witness_refusal_vector_is_checked_in_full() {
         std::fs::read_to_string(corpus().join("keys/witness-1.seed")).expect("seed").trim(),
     )
     .expect("seed");
+    let witness_keys =
+        std::collections::BTreeMap::from([(witness_key.key_id(), witness_key.pubkey())]);
+    let log_keys = std::collections::BTreeMap::from([(log_key.key_id(), log_key.pubkey())]);
+    let log_id = refusal["log_id"].as_str().expect("log id");
 
-    let error = ahl_cli::witness::check_refusal(
-        &vector["refusal"],
+    let checked = ahl_cli::witness::check_refusal(
+        refusal,
         ahl_cli::checkpoint::SigningForm::CanonicalJson,
-        &std::collections::BTreeMap::from([(witness_key.key_id(), witness_key.pubkey())]),
-        &std::collections::BTreeMap::from([(log_key.key_id(), log_key.pubkey())]),
-        vector["refusal"]["log_id"].as_str().expect("log id"),
+        &witness_keys,
+        &log_keys,
+        log_id,
     )
-    .expect_err("a removed reason is never accepted");
-    assert!(error.to_string().contains("§11.2.1"), "{error}");
-    assert!(error.to_string().contains("removed, not renamed"), "{error}");
+    .expect("the published refusal verifies in full");
+    assert_eq!(checked.reason, ahl_cli::witness::RefusalReason::Equivocation);
+    assert_eq!(checked.retained_size, checked.offered_size, "equivocation is one size, two roots");
+
+    // A verified `equivocation` refusal is evidence about the log's conduct within the boundary
+    // of its reason, never a verdict about any particular statement.
+    let finding = checked.finding();
+    assert_eq!(finding.code, "witness-refusal-equivocation");
+    assert!(finding.detail.contains("two different roots"), "{}", finding.detail);
+
+    // And it is bound to the corpus's own Data Tree: the same evidence offered for another log
+    // is unusable.
+    assert!(ahl_cli::witness::check_refusal(
+        refusal,
+        ahl_cli::checkpoint::SigningForm::CanonicalJson,
+        &witness_keys,
+        &log_keys,
+        &format!("sha256:{}", "99".repeat(32)),
+    )
+    .is_err());
 }
 
 #[test]

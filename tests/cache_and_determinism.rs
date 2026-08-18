@@ -38,6 +38,25 @@ fn poison_objects(cache_dir: &Path) {
     }
 }
 
+/// Store **semantically wrong bytes under their own matching digest** and repoint every index
+/// entry at them.
+///
+/// This is the poisoning that matters, and the one a digest check cannot catch: an attacker
+/// with write access to the cache directory can always store bytes whose digest is exactly the
+/// digest the index names. Only the caller's own proof checks catch it, and only an eviction
+/// driven by *those* restores the cold-cache answer.
+fn poison_semantically(cache_dir: &Path) {
+    let attacker = br#"{"range":{"from_index":0,"to_index":1},"entries":[],"checkpoint":{}}"#;
+    let digest = ahl_core::sha256_hex(attacker);
+    let object_name: String =
+        digest.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    std::fs::write(cache_dir.join("objects").join(&object_name), attacker).expect("plant object");
+    for entry in std::fs::read_dir(cache_dir.join("index")).expect("request index") {
+        let path = entry.expect("entry").path();
+        std::fs::write(&path, &digest).expect("repoint index");
+    }
+}
+
 /// Point every index entry at a digest nothing is stored under.
 fn poison_index(cache_dir: &Path) {
     let index = cache_dir.join("index");
@@ -126,6 +145,24 @@ fn assert_cache_invariant(scenario: &Scenario<'_>) {
     assert_eq!(
         crossed.stdout, cold.stdout,
         "{}: a cross-wired index changed the verdict",
+        scenario.name
+    );
+
+    // Repopulate, then poison **semantically**: bytes that pass every integrity check the
+    // cache can perform and are simply the wrong answer. A digest check cannot catch this, so
+    // eviction has to be driven by the caller's own proof checks; without that, this run
+    // returns `3` where the cold one returned `0`.
+    let _ = run_with_cache(scenario, &cache);
+    poison_semantically(&cache);
+    let semantic = run_with_cache(scenario, &cache);
+    assert_eq!(
+        semantic.code, cold.code,
+        "{}: a digest-consistent poisoned object changed the outcome",
+        scenario.name
+    );
+    assert_eq!(
+        semantic.stdout, cold.stdout,
+        "{}: a digest-consistent poisoned object changed the verdict",
         scenario.name
     );
 }

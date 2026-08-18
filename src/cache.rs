@@ -7,32 +7,48 @@
 //! * an **object store**, keyed by the digest of the stored bytes;
 //! * an **untrusted request index**, mapping a request key to a digest.
 //!
-//! The request key binds the **locally selected checkpoint identity**
-//! `{log_id, tree_size, root_hash}`, not merely endpoint and range. After an equivocation two
-//! distinct roots exist at one `tree_size`, so a key built from endpoint + range + size would
-//! serve material from the wrong branch — see [`request_key`].
+//! The request key binds the **locally selected checkpoint identity** `{log_id, tree_size,
+//! root_hash}`, not merely endpoint and range. After an equivocation two distinct roots exist
+//! at one `tree_size`, so a key built from endpoint + range + size would serve material from
+//! the wrong branch — see [`request_key`].
 //!
-//! The index has **zero evidentiary weight**. Every object is re-verified from its bytes on
-//! read exactly as if it had just arrived: this layer recomputes the digest and evicts on
-//! mismatch, and the caller then re-runs the same proof checks it would have run on a fresh
-//! response, against the **locally selected** root — never against a checkpoint carried inside
-//! the cached response. A poisoned index can therefore change *what work happens*, never *what
-//! is accepted*.
+//! # The index has zero evidentiary weight, and the digest check is not what enforces that
+//!
+//! [`Cache::get`] recomputes the digest of the stored bytes and compares it with the digest
+//! the index selected. That is an **integrity check on storage** — it catches a corrupted or
+//! half-written object. It says nothing whatever about whether the bytes are the right answer:
+//! an attacker with write access to the cache directory can store arbitrary bytes under their
+//! own matching digest and point an index entry at them, and every digest check will pass.
+//!
+//! What actually enforces the invariant is that the caller re-runs the same proof checks a
+//! fresh response would get, against the **locally selected** root, and — on failure — evicts
+//! and refetches exactly once through [`crate::net::fetch_revalidating`]. A poisoned cache can
+//! therefore change *what work happens*, never *what is accepted*.
 //!
 //! Consequences that follow, and are tested:
 //!
 //! * a request for the *latest* checkpoint is never served from cache (a valid old checkpoint
 //!   is a replay) — expressed by such requests carrying no `cache_key` at all;
-//! * a cached object failing re-verification is evicted and refetched once, then reported;
+//! * a cached object failing **semantic** re-verification is evicted and refetched once, then
+//!   reported;
 //! * the store is bounded by a byte quota and evicts least-recently-used, so a long
 //!   enumeration cannot fill the disk.
+//!
+//! # Writes
+//!
+//! Every write goes through [`crate::install::Dir`]: handle-relative, `O_NOFOLLOW`, an
+//! `O_EXCL` temporary under an unpredictable name, and a no-replace install. A cache entry has
+//! no evidentiary weight, but that was never a licence to let a symlink planted in the cache
+//! directory redirect a write outside it.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::Path;
 use std::time::SystemTime;
 
 use ahl_core::sha256_hex;
 
-use crate::error::{CliError, CliResult};
+use crate::error::CliResult;
+use crate::install::{Dir, Force};
 use crate::net::{FetchFailure, Fetcher, Request, Response};
 
 /// The locally selected checkpoint identity a cache key binds.
@@ -68,8 +84,8 @@ pub fn request_key(identity: &CheckpointIdentity, request: &Request) -> String {
 /// A two-layer on-disk cache.
 #[derive(Debug)]
 pub struct Cache {
-    objects: PathBuf,
-    index: PathBuf,
+    objects: Dir,
+    index: Dir,
     quota_bytes: u64,
 }
 
@@ -78,44 +94,39 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// [`CliError::Output`] if the directories cannot be created.
+    /// [`crate::error::CliError::Output`] if the directories cannot be created or are not
+    /// directories.
     pub fn open(dir: &Path, quota_bytes: u64) -> CliResult<Self> {
-        let objects = dir.join("objects");
-        let index = dir.join("index");
-        for path in [&objects, &index] {
-            std::fs::create_dir_all(path).map_err(|source| CliError::Output {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        Ok(Self { objects, index, quota_bytes })
+        Ok(Self {
+            objects: Dir::create(&dir.join("objects"))?,
+            index: Dir::create(&dir.join("index"))?,
+            quota_bytes,
+        })
     }
 
-    fn index_path(&self, key: &str) -> PathBuf {
-        self.index.join(sanitize(key))
+    fn read_cap(&self) -> usize {
+        usize::try_from(self.quota_bytes).unwrap_or(usize::MAX)
     }
 
-    fn object_path(&self, digest: &str) -> PathBuf {
-        self.objects.join(sanitize(digest))
-    }
-
-    /// Look up `key`, re-verifying the stored bytes against their own digest.
+    /// Look up `key`, checking the stored bytes against the digest they are filed under.
     ///
-    /// A stored object whose bytes no longer hash to the digest they are filed under is
-    /// evicted here and reported as a miss, so the caller refetches.
+    /// A stored object whose bytes no longer hash to that digest is evicted here and reported
+    /// as a miss. This is storage integrity only: see the module docs for why it is not, and
+    /// cannot be, verification.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let digest = std::fs::read_to_string(self.index_path(key)).ok()?;
+        let name = sanitize(key);
+        let digest = String::from_utf8(self.index.read(&name, 128)?).ok()?;
         let digest = digest.trim().to_owned();
-        let object = self.object_path(&digest);
-        let bytes = std::fs::read(&object).ok()?;
+        let object = sanitize(&digest);
+        let bytes = self.objects.read(&object, self.read_cap())?;
         if sha256_hex(&bytes) == digest {
             // Touch for the LRU. A failure here only costs eviction accuracy.
-            let _ = filetime_touch(&object);
+            let _ = self.objects.replace(&object, &bytes);
             Some(bytes)
         } else {
-            let _ = std::fs::remove_file(&object);
-            let _ = std::fs::remove_file(self.index_path(key));
+            self.objects.remove(&object);
+            self.index.remove(&name);
             None
         }
     }
@@ -124,85 +135,62 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// [`CliError::Output`] if the object or index entry cannot be written.
+    /// [`crate::error::CliError::Output`] if the object or index entry cannot be written.
     pub fn put(&self, key: &str, bytes: &[u8]) -> CliResult<()> {
         let digest = sha256_hex(bytes);
-        let object = self.object_path(&digest);
-        if !object.exists() {
-            write_atomic(&object, bytes)?;
+        let object = sanitize(&digest);
+        // Objects are content-addressed and immutable, so an existing one is already correct
+        // and a no-replace install refusing it is the right answer, not an error.
+        if self.objects.read(&object, self.read_cap()).is_none() {
+            self.objects.install(&object, bytes, Force::No)?;
         }
-        write_atomic(&self.index_path(key), digest.as_bytes())?;
+        // An index entry legitimately moves to a newer object, so replacement is normal here —
+        // still handle-relative and still no-replace after an explicit unlink.
+        self.index.replace(&sanitize(key), digest.as_bytes())?;
         self.enforce_quota();
         Ok(())
     }
 
-    /// Remove the index entry and its object.
-    pub fn evict(&self, key: &str) {
-        if let Ok(digest) = std::fs::read_to_string(self.index_path(key)) {
-            let _ = std::fs::remove_file(self.object_path(digest.trim()));
+    /// Remove the index entry and its object, reporting whether anything was removed.
+    #[must_use]
+    pub fn evict(&self, key: &str) -> bool {
+        let name = sanitize(key);
+        let Some(digest) = self.index.read(&name, 128) else { return false };
+        if let Ok(digest) = String::from_utf8(digest) {
+            self.objects.remove(&sanitize(digest.trim()));
         }
-        let _ = std::fs::remove_file(self.index_path(key));
+        self.index.remove(&name);
+        true
     }
 
     /// Total bytes currently held in the object store.
     #[must_use]
     pub fn size_bytes(&self) -> u64 {
-        entries(&self.objects).iter().map(|(_, size, _)| *size).sum()
+        self.objects.entries().iter().map(|(_, size, _)| *size).sum()
     }
 
     /// Drop least-recently-used objects until the store is within quota.
     fn enforce_quota(&self) {
-        let mut objects = entries(&self.objects);
+        let mut objects: Vec<(OsString, u64, SystemTime)> = self.objects.entries();
         let mut total: u64 = objects.iter().map(|(_, size, _)| *size).sum();
         if total <= self.quota_bytes {
             return;
         }
-        objects.sort_by_key(|(_, _, accessed)| *accessed);
-        for (path, size, _) in objects {
+        objects.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        for (name, size, _) in objects {
             if total <= self.quota_bytes {
                 break;
             }
-            if std::fs::remove_file(&path).is_ok() {
-                total = total.saturating_sub(size);
-            }
+            self.objects.remove(&name);
+            total = total.saturating_sub(size);
         }
     }
 }
 
-fn sanitize(key: &str) -> String {
-    key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
-}
-
-fn entries(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    read.filter_map(|entry| {
-        let entry = entry.ok()?;
-        let metadata = entry.metadata().ok()?;
-        let accessed = metadata.accessed().or_else(|_| metadata.modified()).ok()?;
-        Some((entry.path(), metadata.len(), accessed))
-    })
-    .collect()
-}
-
-/// Re-write a file so its access time advances, which is what the LRU orders on.
-fn filetime_touch(path: &Path) -> std::io::Result<()> {
-    let bytes = std::fs::read(path)?;
-    std::fs::write(path, bytes)
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> CliResult<()> {
-    // Cache files are this process's own bookkeeping, so the no-replace install of
-    // `crate::install` is deliberately not used here: overwriting a cache entry is the normal
-    // case, and a cache entry has no evidentiary weight to protect.
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes).map_err(|source| CliError::Output {
-        path: temporary.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    std::fs::rename(&temporary, path).map_err(|source| CliError::Output {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+fn sanitize(key: &str) -> OsString {
+    OsString::from(
+        key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>(),
+    )
 }
 
 /// A [`Fetcher`] that consults a cache for requests carrying a `cache_key`.
@@ -232,9 +220,9 @@ impl<F: Fetcher> Fetcher for Caching<F> {
             return self.inner.fetch(request);
         };
         if let Some(bytes) = self.cache.get(key) {
-            // A cached object is returned with the status a successful fetch carries; the
-            // caller re-runs every proof check against the locally selected root regardless,
-            // so this cannot decide what is accepted.
+            // Returned with the status a successful fetch carries. The caller re-runs every
+            // proof check against the locally selected root regardless, and evicts through
+            // `invalidate` if they fail, so this cannot decide what is accepted.
             return Ok(Response { status: 200, body: bytes });
         }
         let response = self.inner.fetch(request)?;
@@ -245,11 +233,22 @@ impl<F: Fetcher> Fetcher for Caching<F> {
         }
         Ok(response)
     }
+
+    fn invalidate(&self, request: &Request) -> bool {
+        // Only a genuine eviction reports `true`: that is what stops a caller from retrying a
+        // live endpoint that simply answered badly.
+        request.cache_key.as_deref().is_some_and(|key| self.cache.evict(key))
+            || self.inner.invalidate(request)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use crate::error::CliError;
+    use crate::net::fetch_revalidating;
 
     fn identity(root: &str) -> CheckpointIdentity {
         CheckpointIdentity {
@@ -262,21 +261,21 @@ mod tests {
     #[derive(Debug)]
     struct Counting {
         body: Vec<u8>,
-        calls: std::sync::atomic::AtomicUsize,
+        calls: AtomicUsize,
     }
 
     impl Counting {
         fn new(body: &[u8]) -> Self {
-            Self { body: body.to_vec(), calls: std::sync::atomic::AtomicUsize::new(0) }
+            Self { body: body.to_vec(), calls: AtomicUsize::new(0) }
         }
         fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+            self.calls.load(Ordering::Relaxed)
         }
     }
 
     impl Fetcher for Counting {
         fn fetch(&self, _request: &Request) -> Result<Response, FetchFailure> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(Response { status: 200, body: self.body.clone() })
         }
     }
@@ -286,7 +285,7 @@ mod tests {
         let request = Request::post("https://m/v1/range", b"{\"from\":0}".to_vec());
         let branch_a = request_key(&identity(&"aa".repeat(32)), &request);
         let branch_b = request_key(&identity(&"bb".repeat(32)), &request);
-        assert_ne!(branch_a, branch_b, "two roots at one tree_size must not share a cache entry");
+        assert_ne!(branch_a, branch_b, "two roots at one tree_size must not share an entry");
 
         let mut other_size = identity(&"aa".repeat(32));
         other_size.tree_size = 9;
@@ -326,47 +325,108 @@ mod tests {
         let _ = caching.fetch(&request).expect("first");
         let _ = caching.fetch(&request).expect("second");
         assert_eq!(caching.inner.calls(), 2);
+        assert!(!caching.invalidate(&request), "there is nothing to evict for an uncached request");
     }
 
     #[test]
-    fn a_poisoned_object_is_evicted_and_refetched() {
+    fn a_corrupted_object_is_a_miss_and_is_refetched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
         let caching = Caching::new(Counting::new(b"payload"), cache);
         let request = Request::get("https://m/v1/x").cached_under("k1");
         let _ = caching.fetch(&request).expect("cold");
 
-        // Overwrite every stored object with attacker bytes, leaving the index intact.
-        for (path, _, _) in entries(&caching.cache.objects) {
-            std::fs::write(&path, b"attacker").expect("poison");
+        // Bytes that no longer hash to the digest they are filed under: storage corruption,
+        // caught by the integrity check.
+        for (name, _, _) in caching.cache.objects.entries() {
+            caching.cache.objects.replace(&name, b"corrupted").expect("corrupt");
         }
-        assert!(caching.cache.get("k1").is_none(), "a poisoned object must not be served");
+        assert!(caching.cache.get("k1").is_none(), "a corrupted object must not be served");
 
-        let response = caching.fetch(&request).expect("refetch");
-        assert_eq!(response.body, b"payload");
-        assert_eq!(caching.inner.calls(), 2, "the poisoned entry must have been refetched");
+        assert_eq!(caching.fetch(&request).expect("refetch").body, b"payload");
+        assert_eq!(caching.inner.calls(), 2);
+    }
+
+    /// Store `bytes` under `key` **with a matching digest**, which is what an attacker with
+    /// write access to the cache directory can always do. The integrity check passes; only
+    /// semantic verification catches it.
+    fn plant(cache: &Cache, key: &str, bytes: &[u8]) {
+        cache.put(key, bytes).expect("plant");
+        assert_eq!(cache.get(key).as_deref(), Some(bytes), "the plant must look genuine");
+    }
+
+    #[test]
+    fn a_semantically_wrong_but_digest_consistent_object_is_evicted_and_refetched_once() {
+        // The heart of the §5 invariant. The digest check cannot catch this — the bytes hash
+        // to exactly the digest the index names — so eviction has to be driven by the caller's
+        // own verification, through `fetch_revalidating`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
+        let caching = Caching::new(Counting::new(b"genuine"), cache);
+        let request = Request::get("https://m/v1/x").cached_under("k1");
+        plant(caching.cache(), "k1", b"attacker-controlled");
+
+        let verify = |response: Response| -> CliResult<Vec<u8>> {
+            if response.body == b"genuine" {
+                Ok(response.body)
+            } else {
+                Err(CliError::EvidenceMissing("did not verify".to_owned()))
+            }
+        };
+        let value = fetch_revalidating(&caching, &request, verify).expect("revalidated");
+        assert_eq!(value, b"genuine", "the cold answer must survive a poisoned cache");
+        assert_eq!(caching.inner.calls(), 1, "evicted and refetched exactly once");
+    }
+
+    #[test]
+    fn a_second_failure_is_reported_rather_than_retried_forever() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
+        let caching = Caching::new(Counting::new(b"still-wrong"), cache);
+        let request = Request::get("https://m/v1/x").cached_under("k1");
+        plant(caching.cache(), "k1", b"attacker-controlled");
+
+        let verify = |_: Response| -> CliResult<Vec<u8>> {
+            Err(CliError::EvidenceMissing("never verifies".to_owned()))
+        };
+        let error = fetch_revalidating(&caching, &request, verify).expect_err("reported");
+        assert!(error.to_string().contains("never verifies"), "{error}");
+        assert_eq!(caching.inner.calls(), 1, "exactly one refetch, then reported");
+    }
+
+    #[test]
+    fn a_live_endpoint_answering_badly_is_reported_without_a_retry() {
+        // Nothing was evicted, so there is nothing to retry: a broken server is reported, not
+        // hammered.
+        let counting = Counting::new(b"wrong");
+        let request = Request::get("https://m/v1/x");
+        let verify =
+            |_: Response| -> CliResult<Vec<u8>> { Err(CliError::EvidenceMissing("no".to_owned())) };
+        assert!(fetch_revalidating(&counting, &request, verify).is_err());
+        assert_eq!(counting.calls(), 1);
     }
 
     #[test]
     fn a_poisoned_index_pointing_at_nothing_is_a_miss_not_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
-        std::fs::write(cache.index_path("k1"), format!("sha256:{}", "ff".repeat(32)))
+        cache
+            .index
+            .replace(&sanitize("k1"), format!("sha256:{}", "ff".repeat(32)).as_bytes())
             .expect("write index");
         assert!(cache.get("k1").is_none());
     }
 
     #[test]
-    fn eviction_removes_an_entry_and_its_object() {
+    fn eviction_removes_an_entry_and_its_object_and_reports_whether_it_did() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
         cache.put("k1", b"payload").expect("put");
         assert!(cache.get("k1").is_some());
-        cache.evict("k1");
+        assert!(cache.evict("k1"), "an eviction that removed something reports true");
         assert!(cache.get("k1").is_none());
         assert_eq!(cache.size_bytes(), 0);
-        // Evicting an absent key is a no-op, not a failure.
-        cache.evict("k1");
+        assert!(!cache.evict("k1"), "evicting an absent key reports false");
     }
 
     #[test]
@@ -376,7 +436,7 @@ mod tests {
         for n in 0u8..10 {
             cache.put(&format!("k{n}"), &[n; 100]).expect("put");
         }
-        assert!(cache.size_bytes() <= 300, "quota exceeded: {} bytes held", cache.size_bytes());
+        assert!(cache.size_bytes() <= 300, "quota exceeded: {} bytes", cache.size_bytes());
     }
 
     #[test]
@@ -385,7 +445,7 @@ mod tests {
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
         cache.put("k1", b"same").expect("put");
         cache.put("k2", b"same").expect("put");
-        assert_eq!(entries(&cache.objects).len(), 1);
+        assert_eq!(cache.objects.entries().len(), 1);
         assert_eq!(cache.get("k1"), cache.get("k2"));
     }
 
@@ -412,5 +472,23 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").expect("write");
         assert!(Cache::open(&file, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_symlink_planted_in_the_cache_cannot_redirect_a_write_outside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::open(&dir.path().join("cache"), 1 << 20).expect("open cache");
+        let outside = dir.path().join("outside.txt");
+        let planted = sanitize("planted");
+        std::os::unix::fs::symlink(&outside, cache.index.path().join("planted")).expect("symlink");
+
+        // Writing at the planted name must not follow it.
+        let _ = cache.index.replace(&planted, b"attacker");
+        assert!(
+            !outside.exists() || std::fs::read(&outside).expect("read") != b"attacker",
+            "a cache write followed a symlink out of the cache directory"
+        );
+        // And reading it back never follows it either.
+        assert!(cache.index.read(&planted, 128).is_none() || !outside.exists());
     }
 }

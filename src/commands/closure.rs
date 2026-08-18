@@ -30,7 +30,7 @@ use ahl_core::closure::{affected_set, TreeMaterial};
 use ahl_core::AhlError;
 use serde_json::Value;
 
-use crate::anchored::{self, Anchored, Mirror};
+use crate::anchored::{self, Anchored, Mirror, Statements};
 use crate::corpus;
 use crate::error::{CliError, CliResult};
 use crate::evaluation::EvaluationTime;
@@ -49,16 +49,45 @@ pub enum TriggerRef {
 }
 
 impl TriggerRef {
-    fn resolve(&self, entries: &[(u64, Value)]) -> CliResult<u64> {
+    /// Resolve against a **verified** statement view.
+    ///
+    /// A position voided for carrying a non-verifying signature, or for repeating a statement
+    /// id a smaller entry index already governs, is not selectable: it is not a statement, so
+    /// there is no closure to compute of it.
+    fn resolve(&self, statements: &Statements) -> CliResult<u64> {
+        match self {
+            Self::EntryIndex(index) => match statements.statement_type(*index) {
+                Some("not-a-statement") | None => Err(CliError::EvidenceMissing(format!(
+                    "entry index {index} is not a statement this checkpoint commits: it is \
+                         beyond the checkpoint, or it was voided for a signature that does not \
+                         verify or for repeating a statement id a smaller index governs"
+                ))),
+                Some(_) => Ok(*index),
+            },
+            Self::StatementId(wanted) => statements
+                .iter()
+                .find(|(_, envelope)| {
+                    ahl_core::statement_id(envelope).is_ok_and(|id| &id == wanted)
+                })
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    CliError::EvidenceMissing(format!(
+                        "no verified statement in the material has statement id `{wanted}`"
+                    ))
+                }),
+        }
+    }
+
+    /// Resolve against an unauthenticated corpus, where nothing is evidence and the operator's
+    /// own file is all there is.
+    fn resolve_topology(&self, entries: &[(u64, Value)]) -> CliResult<u64> {
         match self {
             Self::EntryIndex(index) => {
-                if entries.iter().any(|(at, _)| at == index) {
-                    Ok(*index)
-                } else {
-                    Err(CliError::EvidenceMissing(format!(
-                        "no entry at index {index} is present in the material"
-                    )))
-                }
+                entries.iter().any(|(at, _)| at == index).then_some(*index).ok_or_else(|| {
+                    CliError::TopologyMode(format!(
+                        "no entry at index {index} is present in the corpus"
+                    ))
+                })
             }
             Self::StatementId(wanted) => entries
                 .iter()
@@ -67,8 +96,8 @@ impl TriggerRef {
                 })
                 .map(|(index, _)| *index)
                 .ok_or_else(|| {
-                    CliError::EvidenceMissing(format!(
-                        "no anchored statement in the material has statement id `{wanted}`"
+                    CliError::TopologyMode(format!(
+                        "no entry in the corpus has statement id `{wanted}`"
                     ))
                 }),
         }
@@ -153,13 +182,15 @@ fn topology(
         )
     })?;
 
-    // Only a failure to read or parse the file at all is a local-environment failure, because
-    // that happens before any walking begins.
+    // §6's one stated exception, and the boundary inside it: a failure to read **or parse**
+    // the file at all is a local-environment failure (exit `2`), because it happens before any
+    // walking begins. From the first line of the walk onwards, everything found is a finding
+    // and the outcome is fixed at `3` — including a corpus riddled with violations.
     let loaded = corpus::load(path, policy.local)?;
     let mut findings = corpus::walk(&loaded);
 
     let envelopes = loaded.dense_envelopes()?;
-    let trigger_index = options.trigger.resolve(&loaded.entries)?;
+    let trigger_index = options.trigger.resolve_topology(&loaded.entries)?;
     let trees = tree_material(policy, options)?;
 
     let closure = affected_set(
@@ -209,7 +240,7 @@ fn authenticated<F: Fetcher>(
     fetcher: Option<&F>,
 ) -> CliResult<Report> {
     let anchored = establish_view(policy, options, fetcher)?;
-    let trigger_index = options.trigger.resolve(&anchored.entries)?;
+    let trigger_index = options.trigger.resolve(&anchored.statements)?;
 
     // Trigger effectiveness per receipt format §3: not merely that *a* trigger is anchored,
     // but that **this** trigger governs at C.
@@ -227,7 +258,7 @@ fn authenticated<F: Fetcher>(
     let trees = tree_material(policy, options)?;
     let through = usize::try_from(anchored.checkpoint.tree_size).unwrap_or(usize::MAX);
     let closure = affected_set(
-        &anchored.statements,
+        anchored.statements.envelopes(),
         &trees,
         usize::try_from(trigger_index).unwrap_or(usize::MAX),
         through,
@@ -292,12 +323,11 @@ fn establish_view<F: Fetcher>(
 }
 
 fn trigger_record(anchored: &Anchored, index: u64) -> CliResult<(String, String)> {
-    let envelope =
-        anchored.statements.get(usize::try_from(index).unwrap_or(usize::MAX)).ok_or_else(|| {
-            CliError::EvidenceMissing(format!(
-                "entry index {index} is not committed by this checkpoint"
-            ))
-        })?;
+    let envelope = anchored.statements.get(index).ok_or_else(|| {
+        CliError::EvidenceMissing(format!(
+            "entry index {index} is not committed by this checkpoint"
+        ))
+    })?;
     let payload = envelope.get("payload").ok_or_else(|| {
         CliError::EvidenceMissing(format!("the entry at index {index} carries no payload"))
     })?;
@@ -461,22 +491,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_corpus_is_a_local_failure_and_a_walkable_one_with_violations_is_not() {
-        // The boundary the reviewer asked for: "cannot parse topology input" (2) versus
-        // "parsed topology input with violations" (3).
+    fn the_boundary_between_unparseable_input_and_a_walked_corpus_with_violations() {
+        // The boundary the reviewer asked for, in all three positions. It is asserted on the
+        // *reason code* as well as the status, because two different failures can share an
+        // exit code and only one of them is the one under test.
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("corpus.json");
-        std::fs::write(&path, b"{ this is not json").expect("write");
-        let mut options = topology_options(TriggerRef::EntryIndex(0));
-        options.corpus = Some(path);
-        let report = run_topology(&options);
-        assert_eq!(report.status, "unverifiable", "a parse failure inside topology mode");
 
-        // A file that cannot be opened at all is the local-environment failure of the table.
+        // (a) cannot be opened at all — local-environment failure, before any walking.
+        let mut options = topology_options(TriggerRef::EntryIndex(0));
         options.corpus = Some(dir.path().join("absent.json"));
         let report = run_topology(&options);
         assert_eq!(report.status, "error");
         assert_eq!(report.reason_code, "input-unreadable");
+
+        // (b) opens but does not parse — still before any walking, so still `2`.
+        let path = dir.path().join("corpus.json");
+        std::fs::write(&path, b"{ this is not json").expect("write");
+        options.corpus = Some(path);
+        let report = run_topology(&options);
+        assert_eq!(report.status, "error", "a parse failure happens before any walking begins");
+        assert_eq!(report.reason_code, "input-unparseable");
+
+        // (c) parses, and the walk finds violations — findings, not verdicts, outcome `3`.
+        let report = run_topology(&topology_options(TriggerRef::EntryIndex(6)));
+        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.reason_code, "topology-mode");
+        assert!(!report.findings.is_empty(), "violations are reported in full");
     }
 
     #[test]

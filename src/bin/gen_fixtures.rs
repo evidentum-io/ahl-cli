@@ -39,11 +39,14 @@ fn main() -> std::process::ExitCode {
     let equivocating = MirrorFixture::conformance().with_equivocation_at(13);
     let foreign_key = MirrorFixture::conformance().with_foreign_log_key(8);
     let tampered = MirrorFixture::conformance().with_tampered_entry(3);
+    let forged_manifest = MirrorFixture::conformance().with_forged_manifest();
 
-    for fixture in [&honest, &equivocating, &foreign_key, &tampered] {
+    for fixture in [&honest, &equivocating, &foreign_key, &tampered, &forged_manifest] {
         // Drive every request path the integration tests replay: an authenticated closure at
         // several checkpoints, and a reconstruction, which additionally reads the witness.
-        for tree_size in ahl_cli::testing::CHECKPOINT_SIZES {
+        let mut sizes = ahl_cli::testing::CHECKPOINT_SIZES.to_vec();
+        sizes.push(fixture.forged_tree_size());
+        for tree_size in sizes {
             let _ = closure::run(
                 &fixture.policy,
                 &evaluation,
@@ -76,6 +79,7 @@ fn main() -> std::process::ExitCode {
         ("mirror-transcript-equivocating.json", equivocating.transcript()),
         ("mirror-transcript-foreign-key.json", foreign_key.transcript()),
         ("mirror-transcript-tampered.json", tampered.transcript()),
+        ("mirror-transcript-forged-manifest.json", forged_manifest.transcript()),
         ("tree-material.json", tree_material(&MirrorFixture::corpus_root())),
     ];
     for (name, value) in written {

@@ -27,6 +27,23 @@ pub enum CliError {
         detail: String,
     },
 
+    /// Input that opened but could not be parsed at all, before any evaluation began.
+    ///
+    /// Distinct from [`Self::Malformed`]: that one is a rule firing against an artifact the
+    /// CLI is adjudicating, this one is a local-environment failure that happens *before* any
+    /// adjudication starts — which is exactly the line §6 draws for topology mode, where a
+    /// failure to read or parse the file at all is `2` and everything found by walking it is a
+    /// finding.
+    #[error("cannot parse {what} at `{path}`: {detail}")]
+    Unparseable {
+        /// What the file was supposed to be.
+        what: &'static str,
+        /// The path as given.
+        path: String,
+        /// Why it did not parse.
+        detail: String,
+    },
+
     /// The trust policy could not be parsed, or is internally inconsistent.
     #[error("trust policy is unusable: {0}")]
     Policy(String),
@@ -135,6 +152,7 @@ impl CliError {
         match self {
             Self::Usage(_)
             | Self::Open { .. }
+            | Self::Unparseable { .. }
             | Self::Policy(_)
             | Self::ProfileBroken { .. }
             | Self::Output { .. }
@@ -158,6 +176,7 @@ impl CliError {
         match self {
             Self::Usage(_) => "usage",
             Self::Open { .. } => "input-unreadable",
+            Self::Unparseable { .. } => "input-unparseable",
             Self::Policy(_) => "policy-unusable",
             Self::ProfileBroken { .. } => "profile-broken",
             Self::Output { .. } => "output-io",
@@ -187,6 +206,7 @@ mod tests {
         vec![
             CliError::Usage("u".to_owned()),
             CliError::Open { what: "receipt", path: "p".to_owned(), detail: "d".to_owned() },
+            CliError::Unparseable { what: "corpus", path: "p".to_owned(), detail: "d".to_owned() },
             CliError::Policy("p".to_owned()),
             CliError::ProfileBroken {
                 id: "i".to_owned(),
@@ -225,6 +245,24 @@ mod tests {
         let before = codes.len();
         codes.dedup();
         assert_eq!(codes.len(), before, "reason codes must be distinct");
+    }
+
+    #[test]
+    fn a_parse_failure_before_any_walking_is_a_local_failure_not_a_verdict() {
+        // §6: in topology mode "only a failure to read or parse the file at all is `2`, because
+        // that is a local-environment failure before any walking begins".
+        let error = CliError::Unparseable {
+            what: "corpus",
+            path: "corpus.json".to_owned(),
+            detail: "expected value".to_owned(),
+        };
+        assert_eq!(error.outcome(), Outcome::Error);
+        assert_eq!(error.reason_code(), "input-unparseable");
+        // And it is not the same thing as a rule firing against an artifact.
+        assert_eq!(
+            CliError::Malformed { what: "receipt", detail: "d".to_owned() }.outcome(),
+            Outcome::Invalid
+        );
     }
 
     #[test]

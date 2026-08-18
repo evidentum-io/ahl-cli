@@ -74,8 +74,9 @@ impl Corpus {
 ///
 /// # Errors
 ///
-/// [`CliError::Open`] if the path cannot be read; [`CliError::TopologyMode`] if the input does
-/// not parse into entries at all; [`CliError::LimitExhausted`] on a bound.
+/// [`CliError::Open`] if the path cannot be read and [`CliError::Unparseable`] if it does not
+/// parse — both local-environment failures before any walking begins;
+/// [`CliError::LimitExhausted`] on a bound.
 pub fn load(path: &Path, limits: LocalLimits) -> CliResult<Corpus> {
     let mut raw: Vec<Value> = Vec::new();
     if path.is_dir() {
@@ -99,11 +100,11 @@ pub fn load(path: &Path, limits: LocalLimits) -> CliResult<Corpus> {
         }
         for file in files {
             let bytes = secure::read_regular("corpus entry", &file, limits.max_file_bytes)?;
-            raw.push(parse(&file.display().to_string(), &bytes)?);
+            raw.push(parse("corpus entry", &file.display().to_string(), &bytes)?);
         }
     } else {
         let bytes = secure::read_regular("corpus", path, limits.max_file_bytes)?;
-        let value = parse(&path.display().to_string(), &bytes)?;
+        let value = parse("corpus", &path.display().to_string(), &bytes)?;
         match value {
             Value::Array(items) => raw = items,
             other => raw.push(other),
@@ -152,9 +153,14 @@ pub fn load(path: &Path, limits: LocalLimits) -> CliResult<Corpus> {
     Ok(Corpus { entries, findings })
 }
 
-fn parse(label: &str, bytes: &[u8]) -> CliResult<Value> {
-    serde_json::from_slice(bytes).map_err(|source| {
-        CliError::TopologyMode(format!("`{label}` does not parse as JSON: {source}"))
+/// A parse failure happens **before any walking begins**, so it is a local-environment
+/// failure (exit `2`), not a finding about the operator's corpus. Everything the walk finds
+/// afterwards is a finding and leaves the outcome at `3`.
+fn parse(what: &'static str, label: &str, bytes: &[u8]) -> CliResult<Value> {
+    serde_json::from_slice(bytes).map_err(|source| CliError::Unparseable {
+        what,
+        path: label.to_owned(),
+        detail: format!("does not parse as JSON: {source}"),
     })
 }
 
@@ -166,21 +172,22 @@ fn parse(label: &str, bytes: &[u8]) -> CliResult<Value> {
 ///
 /// # Errors
 ///
-/// [`CliError::Open`] if the file cannot be read; [`CliError::TopologyMode`] if it does not
+/// [`CliError::Open`] if the file cannot be read; [`CliError::Unparseable`] if it does not
 /// parse into a root-to-leaves map.
 pub fn load_tree_material(path: &Path, limits: LocalLimits) -> CliResult<TreeMaterial> {
     let bytes = secure::read_regular("tree material", path, limits.max_file_bytes)?;
-    let value: Value = parse(&path.display().to_string(), &bytes)?;
-    let object = value.as_object().ok_or_else(|| {
-        CliError::TopologyMode(
-            "tree material must be a JSON object mapping each anchored root to its leaf set"
-                .to_owned(),
-        )
+    let value: Value = parse("tree material", &path.display().to_string(), &bytes)?;
+    let object = value.as_object().ok_or_else(|| CliError::Unparseable {
+        what: "tree material",
+        path: path.display().to_string(),
+        detail: "must be a JSON object mapping each anchored root to its leaf set".to_owned(),
     })?;
     let mut material = BTreeMap::new();
     for (root, leaves) in object {
-        let leaves = leaves.as_array().ok_or_else(|| {
-            CliError::TopologyMode(format!("tree material for `{root}` is not an array"))
+        let leaves = leaves.as_array().ok_or_else(|| CliError::Unparseable {
+            what: "tree material",
+            path: path.display().to_string(),
+            detail: format!("the material for `{root}` is not an array"),
         })?;
         material.insert(root.clone(), leaves.clone());
     }
@@ -202,7 +209,7 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
 
     // Governance may or may not be resolvable from an unauthenticated corpus; where it is not,
     // that is itself reported rather than silently skipping every signature check.
-    let governance = Governance::from_entries(&corpus.entries);
+    let governance = Governance::structural_only(&corpus.entries);
     if let Err(error) = &governance {
         findings.push(Finding::new(
             "corpus-governance-unresolvable",
@@ -417,21 +424,19 @@ mod tests {
         // would be skipping violations.
         assert!(codes.contains("signature-does-not-verify"));
 
-        // Entries 28, 29 and 31 are three envelopes over ONE payload — different signature
-        // sets, therefore one statement id. Core spec §2.1 states that a producer MUST NOT
-        // anchor two envelopes with the same statement id and that, where duplicates occur,
-        // the one with the smallest entry index governs and later ones are void; under that
-        // rule the invalid-signature entry 28 would govern and the co-signed entry 31 would be
-        // void, yet `trigger-effective-co-signed-by-authority.ahl` is expected to verify over
-        // entry 31. Reported here, not adjudicated.
-        assert!(codes.contains("statement-id-not-unique"));
+        // The corpus previously anchored three envelopes over one payload, which core §2.1
+        // makes a duplicate-statement-id violation. It has since been regenerated to give each
+        // a distinct payload, so the rule has nothing to fire on here; it is pinned instead by
+        // `a_repeated_statement_id_is_reported_with_the_index_that_governs` over a fixture this
+        // crate controls, which is where a normative rule belongs.
+        assert!(
+            !codes.contains("statement-id-not-unique"),
+            "the regenerated corpus should carry no duplicate statement ids: {findings:?}"
+        );
 
-        // Nothing else: the corpus is otherwise structurally clean, and the *challenge* at
-        // entry 23 — a trigger signed by a non-authority key — is a valid signature by a valid
-        // producer key, so it is deliberately not a structural finding.
         assert_eq!(
             codes,
-            BTreeSet::from(["signature-does-not-verify", "statement-id-not-unique"]),
+            BTreeSet::from(["signature-does-not-verify"]),
             "unexpected findings: {findings:?}"
         );
     }
@@ -611,6 +616,11 @@ mod tests {
         std::fs::write(&path, b"{oops").expect("write");
         let error = load(&path, limits()).expect_err("unparseable");
         assert!(error.to_string().contains("does not parse"), "{error}");
+        assert_eq!(
+            error.outcome(),
+            crate::outcome::Outcome::Error,
+            "a parse failure happens before any walking begins"
+        );
     }
 
     #[test]

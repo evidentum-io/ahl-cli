@@ -55,25 +55,152 @@ use crate::report::Finding;
 /// How wide one subrange request is, unless a caller narrows it.
 pub const DEFAULT_CHUNK: u64 = 512;
 
-/// An established view: a series-usable checkpoint, its complete entry set, and its governance.
+/// The **verified statement view**: dense by entry index, and the only view an
+/// authenticated-mode decision may read.
+///
+/// Two normative rules are applied when this is built, in this order, and applying them here
+/// rather than at each use site is the point — a second `&[Value]` with the same shape is how
+/// one call site ends up reading the raw enumeration by accident.
+///
+/// 1. **An envelope whose signatures do not all verify is not an AHL statement** (core §2.1),
+///    and adaptor §7.4.1 spells out the consequence for a log without submission controls:
+///    anyone who can reach the endpoint can place a well-formed object at a real index with a
+///    real inclusion proof, and a verifier must ignore it rather than treat the log as
+///    compromised.
+/// 2. **A duplicate statement id is void from the second occurrence on** (core §2.1: "if
+///    duplicates occur, the one with the smallest entry index governs and later ones are
+///    void").
+///
+/// The order matters. Excluding non-statements *first* means a hostile party cannot void a
+/// genuine statement by anchoring the same payload with a broken signature at a smaller index
+/// — which is exactly what "later ones are void" would otherwise hand them. Core §2.1 does not
+/// say which of the two rules runs first; this is recorded as an ambiguity in the README, and
+/// the reading implemented here is the only one that is not trivially exploitable.
+///
+/// A voided position is **occupied by a placeholder**, never removed: the entry index is AHL's
+/// only ordering primitive, and closing a gap would shift every index after it.
+#[derive(Debug, Clone, Default)]
+pub struct Statements {
+    inner: Vec<Value>,
+}
+
+/// What a voided position carries. Contributes no edges, no trigger, and no introduction.
+fn voided() -> Value {
+    json!({ "payload": { "type": "not-a-statement" } })
+}
+
+impl Statements {
+    /// The statement at `index`, if the checkpoint commits it and it is a statement at all.
+    #[must_use]
+    pub fn get(&self, index: u64) -> Option<&Value> {
+        self.inner.get(usize::try_from(index).ok()?)
+    }
+
+    /// `(entry_index, envelope)` for every position, voided ones included.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &Value)> {
+        self.inner
+            .iter()
+            .enumerate()
+            .map(|(index, envelope)| (u64::try_from(index).unwrap_or(u64::MAX), envelope))
+    }
+
+    /// The dense envelope slice `ahl-core`'s closure functions take, where the position in the
+    /// slice *is* the entry index.
+    #[must_use]
+    pub fn envelopes(&self) -> &[Value] {
+        &self.inner
+    }
+
+    /// How many positions the view covers.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the view is empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// The payload of the statement at `index`, if there is one.
+    #[must_use]
+    pub fn payload(&self, index: u64) -> Option<&Value> {
+        self.get(index)?.get("payload")
+    }
+
+    /// The statement type at `index`, if there is one.
+    #[must_use]
+    pub fn statement_type(&self, index: u64) -> Option<&str> {
+        self.payload(index)?.get("type")?.as_str()
+    }
+
+    /// Build the view from an enumeration, applying both rules above.
+    fn build(entries: &[(u64, Value)], governance: &Governance) -> (Self, Vec<Finding>) {
+        let mut inner = Vec::with_capacity(entries.len());
+        let mut findings = Vec::new();
+        let mut seen: BTreeMap<String, u64> = BTreeMap::new();
+
+        for (index, envelope) in entries {
+            // Rule 1.
+            if !governance.envelope_verifies_at(envelope, *index).unwrap_or(false) {
+                findings.push(Finding::new(
+                    "entry-is-not-a-statement",
+                    format!(
+                        "the entry at entry index {index} carries a signature that does not \
+                         resolve to a key active at that index, or does not verify; core spec \
+                         §2.1 makes it not an AHL statement, so it is excluded from every \
+                         decision and reported rather than being treated as evidence"
+                    ),
+                ));
+                inner.push(voided());
+                continue;
+            }
+            // Rule 2, over the survivors of rule 1 only.
+            match ahl_core::statement_id(envelope) {
+                Ok(statement_id) => {
+                    if let Some(governing) = seen.get(&statement_id) {
+                        findings.push(Finding::new(
+                            "statement-void-duplicate-id",
+                            format!(
+                                "the entry at entry index {index} repeats the statement id \
+                                 first anchored at {governing}; core spec §2.1 makes the \
+                                 smallest entry index govern and voids later ones, so this \
+                                 position is excluded from every decision"
+                            ),
+                        ));
+                        inner.push(voided());
+                        continue;
+                    }
+                    seen.insert(statement_id, *index);
+                    inner.push(envelope.clone());
+                }
+                Err(source) => {
+                    findings.push(Finding::new(
+                        "entry-is-not-a-statement",
+                        format!("the entry at entry index {index} has no statement id: {source}"),
+                    ));
+                    inner.push(voided());
+                }
+            }
+        }
+        (Self { inner }, findings)
+    }
+}
+
+/// An established view: a series-usable checkpoint, its verified statements, and its
+/// governance.
+///
+/// There is deliberately **no** raw-entry field. The enumeration is consumed while
+/// establishing the view and is not carried forward, so no later decision can read it by
+/// accident.
 #[derive(Debug)]
 pub struct Anchored {
     /// The selected checkpoint, authenticated and series-usable as of this run.
     pub checkpoint: Checkpoint,
-    /// The complete enumerated entry set of `[0, tree_size(C))`, ascending.
-    pub entries: Vec<(u64, Value)>,
-    /// The same set as a dense array for traversal, with every entry whose signature does not
-    /// verify replaced by a neutral placeholder.
-    ///
-    /// Core spec §2.1 makes an object whose signatures do not all verify **not an AHL
-    /// statement**, and adaptor §7.4.1 spells out the consequence for a permissionless log:
-    /// anyone who can reach the submission endpoint can place a well-formed object at a real
-    /// index with a real inclusion proof, and a verifier must ignore it rather than treat the
-    /// whole log as compromised. Such entries are therefore excluded from traversal and
-    /// reported in `findings` — never silently dropped, and never allowed to shift an entry
-    /// index, which is why a placeholder occupies the position rather than the entry vanishing.
-    pub statements: Vec<Value>,
-    /// The governance state resolved from those entries.
+    /// The verified statement view — the only view an authenticated decision reads.
+    pub statements: Statements,
+    /// The governance state resolved from the enumeration under adaptor §7.4.1.
     pub governance: Governance,
     /// Findings raised while establishing the view.
     pub findings: Vec<Finding>,
@@ -185,25 +312,29 @@ impl<'a, F: Fetcher> Mirror<'a, F> {
     ) -> CliResult<Value> {
         let request = Request::get(format!("{}/v1/entries/{entry_id}", self.base));
         let key = cache::request_key(identity, &request);
-        let response =
-            self.fetcher.fetch(&request.cached_under(key)).map_err(FetchFailure::into_cli_error)?;
-        if response.status != 200 {
-            // Absence is a fact about the interface, not about the corpus: it is never read as
-            // evidence that no such entry was ever anchored.
-            return Err(CliError::EvidenceMissing(format!(
-                "the mirror does not hold entry `{entry_id}` (status {}); absence is \
-                 unavailability, never a negative result about the corpus",
-                response.status
-            )));
-        }
-        if ahl_core::sha256_hex(&response.body) != entry_id {
-            return Err(CliError::EvidenceMissing(format!(
-                "the bytes served for `{entry_id}` do not digest to it; retrieval is \
-                 self-checking and a substitution is detected here"
-            )));
-        }
-        serde_json::from_slice(&response.body).map_err(|source| {
-            CliError::EvidenceMissing(format!("entry `{entry_id}` is not JSON: {source}"))
+        let request = request.cached_under(key);
+
+        // Content-addressed, and revalidating: a cached answer whose bytes do not digest to
+        // the id requested is evicted and refetched once, then reported.
+        crate::net::fetch_revalidating(self.fetcher, &request, |response| {
+            if response.status != 200 {
+                // Absence is a fact about the interface, not about the corpus: it is never
+                // read as evidence that no such entry was ever anchored.
+                return Err(CliError::EvidenceMissing(format!(
+                    "the mirror does not hold entry `{entry_id}` (status {}); absence is \
+                     unavailability, never a negative result about the corpus",
+                    response.status
+                )));
+            }
+            if ahl_core::sha256_hex(&response.body) != entry_id {
+                return Err(CliError::EvidenceMissing(format!(
+                    "the bytes served for `{entry_id}` do not digest to it; retrieval is \
+                     self-checking and a substitution is detected here"
+                )));
+            }
+            serde_json::from_slice(&response.body).map_err(|source| {
+                CliError::EvidenceMissing(format!("entry `{entry_id}` is not JSON: {source}"))
+            })
         })
     }
 }
@@ -243,8 +374,13 @@ pub fn establish<F: Fetcher>(
     );
     let entries = enumerator.enumerate_and_recompute(&selected)?;
 
-    let governance = Governance::from_entries(&entries).map_err(remote_candidate)?;
-    governance.check_genesis(&entries, &policy.trust).map_err(remote_candidate)?;
+    // Governance is resolved incrementally under adaptor §7.4.1 — every later statement
+    // verified under the key set the chain established before it — and anchored to the
+    // **locally configured** genesis. A forged manifest in the enumeration is ignored for key
+    // resolution and reported; it cannot contribute the log key that authenticates `C`.
+    let (governance, governance_findings) =
+        Governance::resolve(&entries, &policy.trust).map_err(remote_candidate)?;
+    findings.extend(governance_findings);
     findings.extend(governance.log_object_findings());
 
     let declared_log_id = governance.log_id_for(tree_size).map_err(remote_candidate)?;
@@ -293,29 +429,13 @@ pub fn establish<F: Fetcher>(
     // --- step 3: neighbouring consistency --------------------------------------------
     findings.extend(check_neighbours(mirror, &authenticated, &selected)?);
 
-    // --- step 5: every envelope's signature, under the manifest governing its index ----
-    let mut statements = Vec::with_capacity(entries.len());
-    for (index, envelope) in &entries {
-        let verifies = governance.envelope_verifies_at(envelope, *index).unwrap_or(false);
-        if verifies {
-            statements.push(envelope.clone());
-        } else {
-            findings.push(Finding::new(
-                "entry-is-not-a-statement",
-                format!(
-                    "the entry at entry index {index} carries a signature that does not resolve \
-                     to a key active at that index, or does not verify; core spec §2.1 makes it \
-                     not an AHL statement, so it is excluded from traversal and reported rather \
-                     than being treated as evidence"
-                ),
-            ));
-            statements.push(json!({ "payload": { "type": "not-a-statement" } }));
-        }
-    }
+    // --- step 5: the verified statement view, and nothing else carried forward ---------
+    let (statements, statement_findings) = Statements::build(&entries, &governance);
+    findings.extend(statement_findings);
 
     findings.sort();
     findings.dedup();
-    Ok(Anchored { checkpoint: selected, entries, statements, governance, findings })
+    Ok(Anchored { checkpoint: selected, statements, governance, findings })
 }
 
 /// A failure while reading remote material is missing evidence, never a disproved artifact.
@@ -432,18 +552,19 @@ pub fn governing_trigger(
     dataset: &str,
     record: &str,
 ) -> CliResult<GoverningTrigger> {
-    let introduction = introduction_index(anchored, dataset, record).ok_or_else(|| {
-        CliError::EvidenceMissing(format!(
-            "no anchored `ingestion` or `derivation` introduces `{dataset}`/`{record}` in \
+    let introduction =
+        introduction_index(&anchored.statements, dataset, record).ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "no anchored `ingestion` or `derivation` introduces `{dataset}`/`{record}` in \
              [0, {}); authority cannot predate the introduction that creates it",
-            anchored.checkpoint.tree_size
-        ))
-    })?;
+                anchored.checkpoint.tree_size
+            ))
+        })?;
 
     let mut findings = Vec::new();
     let mut governing: Option<(u64, String)> = None;
 
-    for (index, envelope) in &anchored.entries {
+    for (index, envelope) in anchored.statements.iter() {
         let Some(payload) = envelope.get("payload") else { continue };
         let kind = payload.get("type").and_then(Value::as_str).unwrap_or_default();
         if !matches!(kind, "retraction" | "correction") {
@@ -456,7 +577,7 @@ pub fn governing_trigger(
         }
 
         // A trigger anchored before the record's introduction is never effective.
-        if *index < introduction {
+        if index < introduction {
             findings.push(Finding::new(
                 "trigger-predates-introduction",
                 format!(
@@ -467,20 +588,11 @@ pub fn governing_trigger(
             continue;
         }
 
-        // Every candidate's signature is verified BEFORE authority is compared.
-        if !anchored.governance.envelope_verifies_at(envelope, *index).unwrap_or(false) {
-            findings.push(Finding::new(
-                "trigger-signature-does-not-verify",
-                format!(
-                    "the candidate trigger at entry index {index} carries a signature that does \
-                     not verify; an invalid signature never governs"
-                ),
-            ));
-            continue;
-        }
-
+        // Signature verification and duplicate voiding already happened when the view was
+        // built, so anything reached here is a statement: an invalid signature never governs
+        // because it is not in this view at all.
         let signers = signer_key_ids(envelope);
-        let authority = authority_for(anchored, dataset, introduction, *index);
+        let authority = authority_for(anchored, dataset, introduction, index);
         if signers.is_disjoint(&authority) {
             // Triggers from other keys anchor as challenges: surfaced, never traversed.
             findings.push(Finding::new(
@@ -497,8 +609,8 @@ pub fn governing_trigger(
             CliError::EvidenceMissing(format!("entry {index} has no statement id: {source}"))
         })?;
         // Among effective triggers for one record, the greatest entry index governs.
-        if governing.as_ref().is_none_or(|(at, _)| *index > *at) {
-            governing = Some((*index, statement_id));
+        if governing.as_ref().is_none_or(|(at, _)| index > *at) {
+            governing = Some((index, statement_id));
         }
     }
 
@@ -519,14 +631,18 @@ pub fn governing_trigger(
 }
 
 /// The entry index at which `(dataset, record)` is introduced, if it is.
+///
+/// Reads the **verified** view: a forged, non-verifying ingestion or derivation must not be
+/// able to establish an earlier introduction, which would move the authority consulted for a
+/// later, genuine trigger.
 #[must_use]
-pub fn introduction_index(anchored: &Anchored, dataset: &str, record: &str) -> Option<u64> {
-    anchored.entries.iter().find_map(|(index, envelope)| {
+pub fn introduction_index(statements: &Statements, dataset: &str, record: &str) -> Option<u64> {
+    statements.iter().find_map(|(index, envelope)| {
         let payload = envelope.get("payload")?;
         match payload.get("type")?.as_str()? {
             "ingestion" => (payload.get("dataset")?.as_str()? == dataset
                 && payload.get("record")?.as_str()? == record)
-                .then_some(*index),
+                .then_some(index),
             "derivation" => payload
                 .get("outputs")?
                 .as_array()?
@@ -535,7 +651,7 @@ pub fn introduction_index(anchored: &Anchored, dataset: &str, record: &str) -> O
                     output.get("dataset").and_then(Value::as_str) == Some(dataset)
                         && output.get("record").and_then(Value::as_str) == Some(record)
                 })
-                .then_some(*index),
+                .then_some(index),
             _ => None,
         }
     })
@@ -545,19 +661,16 @@ pub fn introduction_index(anchored: &Anchored, dataset: &str, record: &str) -> O
 ///
 /// For an **ingested** record it is the dataset authority the manifest declares. For a
 /// **derived** record it is the introducing producer's key set **as of the trigger's entry
-/// index** — not the introduction index, so a key rotation between the two applies.
+/// index** — not the introduction index, so a key rotation between the two applies. The
+/// introduction is read from the verified view for the same reason as above.
 fn authority_for(
     anchored: &Anchored,
     dataset: &str,
     introduction: u64,
     trigger_index: u64,
 ) -> BTreeSet<String> {
-    let introduced_by_ingestion = anchored
-        .entries
-        .iter()
-        .find(|(index, _)| *index == introduction)
-        .and_then(|(_, envelope)| envelope.get("payload")?.get("type")?.as_str())
-        == Some("ingestion");
+    let introduced_by_ingestion =
+        anchored.statements.statement_type(introduction) == Some("ingestion");
 
     if introduced_by_ingestion {
         anchored.governance.dataset_authority(trigger_index, dataset).unwrap_or_default()
@@ -579,12 +692,12 @@ fn signer_key_ids(envelope: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Every committed tree root the enumerated entries reference, so missing material can be
+/// Every committed tree root the **verified** statements reference, so missing material can be
 /// named rather than discovered mid-traversal.
 #[must_use]
-pub fn required_tree_roots(entries: &[(u64, Value)]) -> BTreeMap<String, u64> {
+pub fn required_tree_roots(statements: &Statements) -> BTreeMap<String, u64> {
     let mut roots = BTreeMap::new();
-    for (_, envelope) in entries {
+    for (_, envelope) in statements.iter() {
         let Some(payload) = envelope.get("payload") else { continue };
         if let (Some(root), Some(count)) = (
             payload.get("outputs_root").and_then(Value::as_str),
@@ -612,7 +725,7 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let anchored = fixture.establish(8).expect("established");
         assert_eq!(anchored.checkpoint.tree_size, 8);
-        assert_eq!(anchored.entries.len(), 8);
+        assert_eq!(anchored.statements.len(), 8);
         assert_eq!(anchored.governance.manifest_indexes(), vec![0]);
     }
 
@@ -707,7 +820,14 @@ mod tests {
         let codes: BTreeSet<&str> =
             governing.findings.iter().map(|finding| finding.code.as_str()).collect();
         assert!(codes.contains("trigger-anchored-as-challenge"));
-        assert!(codes.contains("trigger-signature-does-not-verify"));
+        // A candidate whose signature does not verify never reaches trigger selection at all:
+        // it is not a statement, so it is excluded when the verified view is built and
+        // reported there instead.
+        assert!(
+            !codes.contains("trigger-signature-does-not-verify"),
+            "an invalid signature is filtered before selection, not during it"
+        );
+        assert!(anchored.findings.iter().any(|f| f.code == "entry-is-not-a-statement"));
     }
 
     #[test]
@@ -744,7 +864,7 @@ mod tests {
         let identity = crate::testing::identity_at(&fixture, 8);
 
         let anchored = fixture.establish(8).expect("established");
-        let (_, envelope) = &anchored.entries[1];
+        let envelope = anchored.statements.get(1).expect("committed");
         let entry_id = ahl_core::entry_id(envelope);
         assert_eq!(&mirror.entry_by_id(&entry_id, &identity).expect("retrieved"), envelope);
 
@@ -760,8 +880,162 @@ mod tests {
     fn required_tree_roots_are_collected_before_traversal_begins() {
         let fixture = MirrorFixture::conformance();
         let anchored = fixture.establish(fixture.newest_tree_size()).expect("established");
-        let roots = required_tree_roots(&anchored.entries);
+        let roots = required_tree_roots(&anchored.statements);
         assert!(!roots.is_empty(), "the corpus commits batch and disposition trees");
         assert!(roots.values().all(|count| *count > 0));
+    }
+
+    // -- adaptor §7.4.1 and core §2.1, at the establishment boundary --------------------
+
+    #[test]
+    fn a_forged_later_manifest_can_never_authenticate_a_checkpoint() {
+        // Blocker 1, staged end to end. A hostile mirror serves a recomputable tree carrying
+        // the genuine pinned genesis manifest **plus** a forged later manifest naming attacker
+        // log keys, and a checkpoint signed by those keys. The tree recomputes, the inclusion
+        // proofs are real, and the forged manifest even links correctly to the version active
+        // before it — so if governance were collected before it was authenticated, this would
+        // authenticate.
+        let fixture = MirrorFixture::conformance().with_forged_manifest();
+        let size = fixture.forged_tree_size();
+
+        let error = fixture.establish(size).expect_err("the forged chain must not authenticate");
+        assert_eq!(
+            error.outcome(),
+            crate::outcome::Outcome::Unverifiable,
+            "a hostile mirror disproves nothing about the user's artifact: {error}"
+        );
+        assert!(error.to_string().contains("does not verify"), "{error}");
+
+        // And the forgery truncates nothing: a checkpoint below it still establishes, because
+        // an unauthorized governance statement is ignored rather than treated as a fork of the
+        // corpus (adaptor §7.4.1). That the forged manifest is *ignored and reported* rather
+        // than fatal is pinned in `governance`'s own tests, over an enumeration that includes
+        // it; this checkpoint's enumeration stops before it.
+        let anchored = fixture.establish(8).expect("the honest prefix still establishes");
+        assert_eq!(anchored.checkpoint.tree_size, 8);
+    }
+
+    #[test]
+    fn a_voided_entry_cannot_establish_an_earlier_introduction() {
+        // Blocker 2. A forged, non-verifying ingestion at a *smaller* index than the genuine
+        // introduction would, if the raw enumeration were read, move the introduction — and
+        // with it the authority consulted for a later, genuine trigger.
+        let honest = ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+        let attacker =
+            ahl_core::TestKey::from_seed_hex("attacker", &"09".repeat(32)).expect("seed");
+        let record = format!("sha256:{}", hex::encode([0xab_u8; 32]));
+
+        let genesis = ahl_core::envelope(
+            serde_json::json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+                "datasets": { "d": { "commitment_mode": "plain",
+                                     "authority": { "producer": "p", "key_ids": [honest.key_id()] } } },
+            }),
+            &honest,
+        );
+        let forged = ahl_core::envelope(
+            serde_json::json!({ "type": "ingestion", "dataset": "d", "record": record }),
+            &attacker,
+        );
+        let genuine = ahl_core::envelope(
+            serde_json::json!({ "type": "ingestion", "dataset": "d", "record": record }),
+            &honest,
+        );
+        let entries = vec![(0, genesis), (1, forged), (2, genuine)];
+        let policy = ahl_core::receipt::TrustPolicy {
+            genesis_entry_id: ahl_core::entry_id(&entries[0].1),
+            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            ..ahl_core::receipt::TrustPolicy::default()
+        };
+        let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
+        let (statements, findings) = Statements::build(&entries, &governance);
+
+        assert_eq!(
+            introduction_index(&statements, "d", &record),
+            Some(2),
+            "the forged ingestion at index 1 must not establish the introduction"
+        );
+        assert!(findings.iter().any(|finding| finding.code == "entry-is-not-a-statement"));
+        assert_eq!(statements.statement_type(1), Some("not-a-statement"));
+        // The position is occupied, never removed: the entry index is the ordering primitive.
+        assert_eq!(statements.len(), 3);
+    }
+
+    #[test]
+    fn a_duplicate_statement_id_is_void_from_the_second_occurrence_on() {
+        // Blocker 3. Core §2.1: "if duplicates occur, the one with the smallest entry index
+        // governs and later ones are void."
+        let honest = ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+        let genesis = ahl_core::envelope(
+            serde_json::json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+            }),
+            &honest,
+        );
+        let payload =
+            serde_json::json!({ "type": "ingestion", "dataset": "d", "record": "sha256:aa" });
+        let first = ahl_core::envelope(payload.clone(), &honest);
+        let second = ahl_core::envelope(payload, &honest);
+        assert_eq!(
+            ahl_core::statement_id(&first).expect("id"),
+            ahl_core::statement_id(&second).expect("id"),
+            "one payload, one statement id"
+        );
+
+        let entries = vec![(0, genesis), (4, first), (9, second)];
+        let policy = ahl_core::receipt::TrustPolicy {
+            genesis_entry_id: ahl_core::entry_id(&entries[0].1),
+            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            ..ahl_core::receipt::TrustPolicy::default()
+        };
+        let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
+        let (statements, findings) = Statements::build(&entries, &governance);
+
+        assert_eq!(statements.statement_type(1), Some("ingestion"), "the smaller index governs");
+        assert_eq!(statements.statement_type(2), Some("not-a-statement"), "the later one is void");
+        assert!(findings.iter().any(|finding| finding.code == "statement-void-duplicate-id"));
+    }
+
+    #[test]
+    fn a_non_verifying_duplicate_at_a_smaller_index_cannot_void_the_genuine_statement() {
+        // The ordering between the two rules, which core §2.1 does not fix. Excluding
+        // non-statements first is the only reading that is not trivially exploitable: an
+        // attacker who could void a genuine statement by anchoring the same payload with a
+        // broken signature at a smaller index would have a deletion primitive.
+        let honest = ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+        let attacker =
+            ahl_core::TestKey::from_seed_hex("attacker", &"09".repeat(32)).expect("seed");
+        let genesis = ahl_core::envelope(
+            serde_json::json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+            }),
+            &honest,
+        );
+        let payload =
+            serde_json::json!({ "type": "retraction", "dataset": "d", "record": "sha256:aa" });
+        let forged_first = ahl_core::envelope(payload.clone(), &attacker);
+        let genuine_later = ahl_core::envelope(payload, &honest);
+
+        let entries = vec![(0, genesis), (1, forged_first), (2, genuine_later)];
+        let policy = ahl_core::receipt::TrustPolicy {
+            genesis_entry_id: ahl_core::entry_id(&entries[0].1),
+            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            ..ahl_core::receipt::TrustPolicy::default()
+        };
+        let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
+        let (statements, _) = Statements::build(&entries, &governance);
+
+        assert_eq!(statements.statement_type(1), Some("not-a-statement"));
+        assert_eq!(
+            statements.statement_type(2),
+            Some("retraction"),
+            "the genuine statement survives a forged duplicate at a smaller index"
+        );
     }
 }

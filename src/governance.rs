@@ -23,16 +23,45 @@
 //!   directions: it rejects a legitimate rotation between the entry and the checkpoint, and it
 //!   admits a retired key on a later checkpoint.
 //!
-//! # A recorded disagreement between the frozen sources and their implementations
+//! # Governance is not self-authorizing, and this is where that is enforced
 //!
-//! Core spec §7.2/§7.3 and adaptor profile §7.3 name the manifest log-object member
-//! **`log_id`**, and `ahl-mirror` and `ahl-witness` both read that spelling. `ahl-core` reads
-//! **`log.id`**, and every manifest in the `ahl-core` conformance corpus carries `id`. Both
-//! spellings are therefore accepted here, `log_id` first; where only `id` is present a
-//! [`Finding`] with code `manifest-log-id-legacy-spelling` is raised so
-//! the disagreement is reported rather than smoothed over. The same applies to the members
-//! core §7.3 makes REQUIRED that the corpus omits — see [`Governance::log_object_findings`].
-
+//! Adaptor §7.4.1 is explicit that an implementation built from the profile alone could
+//! otherwise "resolve keys from any anchored entry whose payload says `"type": "manifest"`. It
+//! MUST NOT." An anchored `manifest` or `key` statement counts as governance only if **all**
+//! of the following hold:
+//!
+//! 1. it is anchored at a known entry index, proven by inclusion under a checkpoint — which is
+//!    established before [`Governance::resolve`] is reached, by the range proof and the root
+//!    recomputation of [`crate::enumerate`];
+//! 2. its **producer signature verifies under the key set in force at its own entry index**,
+//!    every signature entry resolving to an active key and verifying;
+//! 3. for a non-genesis manifest, its `predecessor` links by entry id to the manifest version
+//!    **active immediately before it** — not merely to some earlier manifest in the log;
+//! 4. for the genesis manifest, its entry id and initial key fingerprints match the verifier's
+//!    **locally configured** trust anchor, which is never taken from the log.
+//!
+//! Test 2 is why [`Governance::resolve`] builds the chain **incrementally**. Collecting every
+//! `manifest`-shaped payload first and checking signatures afterwards inverts the dependency:
+//! a hostile mirror can then serve a recomputable tree containing the genuine pinned genesis
+//! manifest *plus a forged later manifest naming attacker log keys*, and a checkpoint signed
+//! by those keys authenticates. On a log without submission controls anyone who can reach the
+//! endpoint can place such an entry at a real index with a real inclusion proof.
+//!
+//! A statement that fails is **ignored for key resolution and reported**, never fatal: adaptor
+//! §7.4.1 says such an entry "is not a fork of the corpus and does not need to be reconciled
+//! with the real chain". Only a genesis that does not match configured policy is fatal, because
+//! then there is no trust anchor at all.
+//!
+//! # `log.log_id`
+//!
+//! Core §7.2/§7.3 and adaptor §7.3 name the manifest log-object member `log_id`, and every
+//! member of that object is REQUIRED. This module requires that spelling: the value is
+//! load-bearing for the check that a checkpoint belongs to the corpus's bound Data Tree
+//! (adaptor §3, §6.2), so its absence is not a reportable irregularity but a check that cannot
+//! be performed. Members this build never consults — `cadence_epoch`, `operator` — are
+//! reported through [`Governance::log_object_findings`] instead, because reporting is all a
+//! verifier can honestly do about a field no rule of its own depends on.
+//!
 use std::collections::{BTreeMap, BTreeSet};
 
 use ahl_core::entry_id;
@@ -69,17 +98,18 @@ fn payload_of(envelope: &Value) -> CliResult<&Value> {
 }
 
 impl Governance {
-    /// Collect and structurally validate the governance statements among `entries`.
+    /// Collect governance statements after **structural validation only**.
     ///
-    /// `entries` is `(entry_index, envelope)` in ascending index order; it may be a full
-    /// enumeration or a receipt's governance chain. Every statement that is neither a
-    /// `manifest` nor a `key` is skipped, because a full enumeration legitimately contains
-    /// them.
+    /// No producer signature is checked and no trust anchor is consulted, so the result is
+    /// **not** an authenticated key set and must never be used to authenticate anything. It
+    /// exists for topology mode, where nothing is evidence and the point is to describe an
+    /// operator-supplied file rather than to believe it. Authenticated callers use
+    /// [`Self::resolve`].
     ///
     /// # Errors
     ///
-    /// [`CliError::RuleFired`] naming the chain rule that failed.
-    pub fn from_entries(entries: &[(u64, Value)]) -> CliResult<Self> {
+    /// [`CliError::RuleFired`] naming the structural rule that failed.
+    pub fn structural_only(entries: &[(u64, Value)]) -> CliResult<Self> {
         let mut manifests: Vec<(u64, Value)> = Vec::new();
         let mut events: Vec<KeyEvent> = Vec::new();
         let mut previous_manifest_entry_id: Option<String> = None;
@@ -130,29 +160,11 @@ impl Governance {
                     previous_manifest_entry_id = Some(entry_id(envelope));
                     manifests.push((*index, payload.clone()));
                 }
-                "key" => {
-                    let key = payload.get("key").filter(|k| k.is_object()).ok_or_else(|| {
-                        CliError::RuleFired(format!(
-                            "`key` statement at entry index {index} carries no `key` object"
-                        ))
-                    })?;
-                    let added = match payload.get("action").and_then(Value::as_str) {
-                        Some("add") => true,
-                        Some("retire") => false,
-                        other => {
-                            return Err(CliError::RuleFired(format!(
-                                "unknown key action `{}` at entry index {index}",
-                                other.unwrap_or("<absent>")
-                            )))
-                        }
-                    };
-                    events.push(KeyEvent {
-                        entry_index: *index,
-                        key_id: string_member(key, "key_id")?,
-                        pubkey: string_member(key, "pubkey")?,
-                        added,
-                    });
-                }
+                "key" => events.push(read_key_event(*index, payload).map_err(|detail| {
+                    CliError::RuleFired(format!(
+                        "`key` statement at entry index {index} is unusable: {detail}"
+                    ))
+                })?),
                 _ => {}
             }
         }
@@ -167,49 +179,176 @@ impl Governance {
         Ok(Self { manifests, events })
     }
 
-    /// Compare the genesis anchor against **locally configured policy**.
+    /// Resolve governance **incrementally**, per adaptor §7.4.1.
     ///
-    /// A receipt or a log carries a genesis anchor so it is self-describing; policy decides
-    /// whether that anchor is the right one. Nothing here is ever defaulted from the artifact.
+    /// Walks `entries` in ascending entry-index order. The first manifest is the genesis and
+    /// is tested against locally configured policy; every later `manifest` or `key` statement
+    /// must verify under the key set the chain has already established *before* it can
+    /// contribute anything to that key set. A statement that fails any of §7.4.1's tests is
+    /// ignored for key resolution and reported in the returned findings.
+    ///
+    /// Returns the resolved state and the findings raised while resolving it.
     ///
     /// # Errors
     ///
-    /// [`CliError::RuleFired`] if the genesis manifest is not at index 0, its entry id is not
-    /// the configured anchor, or its key fingerprints are not the configured ones.
-    pub fn check_genesis(&self, entries: &[(u64, Value)], policy: &TrustPolicy) -> CliResult<()> {
-        let (index, _) = self
-            .manifests
-            .first()
-            .ok_or_else(|| CliError::RuleFired("no genesis manifest is anchored".to_owned()))?;
-        if *index != 0 {
+    /// [`CliError::RuleFired`] when there is no usable trust anchor at all: entries out of
+    /// order, no manifest, or a genesis that does not match configured policy. Everything else
+    /// is a finding, because a forged governance statement is not a fork of the corpus and
+    /// does not need to be reconciled with the real chain.
+    pub fn resolve(
+        entries: &[(u64, Value)],
+        policy: &TrustPolicy,
+    ) -> CliResult<(Self, Vec<Finding>)> {
+        let mut resolved = Self::default();
+        let mut findings = Vec::new();
+        let mut previous_index: Option<u64> = None;
+        let mut previous_manifest_entry_id: Option<String> = None;
+
+        for (index, envelope) in entries {
+            if previous_index.is_some_and(|previous| previous >= *index) {
+                return Err(CliError::RuleFired(
+                    "entries must ascend by entry index; the entry index is AHL's only \
+                     ordering primitive"
+                        .to_owned(),
+                ));
+            }
+            previous_index = Some(*index);
+
+            let payload = payload_of(envelope)?;
+            let kind = payload.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(kind, "manifest" | "key") {
+                continue;
+            }
+
+            // --- the genesis manifest: §7.4.1 test 4 ---------------------------------
+            if resolved.manifests.is_empty() {
+                if kind != "manifest" {
+                    findings.push(Finding::new(
+                        "governance-statement-not-authorized",
+                        format!(
+                            "the `key` statement at entry index {index} precedes any manifest \
+                             version, so no key set is in force to authorize it; it is ignored \
+                             for key resolution"
+                        ),
+                    ));
+                    continue;
+                }
+                resolved.accept_genesis(*index, envelope, payload, policy)?;
+                previous_manifest_entry_id = Some(entry_id(envelope));
+                continue;
+            }
+
+            // --- §7.4.1 test 2: verified under the key set the chain already established --
+            //
+            // `resolved` holds only statements already accepted, so `producer_keys_at` is the
+            // key set in force at this index under the chain BEFORE it. This is the ordering
+            // the whole module exists to get right.
+            if !resolved.envelope_verifies_at(envelope, *index).unwrap_or(false) {
+                findings.push(Finding::new(
+                    "governance-statement-not-authorized",
+                    format!(
+                        "the `{kind}` statement at entry index {index} does not verify under \
+                         the key set in force at that index; anchoring proves bytes existed at \
+                         a position and never makes an unverified governance statement \
+                         effective (adaptor §7.4.1)"
+                    ),
+                ));
+                continue;
+            }
+
+            match kind {
+                "manifest" => {
+                    // --- §7.4.1 test 3: the predecessor link ---------------------------
+                    let declared = payload.get("predecessor").and_then(Value::as_str);
+                    let expected = previous_manifest_entry_id.as_deref();
+                    if declared != expected {
+                        findings.push(Finding::new(
+                            "governance-statement-not-authorized",
+                            format!(
+                                "the manifest at entry index {index} references predecessor \
+                                 `{}`, but the version active immediately before it is `{}`; it \
+                                 is ignored for key resolution",
+                                declared.unwrap_or("<absent>"),
+                                expected.unwrap_or("<none>")
+                            ),
+                        ));
+                        continue;
+                    }
+                    previous_manifest_entry_id = Some(entry_id(envelope));
+                    resolved.manifests.push((*index, payload.clone()));
+                }
+                _ => match read_key_event(*index, payload) {
+                    Ok(event) => resolved.events.push(event),
+                    Err(detail) => findings.push(Finding::new(
+                        "governance-statement-not-authorized",
+                        format!("the `key` statement at entry index {index} is unusable: {detail}"),
+                    )),
+                },
+            }
+        }
+
+        if resolved.manifests.is_empty() {
+            return Err(CliError::RuleFired(
+                "no manifest statement authorized by the configured trust anchor is anchored; \
+                 a corpus always contains at least its genesis manifest"
+                    .to_owned(),
+            ));
+        }
+        findings.sort();
+        findings.dedup();
+        Ok((resolved, findings))
+    }
+
+    /// §7.4.1 test 4, plus the genesis's own signature.
+    ///
+    /// The genesis manifest is the one statement validated by its own snapshot: there is no
+    /// earlier key set to check it against, which is exactly why its entry id and key
+    /// fingerprints have to come from **locally configured policy** rather than from the log.
+    fn accept_genesis(
+        &mut self,
+        index: u64,
+        envelope: &Value,
+        payload: &Value,
+        policy: &TrustPolicy,
+    ) -> CliResult<()> {
+        if index != 0 {
             return Err(CliError::RuleFired(format!(
-                "the genesis manifest must be anchored at entry index 0, found it at {index}"
+                "the genesis manifest is anchored at entry index {index}; nothing can be \
+                 governed before the corpus trust anchor, so it can only be at index 0"
             )));
         }
-        let genesis_envelope =
-            entries.iter().find(|(at, _)| *at == 0).map(|(_, envelope)| envelope).ok_or_else(
-                || CliError::RuleFired("entry index 0 is not present in the material".to_owned()),
-            )?;
-        let anchor = entry_id(genesis_envelope);
+        if payload.get("predecessor").is_some() {
+            return Err(CliError::RuleFired(
+                "the genesis manifest must carry no predecessor reference".to_owned(),
+            ));
+        }
+        let anchor = entry_id(envelope);
         if anchor != policy.genesis_entry_id {
             return Err(CliError::RuleFired(format!(
                 "the anchored genesis manifest digests to {anchor}, local policy configures {}",
                 policy.genesis_entry_id
             )));
         }
-        let declared: BTreeSet<String> = self
-            .manifests
-            .first()
-            .map(|(_, payload)| manifest_key_ids(payload))
-            .transpose()?
-            .unwrap_or_default();
+        let declared = manifest_key_ids(payload)?;
         if declared != policy.genesis_key_ids {
             return Err(CliError::RuleFired(
                 "the genesis manifest's producer key fingerprints are not the configured ones"
                     .to_owned(),
             ));
         }
-        Ok(())
+
+        // Provisionally in force so the genesis can be checked against its own snapshot.
+        self.manifests.push((index, payload.clone()));
+        if self.envelope_verifies_at(envelope, index).unwrap_or(false) {
+            Ok(())
+        } else {
+            self.manifests.clear();
+            Err(CliError::RuleFired(
+                "the genesis manifest's own signature does not verify under the key set it \
+                 declares"
+                    .to_owned(),
+            ))
+        }
     }
 
     /// The manifest version whose snapshot is in force **at** `index` — the manifest with the
@@ -304,13 +443,15 @@ impl Governance {
         let log = manifest.get("log").filter(|value| value.is_object()).ok_or_else(|| {
             CliError::RuleFired("the active manifest carries no `log` object".to_owned())
         })?;
-        log.get("log_id")
-            .or_else(|| log.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                CliError::RuleFired("the active manifest's `log` object names no log id".to_owned())
-            })
+        log.get("log_id").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| {
+            CliError::RuleFired(
+                "the active manifest's `log` object declares no `log_id`; core spec §7.2/§7.3 \
+                 and adaptor profile §7.3 name that member and make it REQUIRED, and its value \
+                 is what binds a checkpoint to the corpus's Data Tree, so there is no check to \
+                 perform without it"
+                    .to_owned(),
+            )
+        })
     }
 
     /// `(checkpoint_cadence, witness_grace_period)` in nanoseconds, for `tree_size`.
@@ -400,13 +541,14 @@ impl Governance {
             .map_err(|source| CliError::Malformed { what: "envelope", detail: source.to_string() })
     }
 
-    /// Findings about every manifest version's `log` object, reported rather than adjudicated.
+    /// Findings about members of every manifest version's `log` object that **this build never
+    /// consults**.
     ///
-    /// Core spec §7.3 makes every member of the `log` object REQUIRED and names it `log_id`,
-    /// while the `ahl-core` conformance corpus spells it `id` and omits `cadence_epoch`.
-    /// Rejecting those manifests would reject the frozen corpus; accepting them silently would
-    /// hide a live disagreement between the specification and its reference vectors. They are
-    /// therefore reported as findings, which never change an outcome.
+    /// Core §7.3 makes every member REQUIRED. Members a check of this crate depends on are
+    /// enforced where that check runs — `log_id` in [`Self::log_id_for`], the two durations in
+    /// [`Self::cadence_and_grace_for`] — because a missing value there is a check that cannot
+    /// be performed. The rest are reported: a verifier that has no rule of its own depending
+    /// on a field can honestly report its absence and nothing more.
     #[must_use]
     pub fn log_object_findings(&self) -> Vec<Finding> {
         let mut findings = BTreeSet::new();
@@ -414,32 +556,17 @@ impl Governance {
             let Some(log) = manifest.get("log").filter(|value| value.is_object()) else {
                 continue;
             };
-            if log.get("log_id").is_none() && log.get("id").is_some() {
-                findings.insert(Finding::new(
-                    "manifest-log-id-legacy-spelling",
-                    format!(
-                        "the manifest at entry index {index} names the log `log.id`; core spec \
-                         §7.2/§7.3 and adaptor profile §7.3 name it `log.log_id`"
-                    ),
-                ));
-            }
-            let missing: Vec<&str> = [
-                "operator",
-                "adaptor",
-                "checkpoint_cadence",
-                "cadence_epoch",
-                "witness_grace_period",
-                "keys",
-            ]
-            .into_iter()
-            .filter(|member| log.get(*member).is_none())
-            .collect();
+            let missing: Vec<&str> = ["operator", "adaptor", "cadence_epoch"]
+                .into_iter()
+                .filter(|member| log.get(*member).is_none())
+                .collect();
             if !missing.is_empty() {
                 findings.insert(Finding::new(
                     "manifest-log-object-incomplete",
                     format!(
                         "the manifest at entry index {index} omits {} from its `log` object; \
-                         core spec §7.3 makes every member REQUIRED",
+                         core spec §7.3 makes every member REQUIRED, and no rule this build \
+                         evaluates depends on the missing one",
                         missing.join(", ")
                     ),
                 ));
@@ -453,6 +580,25 @@ impl Governance {
     pub fn manifest_indexes(&self) -> Vec<u64> {
         self.manifests.iter().map(|(index, _)| *index).collect()
     }
+}
+
+/// Read a `key` statement's transition, or say why it is unusable.
+fn read_key_event(index: u64, payload: &Value) -> Result<KeyEvent, String> {
+    let key = payload
+        .get("key")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "it carries no `key` object".to_owned())?;
+    let added = match payload.get("action").and_then(Value::as_str) {
+        Some("add") => true,
+        Some("retire") => false,
+        other => return Err(format!("unknown key action `{}`", other.unwrap_or("<absent>"))),
+    };
+    Ok(KeyEvent {
+        entry_index: index,
+        key_id: string_member(key, "key_id").map_err(|error| error.to_string())?,
+        pubkey: string_member(key, "pubkey").map_err(|error| error.to_string())?,
+        added,
+    })
 }
 
 fn string_member(value: &Value, member: &str) -> CliResult<String> {
@@ -536,56 +682,6 @@ mod tests {
         vec![(0, genesis(log_id_member))]
     }
 
-    fn policy_for(entries: &[(u64, Value)]) -> TrustPolicy {
-        TrustPolicy {
-            genesis_entry_id: entry_id(&entries[0].1),
-            genesis_key_ids: BTreeSet::from([producer(1).key_id()]),
-            ..TrustPolicy::default()
-        }
-    }
-
-    #[test]
-    fn a_genesis_only_chain_resolves_and_matches_configured_policy() {
-        let entries = chain("log_id");
-        let governance = Governance::from_entries(&entries).expect("chain resolves");
-        governance.check_genesis(&entries, &policy_for(&entries)).expect("anchor matches");
-        assert_eq!(governance.manifest_indexes(), vec![0]);
-        assert_eq!(governance.log_id_for(1).expect("log id"), "sha256:aa");
-        assert_eq!(
-            governance.cadence_and_grace_for(1).expect("durations"),
-            (3_600_000_000_000, 900_000_000_000)
-        );
-    }
-
-    #[test]
-    fn a_mismatched_genesis_anchor_is_never_defaulted_from_the_artifact() {
-        let entries = chain("log_id");
-        let governance = Governance::from_entries(&entries).expect("chain resolves");
-        let mut policy = policy_for(&entries);
-        policy.genesis_entry_id = format!("sha256:{}", "99".repeat(32));
-        let error = governance.check_genesis(&entries, &policy).expect_err("anchor mismatch");
-        assert!(error.to_string().contains("local policy configures"), "{error}");
-
-        let mut policy = policy_for(&entries);
-        policy.genesis_key_ids = BTreeSet::from([format!("sha256:{}", "88".repeat(32))]);
-        assert!(governance.check_genesis(&entries, &policy).is_err());
-    }
-
-    #[test]
-    fn the_legacy_log_id_spelling_is_accepted_and_reported_as_a_finding() {
-        let entries = chain("id");
-        let governance = Governance::from_entries(&entries).expect("chain resolves");
-        assert_eq!(governance.log_id_for(1).expect("log id"), "sha256:aa");
-        let findings = governance.log_object_findings();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].code, "manifest-log-id-legacy-spelling");
-
-        assert!(Governance::from_entries(&chain("log_id"))
-            .expect("chain")
-            .log_object_findings()
-            .is_empty());
-    }
-
     #[test]
     fn a_missing_required_log_member_is_reported_not_adjudicated() {
         let key = producer(1);
@@ -598,7 +694,7 @@ mod tests {
             }),
             &key,
         );
-        let governance = Governance::from_entries(&[(0, envelope)]).expect("chain");
+        let governance = Governance::structural_only(&[(0, envelope)]).expect("chain");
         let findings = governance.log_object_findings();
         assert!(findings.iter().any(|f| f.code == "manifest-log-object-incomplete"));
         assert!(findings.iter().any(|f| f.detail.contains("cadence_epoch")));
@@ -619,7 +715,7 @@ mod tests {
             }),
             &key,
         );
-        assert!(Governance::from_entries(&[(0, first.clone()), (5, good)]).is_ok());
+        assert!(Governance::structural_only(&[(0, first.clone()), (5, good)]).is_ok());
 
         let wrong = ahl_core::envelope(
             json!({
@@ -631,7 +727,7 @@ mod tests {
             &key,
         );
         let error =
-            Governance::from_entries(&[(0, first), (5, wrong)]).expect_err("wrong predecessor");
+            Governance::structural_only(&[(0, first), (5, wrong)]).expect_err("wrong predecessor");
         assert!(error.to_string().contains("active immediately before"), "{error}");
     }
 
@@ -642,7 +738,7 @@ mod tests {
             json!({ "type": "manifest", "predecessor": "sha256:aa", "keys": [], "log": {} }),
             &key,
         );
-        let error = Governance::from_entries(&[(0, envelope)]).expect_err("genesis predecessor");
+        let error = Governance::structural_only(&[(0, envelope)]).expect_err("genesis predecessor");
         assert!(error.to_string().contains("no predecessor"), "{error}");
     }
 
@@ -650,7 +746,7 @@ mod tests {
     fn a_non_genesis_manifest_without_a_predecessor_is_refused() {
         let key = producer(1);
         let second = ahl_core::envelope(json!({ "type": "manifest", "keys": [], "log": {} }), &key);
-        let error = Governance::from_entries(&[(0, genesis("log_id")), (5, second)])
+        let error = Governance::structural_only(&[(0, genesis("log_id")), (5, second)])
             .expect_err("no predecessor");
         assert!(error.to_string().contains("must reference its predecessor"), "{error}");
     }
@@ -670,7 +766,7 @@ mod tests {
             &first_key,
         );
         let entries = vec![(0, first), (5, rotation)];
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
 
         // Before the rotation the first key is in force; after it, only the second.
         assert!(governance.producer_keys_at(3).contains_key(&first_key.key_id()));
@@ -696,7 +792,7 @@ mod tests {
             &first_key,
         );
         let entries = vec![(0, first), (3, add), (7, retire)];
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
 
         assert!(!governance.producer_keys_at(2).contains_key(&added.key_id()));
         assert!(governance.producer_keys_at(4).contains_key(&added.key_id()));
@@ -710,7 +806,7 @@ mod tests {
             json!({ "type": "key", "action": "borrow", "key": key.key_object(1) }),
             &key,
         );
-        assert!(Governance::from_entries(&[(0, genesis("log_id")), (1, bad)]).is_err());
+        assert!(Governance::structural_only(&[(0, genesis("log_id")), (1, bad)]).is_err());
     }
 
     #[test]
@@ -728,7 +824,7 @@ mod tests {
             &key,
         );
         let entries = vec![(0, first), (5, second)];
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
 
         // tree_size 5 commits [0, 5), so index 5 is NOT yet committed and genesis governs.
         assert_eq!(governance.log_id_for(5).expect("log id"), "sha256:aa");
@@ -749,7 +845,7 @@ mod tests {
             }),
             &key,
         );
-        let governance = Governance::from_entries(&[(0, envelope)]).expect("chain");
+        let governance = Governance::structural_only(&[(0, envelope)]).expect("chain");
         let error = governance.cadence_and_grace_for(1).expect_err("prohibited component");
         assert!(error.to_string().contains("prohibited"), "{error}");
     }
@@ -766,14 +862,14 @@ mod tests {
             }),
             &key,
         );
-        let governance = Governance::from_entries(&[(0, envelope)]).expect("chain");
+        let governance = Governance::structural_only(&[(0, envelope)]).expect("chain");
         assert!(governance.cadence_and_grace_for(1).is_err());
     }
 
     #[test]
     fn log_and_witness_keys_come_from_the_active_manifest_version() {
         let entries = chain("log_id");
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
         assert!(governance.log_keys_for(1).expect("log keys").contains_key(&producer(3).key_id()));
         assert!(governance
             .witness_keys_for(1)
@@ -784,7 +880,7 @@ mod tests {
     #[test]
     fn dataset_authority_and_commitment_mode_are_read_from_the_snapshot() {
         let entries = chain("log_id");
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
         let authority = governance.dataset_authority(1, "customers").expect("declared");
         assert!(authority.contains(&producer(1).key_id()));
         assert_eq!(governance.dataset_commitment_mode(1, "customers").as_deref(), Some("keyed"));
@@ -796,7 +892,7 @@ mod tests {
         let key = producer(1);
         let stranger = producer(9);
         let entries = chain("log_id");
-        let governance = Governance::from_entries(&entries).expect("chain");
+        let governance = Governance::structural_only(&entries).expect("chain");
 
         let good = ahl_core::envelope(json!({ "type": "ingestion" }), &key);
         assert!(governance.envelope_verifies_at(&good, 1).expect("well-formed"));
@@ -807,16 +903,240 @@ mod tests {
     #[test]
     fn entries_must_ascend_and_a_corpus_must_carry_a_manifest() {
         let entries = vec![(5, genesis("log_id")), (1, genesis("log_id"))];
-        assert!(Governance::from_entries(&entries).is_err());
+        assert!(Governance::structural_only(&entries).is_err());
 
         let key = producer(1);
         let ingestion = ahl_core::envelope(json!({ "type": "ingestion" }), &key);
-        assert!(Governance::from_entries(&[(0, ingestion)]).is_err());
+        assert!(Governance::structural_only(&[(0, ingestion)]).is_err());
     }
 
     #[test]
     fn a_typeless_or_payloadless_entry_is_refused() {
-        assert!(Governance::from_entries(&[(0, json!({ "signatures": [] }))]).is_err());
-        assert!(Governance::from_entries(&[(0, json!({ "payload": { "a": 1 } }))]).is_err());
+        assert!(Governance::structural_only(&[(0, json!({ "signatures": [] }))]).is_err());
+        assert!(Governance::structural_only(&[(0, json!({ "payload": { "a": 1 } }))]).is_err());
+    }
+
+    // -- adaptor §7.4.1: governance is not self-authorizing ---------------------------
+
+    fn policy_for(entries: &[(u64, Value)], key: &TestKey) -> TrustPolicy {
+        TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: BTreeSet::from([key.key_id()]),
+            ..TrustPolicy::default()
+        }
+    }
+
+    /// A manifest a hostile party anchored: well-formed, at a real index, signed by a key the
+    /// corpus never adopted, naming attacker log keys.
+    fn forged_manifest(predecessor: &Value, attacker: &TestKey, log_key: &TestKey) -> Value {
+        ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "predecessor": entry_id(predecessor),
+                "keys": [ attacker.key_object(0) ],
+                "log": {
+                    "log_id": "sha256:aa",
+                    "operator": "op",
+                    "adaptor": { "id": "ahl-test-log-v1", "hash": "sha256:bb" },
+                    "checkpoint_cadence": "PT1H",
+                    "cadence_epoch": "2026-01-01T00:00:00Z",
+                    "witness_grace_period": "PT15M",
+                    "keys": [ log_key.key_object(0) ],
+                },
+            }),
+            attacker,
+        )
+    }
+
+    #[test]
+    fn a_forged_later_manifest_never_contributes_to_the_resolved_key_set() {
+        // The blocker this module was rewritten for. A hostile mirror serves a recomputable
+        // tree containing the genuine pinned genesis manifest PLUS a forged later manifest
+        // naming attacker log keys. If the chain were collected first and checked afterwards,
+        // a checkpoint signed by those keys would authenticate.
+        let honest = producer(1);
+        let attacker = producer(9);
+        let attacker_log_key = producer(8);
+        let first = genesis("log_id");
+        let forged = forged_manifest(&first, &attacker, &attacker_log_key);
+        let entries = vec![(0, first), (5, forged)];
+
+        let (resolved, findings) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+
+        assert_eq!(
+            resolved.manifest_indexes(),
+            vec![0],
+            "the forged manifest must not join the chain"
+        );
+        assert!(findings.iter().any(|f| f.code == "governance-statement-not-authorized"));
+        // And the attacker's log key is not resolvable for any checkpoint.
+        let log_keys = resolved.log_keys_for(9).expect("genesis governs");
+        assert!(!log_keys.contains_key(&attacker_log_key.key_id()));
+        assert!(log_keys.contains_key(&producer(3).key_id()), "the genuine log key still is");
+    }
+
+    #[test]
+    fn a_forged_key_statement_never_adds_a_producer_key() {
+        let honest = producer(1);
+        let attacker = producer(9);
+        let first = genesis("log_id");
+        let forged = ahl_core::envelope(
+            json!({ "type": "key", "action": "add", "key": attacker.key_object(3) }),
+            &attacker,
+        );
+        let entries = vec![(0, first), (3, forged)];
+        let (resolved, findings) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert!(!resolved.producer_keys_at(4).contains_key(&attacker.key_id()));
+        assert!(findings.iter().any(|f| f.code == "governance-statement-not-authorized"));
+    }
+
+    #[test]
+    fn a_key_statement_before_any_manifest_is_not_governance() {
+        let honest = producer(1);
+        let attacker = producer(9);
+        let early = ahl_core::envelope(
+            json!({ "type": "key", "action": "add", "key": attacker.key_object(0) }),
+            &attacker,
+        );
+        let first = genesis("log_id");
+        let entries = vec![(0, early), (1, first.clone())];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&first),
+            genesis_key_ids: BTreeSet::from([honest.key_id()]),
+            ..TrustPolicy::default()
+        };
+        // The genesis is not at index 0 here, so there is no usable anchor at all.
+        assert!(Governance::resolve(&entries, &policy).is_err());
+    }
+
+    #[test]
+    fn a_genuine_rotation_signed_by_the_key_set_before_it_is_accepted() {
+        // The other direction: the incremental rule must not reject an honest chain.
+        let honest = producer(1);
+        let rotated = producer(2);
+        let first = genesis("log_id");
+        let second = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "predecessor": entry_id(&first),
+                "keys": [ rotated.key_object(5) ],
+                "log": {
+                    "log_id": "sha256:cc",
+                    "operator": "op",
+                    "adaptor": { "id": "ahl-test-log-v1", "hash": "sha256:bb" },
+                    "checkpoint_cadence": "PT2H",
+                    "cadence_epoch": "2026-01-01T00:00:00Z",
+                    "witness_grace_period": "PT15M",
+                    "keys": [ producer(3).key_object(0) ],
+                },
+            }),
+            &honest,
+        );
+        let entries = vec![(0, first), (5, second)];
+        let (resolved, findings) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert_eq!(resolved.manifest_indexes(), vec![0, 5]);
+        assert!(findings.iter().all(|f| f.code != "governance-statement-not-authorized"));
+        assert_eq!(resolved.log_id_for(6).expect("log id"), "sha256:cc");
+        // And after the rotation the old producer key is gone.
+        assert!(!resolved.producer_keys_at(6).contains_key(&honest.key_id()));
+    }
+
+    #[test]
+    fn a_manifest_linking_past_the_active_version_is_ignored_for_key_resolution() {
+        let honest = producer(1);
+        let first = genesis("log_id");
+        let second = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "predecessor": entry_id(&first),
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:cc", "keys": [] },
+            }),
+            &honest,
+        );
+        // Links to genesis rather than to the version active immediately before it.
+        let third = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "predecessor": entry_id(&first),
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:dd", "keys": [] },
+            }),
+            &honest,
+        );
+        let entries = vec![(0, first), (5, second), (9, third)];
+        let (resolved, findings) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert_eq!(resolved.manifest_indexes(), vec![0, 5]);
+        assert!(findings.iter().any(|f| f.detail.contains("active immediately before")));
+    }
+
+    #[test]
+    fn a_genesis_that_is_not_the_configured_anchor_is_fatal_not_a_finding() {
+        let honest = producer(1);
+        let entries = vec![(0, genesis("log_id"))];
+        let mut policy = policy_for(&entries, &honest);
+        policy.genesis_entry_id = format!("sha256:{}", "99".repeat(32));
+        let error = Governance::resolve(&entries, &policy).expect_err("no trust anchor");
+        assert!(error.to_string().contains("local policy configures"), "{error}");
+
+        let mut policy = policy_for(&entries, &honest);
+        policy.genesis_key_ids = BTreeSet::from([format!("sha256:{}", "88".repeat(32))]);
+        assert!(Governance::resolve(&entries, &policy).is_err());
+    }
+
+    #[test]
+    fn a_genesis_whose_own_signature_does_not_verify_is_fatal() {
+        let honest = producer(1);
+        let stranger = producer(9);
+        // Declares the honest key set but is signed by someone else.
+        let forged = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+            }),
+            &stranger,
+        );
+        let entries = vec![(0, forged)];
+        let policy = policy_for(&entries, &honest);
+        let error = Governance::resolve(&entries, &policy).expect_err("self-signature");
+        assert!(error.to_string().contains("own signature"), "{error}");
+    }
+
+    #[test]
+    fn the_resolved_chain_is_never_the_structural_one() {
+        // A regression guard for the inversion itself: the structural walk accepts the forged
+        // manifest (it checks no signatures, by design and by name), the resolved one does not.
+        let honest = producer(1);
+        let attacker = producer(9);
+        let first = genesis("log_id");
+        let forged = forged_manifest(&first, &attacker, &producer(8));
+        let entries = vec![(0, first), (5, forged)];
+
+        let structural = Governance::structural_only(&entries).expect("structurally fine");
+        assert_eq!(structural.manifest_indexes(), vec![0, 5]);
+
+        let (resolved, _) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert_eq!(resolved.manifest_indexes(), vec![0]);
+        assert_ne!(structural.manifest_indexes(), resolved.manifest_indexes());
+    }
+
+    #[test]
+    fn a_log_object_without_the_specification_spelling_has_no_check_to_perform() {
+        let entries = vec![(0, genesis("id"))];
+        let governance = Governance::structural_only(&entries).expect("structurally fine");
+        let error = governance.log_id_for(1).expect_err("no log_id");
+        assert!(error.to_string().contains("REQUIRED"), "{error}");
+        assert!(error.to_string().contains("no check to perform"), "{error}");
+
+        // The specification spelling resolves.
+        let entries = vec![(0, genesis("log_id"))];
+        let governance = Governance::structural_only(&entries).expect("structurally fine");
+        assert_eq!(governance.log_id_for(1).expect("log id"), "sha256:aa");
     }
 }

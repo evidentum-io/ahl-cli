@@ -71,6 +71,9 @@ pub struct MirrorFixture {
     foreign_key_at: Option<u64>,
     /// Serve different bytes for this entry index.
     tampered: Option<usize>,
+    /// A forged later manifest was appended, and the newest checkpoint is signed by the log
+    /// key it names.
+    forged_manifest: bool,
     recorded: Mutex<Vec<Recorded>>,
 }
 
@@ -143,6 +146,7 @@ impl MirrorFixture {
             equivocate_at: None,
             foreign_key_at: None,
             tampered: None,
+            forged_manifest: false,
             recorded: Mutex::new(Vec::new()),
         }
     }
@@ -168,6 +172,52 @@ impl MirrorFixture {
         self
     }
 
+    /// Append a **forged later manifest** naming attacker log keys, and sign the newest
+    /// checkpoint with one of them.
+    ///
+    /// This is the attack adaptor §7.4.1 exists to forbid, staged exactly as it would arrive:
+    /// the tree recomputes, the genuine pinned genesis manifest is in it, the forged manifest
+    /// is anchored at a real index with a real inclusion proof, and it even links correctly to
+    /// the manifest version active before it — so the *only* thing standing between an
+    /// attacker and a checkpoint that authenticates is test 2, the producer signature.
+    #[must_use]
+    pub fn with_forged_manifest(mut self) -> Self {
+        let attacker =
+            TestKey::from_seed_hex("attacker", &"7e".repeat(32)).unwrap_or_else(|_| unreachable());
+        let predecessor = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|bytes| {
+                let value: Value = serde_json::from_slice(bytes).ok()?;
+                (value.get("payload")?.get("type")?.as_str()? == "manifest")
+                    .then(|| ahl_core::sha256_hex(bytes))
+            })
+            .unwrap_or_default();
+        let forged = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "producer": "producer-1",
+                "predecessor": predecessor,
+                "keys": [ attacker.key_object(0) ],
+                "log": {
+                    "log_id": self.log_id(),
+                    "operator": "log-operator-1",
+                    "adaptor": { "id": TEST_LOG_PROFILE, "hash": format!("sha256:{}", "00".repeat(32)) },
+                    "checkpoint_cadence": "PT1H",
+                    "cadence_epoch": "2026-08-16T00:00:00Z",
+                    "witness_grace_period": "PT15M",
+                    // The whole point: attacker-controlled checkpoint-signing keys.
+                    "keys": [ self.foreign_key.key_object(0) ],
+                },
+            }),
+            &attacker,
+        );
+        self.entries.push(ahl_core::jcs(&forged));
+        self.forged_manifest = true;
+        self
+    }
+
     /// The largest published tree size.
     #[must_use]
     pub fn newest_tree_size(&self) -> u64 {
@@ -176,7 +226,18 @@ impl MirrorFixture {
 
     fn published_sizes(&self) -> Vec<u64> {
         let total = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
-        CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect()
+        let mut sizes: Vec<u64> =
+            CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
+        if self.forged_manifest && !sizes.contains(&total) {
+            sizes.push(total);
+        }
+        sizes
+    }
+
+    /// The tree size whose checkpoint the forged manifest would govern, if one was appended.
+    #[must_use]
+    pub fn forged_tree_size(&self) -> u64 {
+        u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
     }
 
     fn entry_bytes(&self, index: usize) -> Vec<u8> {
@@ -220,7 +281,12 @@ impl MirrorFixture {
     }
 
     fn checkpoint(&self, tree_size: u64, root: &str, time: &str, foreign: bool) -> Checkpoint {
-        let key = if foreign { &self.foreign_key } else { &self.log_key };
+        // A checkpoint over the forged manifest is signed by the key that manifest declares:
+        // that is what makes the attack complete, and what an unauthenticated chain would
+        // resolve and accept.
+        let attacker_signs =
+            foreign || (self.forged_manifest && tree_size == self.forged_tree_size());
+        let key = if attacker_signs { &self.foreign_key } else { &self.log_key };
         let mut checkpoint = Checkpoint {
             log_id: self.log_id(),
             tree_size,
@@ -507,13 +573,26 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);
     let block = index.get("policy").cloned().unwrap_or(Value::Null);
-    let hash = block
-        .get("adaptor_profiles")
-        .and_then(|profiles| profiles.get(TEST_LOG_PROFILE))
+    let declared =
+        block.get("adaptor_profiles").and_then(|profiles| profiles.get(TEST_LOG_PROFILE));
+    let hash = declared
         .and_then(|profile| profile.get("hash"))
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    // Capabilities come from what the corpus declares, never from a hard-coded guess: they are
+    // a property of the pinned profile document, and pinning them here would make this fixture
+    // silently disagree with the corpus the moment the document gains a capability.
+    let capabilities = declared
+        .and_then(|profile| profile.get("capabilities"))
+        .map(|caps| ahl_core::receipt::AdaptorCapabilities {
+            checkpoint_raw: caps.get("checkpoint_raw").and_then(Value::as_bool).unwrap_or(false),
+            consistency_proofs: caps
+                .get("consistency_proofs")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .unwrap_or_default();
 
     let dataset_keys = std::fs::read_to_string(root.join("keys/dataset_customers.key"))
         .ok()
@@ -535,7 +614,7 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
                 .unwrap_or_default(),
             adaptor_profiles: BTreeMap::from([(
                 TEST_LOG_PROFILE.to_owned(),
-                AdaptorProfile::minimal(hash.clone()),
+                AdaptorProfile { hash: hash.clone(), capabilities },
             )]),
             dataset_keys,
             trusted_witness_key_ids: std::collections::BTreeSet::new(),
@@ -543,11 +622,7 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
         },
         profiles: BTreeMap::from([(
             TEST_LOG_PROFILE.to_owned(),
-            ConfiguredProfile {
-                hash,
-                path: root.join("adaptor/ahl-test-log-v1.md"),
-                capabilities: ahl_core::receipt::AdaptorCapabilities::default(),
-            },
+            ConfiguredProfile { hash, path: root.join("adaptor/ahl-test-log-v1.md"), capabilities },
         )]),
         endpoints: Endpoints { mirror: Some(MIRROR.to_owned()), witness: Some(WITNESS.to_owned()) },
         network: NetworkLimits::default(),
@@ -585,9 +660,15 @@ pub fn tree_material(root: &Path) -> Value {
 }
 
 /// Write [`tree_material`] into `dir` and return the path.
+///
+/// The file name is unique per call: callers routinely pass a shared temporary directory, and
+/// two tests running in parallel writing one name is how a reader ends up seeing a
+/// half-written file.
 #[must_use]
 pub fn tree_material_file(dir: &Path) -> PathBuf {
-    let path = dir.join("tree-material.json");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("tree-material.{}.{unique}.json", std::process::id()));
     let bytes = serde_json::to_vec(&tree_material(&MirrorFixture::corpus_root()))
         .unwrap_or_else(|_| b"{}".to_vec());
     let _ = std::fs::write(&path, bytes);

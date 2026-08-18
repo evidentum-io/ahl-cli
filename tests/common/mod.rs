@@ -124,10 +124,16 @@ pub fn policy(dir: &Path, spec: &PolicySpec<'_>) -> PathBuf {
         } else {
             corpus().join("adaptor/ahl-test-log-v1.md")
         };
+        // Capabilities come from what the corpus declares about the pinned document, never
+        // from a hard-coded guess here.
+        let capabilities = &block["adaptor_profiles"]["ahl-test-log-v1"]["capabilities"];
         let _ = write!(
             text,
-            "[policy.adaptor_profiles.ahl-test-log-v1]\nhash = \"{hash}\"\npath = \"{}\"\n\n",
-            document.display()
+            "[policy.adaptor_profiles.ahl-test-log-v1]\nhash = \"{hash}\"\npath = \"{}\"\n\
+             checkpoint_raw = {}\nconsistency_proofs = {}\n\n",
+            document.display(),
+            capabilities["checkpoint_raw"].as_bool().unwrap_or(false),
+            capabilities["consistency_proofs"].as_bool().unwrap_or(false),
         );
     }
     if spec.dataset_key {

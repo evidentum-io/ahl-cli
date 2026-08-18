@@ -178,14 +178,26 @@ root_hash}`, not merely endpoint and range: after an equivocation two distinct r
 `tree_size`, so a key built from endpoint + range + size would serve material from the wrong
 branch.
 
-The index has zero evidentiary weight. Every object is re-verified from its bytes on read
-exactly as if it had just arrived, and every proof is re-checked against the locally selected
-root — so a poisoned index can change *what work happens*, never *what is accepted*. A request
-for the *latest* checkpoint is never served from cache: a valid old checkpoint is a replay.
+The index has **zero evidentiary weight**, and the cache's own digest check is not what
+enforces that. Recomputing the digest of stored bytes is an integrity check on storage; an
+attacker with write access to the cache directory can always store arbitrary bytes under their
+own matching digest. What enforces the invariant is that the caller re-runs the same proof
+checks a fresh response would get, against the **locally selected** root, and — on failure —
+evicts and refetches exactly once (`net::fetch_revalidating`). A poisoned cache can therefore
+change *what work happens*, never *what is accepted*. A request for the *latest* checkpoint is
+never served from cache: a valid old checkpoint is a replay.
 
-`tests/cache_and_determinism.rs` holds the invariant the design requires: cold, warm and three
-kinds of adversarially poisoned cache produce identical verdicts and identical exit codes,
-evaluated against a fixed recorded transcript.
+Every cache write goes through the same handle-relative, no-replace primitives as `emit`'s
+output: an `O_EXCL` temporary under an unpredictable name inside an `O_NOFOLLOW` directory
+handle. A cache entry has no evidentiary weight, but that was never a licence to let a symlink
+planted in the cache directory redirect a write outside it.
+
+`tests/cache_and_determinism.rs` holds the invariant the design requires: cold, warm and **four**
+kinds of adversarially poisoned cache — corrupted objects, a dangling index, a cross-wired
+index, and objects that are semantically wrong while hashing to exactly the digest the index
+names — produce identical verdicts and identical exit codes, evaluated against a fixed recorded
+transcript. The last of those is the one a digest check cannot catch, and it fails if the
+eviction coupling is removed.
 
 ## Determinism
 
@@ -204,20 +216,26 @@ The frozen sources are `ahl-spec-draft.md` (core v0.3-draft), `ahl-receipt-forma
 implementation reports the gap rather than choosing a reading and proceeding quietly. Each of
 the following is also visible at runtime, as a `findings[]` entry or a named reason.
 
-1. **`log.log_id` versus `log.id`.** Core §7.2/§7.3 and adaptor §7.3 name the manifest
-   log-object member `log_id`; `ahl-core` reads `log.id`, and every manifest in the conformance
-   corpus carries `id`. Both spellings are accepted here, `log_id` first, and using the legacy
-   one raises the finding `manifest-log-id-legacy-spelling`. `emit` enforces the specification
-   spelling, because it is producing a new statement and has no frozen corpus to accommodate.
-2. **`log` object completeness.** Core §7.3 makes every member REQUIRED, including
-   `cadence_epoch`; the corpus manifests omit several. Rejecting them would reject the frozen
-   corpus, so the gap is reported as `manifest-log-object-incomplete` and the outcome is
-   unchanged. `emit` again enforces the specification in full.
+1. **Governance must be authenticated before it can authorize anything, and the order is not
+   optional.** Adaptor §7.4.1 lists four tests a `manifest` or `key` statement must pass before
+   it contributes to a resolved key set, of which test 2 — the producer signature, under the
+   key set in force at its own entry index — can only be applied by building the chain
+   **incrementally**. `Governance::resolve` does that; `Governance::structural_only` explicitly
+   does not, is named so, and is used only in topology mode where nothing is evidence. A
+   statement that fails is *ignored and reported* (`governance-statement-not-authorized`),
+   never fatal: §7.4.1 says such an entry "is not a fork of the corpus".
+2. **The order between core §2.1's two rules is unstated.** An envelope whose signatures do not
+   all verify is not an AHL statement; separately, "if duplicates occur, the one with the
+   smallest entry index governs and later ones are void". §2.1 does not say which applies
+   first. This crate excludes non-statements *first*, because the other order hands an attacker
+   a deletion primitive: anchoring a genuine payload with a broken signature at a smaller index
+   would void the real statement. Reported here; both rules are pinned by tests over fixtures
+   this crate controls.
 3. **Authentication and enumeration are mutually dependent.** Authenticating a checkpoint `C`
    needs the log key from the manifest version governing `tree_size(C)`; that manifest is an
    entry in the log; trusting entries needs `C`'s root. The design note orders them 1 then 2,
-   which cannot be executed as a sequence. They are established here as a **joint fixed point**
-   — see `src/anchored.rs` — and nothing is trusted on the way round.
+   which cannot be executed as a sequence. They are established here as a **joint fixed
+   point** — see `src/anchored.rs` — and nothing is trusted on the way round.
 4. **A series' earliest published member has no predecessor.** Adaptor §6.6 requires the
    predecessor consistency relationship for series-usability, while §5.2.2 item 3 explicitly
    permits an operator to publish no earlier member. The two cannot both hold for the earliest
@@ -226,48 +244,65 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    (`series-predecessor-unpublished`) where one does not.
 5. **"Where a successor exists" is not decidable.** No authenticated completeness proof over
    checkpoint-series history is defined, so a mirror can withhold a successor and make an older
-   `C` look newest. Series usability is therefore claimed only as `run-observed`, with the
-   finding `series-successor-not-observed`.
+   `C` look newest. Series usability is claimed only as `run-observed`, with the finding
+   `series-successor-not-observed`.
 6. **"The latest witnessed checkpoint" is not observable.** Core §4 requires consistency to it;
    nothing lets a client establish that a served checkpoint is the latest. `reconstruct`
    verifies consistency to the newest witnessed checkpoint *this run obtained* and labels it
    `continued_history_bound: run-observed`.
-7. **An anchored object whose signatures do not verify.** Core §2.1 makes it not an AHL
-   statement, and adaptor §7.4.1 requires ignoring such an object rather than treating the log
-   as compromised — on a permissionless log anyone who can reach the submission endpoint can
-   place one. Such entries are excluded from traversal and reported
-   (`entry-is-not-a-statement`), never allowed to shift an entry index, and never fatal to an
-   unrelated closure.
-8. **Payload uniqueness in the conformance corpus.** Core §2.1 forbids anchoring two envelopes
-   with the same statement id and makes the smallest entry index govern. Corpus entries 28, 29
-   and 31 are three envelopes over one payload; under that rule the invalid-signature entry 28
-   would govern and the co-signed entry 31 would be void, yet
-   `trigger-effective-co-signed-by-authority.ahl` is expected to verify over entry 31. Reported
-   as `statement-id-not-unique`, not adjudicated.
-9. **The witness refusal wire form.** Adaptor §11.2 names the carried proof member `proof`;
-   `ahl-witness` serves it as `consistency_proof`. Both are read, `proof` first, and the alias
-   raises `witness-refusal-proof-member-alias`. The corpus's own refusal vector still declares
-   the removed reason `inconsistent` (§11.2.4 removed it rather than renaming it), so that
-   vector is *unusable* under the current profile — which is the finding, not a defect in
-   either artifact.
-10. **Committed tree material has no retrieval interface.** Adaptor §9 makes the complete leaf
-    material of every committed tree corpus material a deployment MUST publish, but defines no
-    interface for serving it and `ahl-mirror` serves none. `closure` therefore takes
-    `--tree-material` as an out-of-band, untrusted root-to-leaves map, validated against the
-    anchored root and count before any edge is read from it. Missing material is *named*, never
-    assumed.
-11. **`3` versus `1` for a dataset key that is not held.** `ahl-core` reports both "carried
+7. **An anchored object whose signatures do not verify.** Core §2.1 makes it not a statement,
+   and adaptor §7.4.1 requires ignoring such an object rather than treating the log as
+   compromised — on a permissionless log anyone who can reach the submission endpoint can place
+   one. Such entries are excluded from **every** authenticated decision — introduction,
+   authority, trigger selection, closure traversal — and reported (`entry-is-not-a-statement`).
+   They never shift an entry index: the position is occupied by a placeholder, because the
+   entry index is AHL's only ordering primitive.
+8. **A digest check is not verification.** Design note §5 requires a cached object failing
+   re-verification to be evicted and refetched once. "Re-verification" cannot mean the cache's
+   own digest check: an attacker with write access to the cache directory can store arbitrary
+   bytes under their own matching digest, and every digest check will pass. Eviction is
+   therefore driven by the **caller's** proof checks, through `net::fetch_revalidating`, and
+   the invariant test poisons the cache in a digest-consistent way so it fails if that
+   coupling is ever removed.
+9. **Committed tree material has no retrieval interface.** Adaptor §9 makes the complete leaf
+   material of every committed tree corpus material a deployment MUST publish, but defines no
+   interface for serving it and `ahl-mirror` serves none. `closure` therefore takes
+   `--tree-material` as an out-of-band, untrusted root-to-leaves map, validated against the
+   anchored root and count before any edge is read from it. Missing material is *named*, never
+   assumed.
+10. **`3` versus `1` for a dataset key that is not held.** `ahl-core` reports both "carried
     bytes do not recompute" and "no dataset key held" through one error variant, distinguished
-    only by a sentinel string. The mapping to `3` is pinned by a test so a change upstream fails
-    loudly rather than silently turning a `3` into a `1`.
-12. **Two rows for redirects.** §6 makes a redirect missing evidence (`3`) and a cross-host or
-    downgrade redirect a refused configuration (`2`), while §7 says redirects are never followed
-    at all. Reconciled by the cross-host/downgrade qualifier: an ordinary same-origin redirect
-    is `3`, one that leaves the origin or downgrades the scheme is `2`.
-13. **Determinism versus `evaluation_time`.** §8 requires byte-identical stdout for the same
+    only by a sentinel string. The mapping to `3` is pinned by a test so a change upstream
+    fails loudly rather than silently turning a `3` into a `1`.
+11. **Two rows for redirects.** §6 makes a redirect missing evidence (`3`) and a cross-host or
+    downgrade redirect a refused configuration (`2`), while §7 says redirects are never
+    followed at all. Reconciled by the cross-host/downgrade qualifier: an ordinary same-origin
+    redirect is `3`, one that leaves the origin or downgrades the scheme is `2`.
+12. **Determinism versus `evaluation_time`.** §8 requires byte-identical stdout for the same
     inputs and policy, while §6 fixes `evaluation_time` in the output, which is a clock read
-    unless overridden. Determinism therefore holds for a fixed `--evaluation-time`; without one,
-    every field but that one is identical.
+    unless overridden. Determinism therefore holds for a fixed `--evaluation-time`; without
+    one, every field but that one is identical.
+13. **An unevaluated claim is not a disproved one.** A verifier that cannot evaluate
+    `anchoring.consistency_path` must not report the receipt as `invalid`. This crate verifies
+    the carried path independently, so it can tell "the path does not verify" (`1`) from "this
+    verifier did not evaluate it" (`3`), and reports upstream's own wording for the former so a
+    consumer written against the family canon still reads it.
+
+### Settled since the first round
+
+Three items this file previously recorded have been resolved upstream and the accommodations
+for them are gone:
+
+* the manifest log-object member is now `log_id` in the corpus as well as in the
+  specification, so the `log.id` alias has been **removed** — a silent alias is how two
+  incompatible dialects survive, and the value is load-bearing for binding a checkpoint to the
+  corpus's Data Tree, so its absence is a check that cannot be performed rather than a
+  reportable irregularity;
+* `cadence_epoch` is present, so the `manifest-log-object-incomplete` finding now fires only
+  for members no rule of this build consults;
+* corpus entries 28, 29 and 31 no longer share one payload, and the witness refusal vector now
+  declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
+  positives.
 
 ## Two additions to the §6 field list
 

@@ -343,6 +343,47 @@ fn row_a_mirror_serving_bytes_the_checkpoint_does_not_commit_is_unverifiable() {
 }
 
 #[test]
+fn a_forged_later_manifest_never_authenticates_a_checkpoint() {
+    // Adaptor §7.4.1, end to end. The transcript serves a recomputable tree carrying the
+    // genuine pinned genesis manifest **plus** a forged later manifest naming attacker log
+    // keys, and a checkpoint signed by one of them. Everything else about it is real: the
+    // entry is at a genuine index, its inclusion proof verifies, and it links correctly to the
+    // manifest version active before it. Only the producer signature stands in the way, and
+    // that is exactly the test a chain collected before it is authenticated would skip.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let transcript = fixtures().join("mirror-transcript-forged-manifest.json");
+
+    // The corpus is 33 entries once the forged manifest is appended; the checkpoint at that
+    // size is the one the attacker signed.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "33",
+        "--transcript",
+        &transcript.display().to_string(),
+    ]);
+    assert_eq!(
+        run.code,
+        3,
+        "a forged governance statement must never authenticate a checkpoint: {}",
+        run.output()
+    );
+    assert!(run.output().contains("does not verify"), "{}", run.output());
+    assert!(
+        !run.output().contains("\"status\": \"valid\""),
+        "the attack must not produce a verdict: {}",
+        run.output()
+    );
+}
+
+#[test]
 fn row_mirror_unreachable_is_unverifiable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path());
@@ -655,6 +696,7 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         &policy_path.display().to_string(),
         AT,
         FIXED,
+        "--json",
         "closure",
         "--unauthenticated",
         "--corpus",
@@ -662,10 +704,13 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         "--trigger-index",
         "0",
     ]);
-    assert_eq!(run.code, 2, "unopenable input is a local failure: {}", run.stderr);
+    assert_eq!(run.code, 2, "unopenable input is a local failure: {}", run.output());
+    assert!(run.output().contains("input-unreadable"), "{}", run.output());
 
-    // (b) The input opens but does not parse: still inside topology mode, and topology mode
-    //     never adjudicates, so `3`.
+    // (b) The input opens but does not parse. §6: "Only a failure to read **or parse** the file
+    //     at all is `2`, because that is a local-environment failure before any walking
+    //     begins." The reason code is asserted too — two different failures share exit `2`, and
+    //     only one of them is the one under test.
     let unparseable = dir.path().join("corpus.json");
     std::fs::write(&unparseable, b"{ not json at all").expect("write");
     let run = ahl_cli(&[
@@ -680,7 +725,8 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         "--trigger-index",
         "0",
     ]);
-    assert_eq!(run.code, 3, "a parse failure inside topology mode: {}", run.stderr);
+    assert_eq!(run.code, 2, "a parse failure happens before any walking: {}", run.output());
+    assert!(run.output().contains("input-unparseable"), "{}", run.output());
 
     // (c) The input parses and the walk finds violations: findings, not verdicts, and `3`.
     let run = ahl_cli(&[
@@ -699,5 +745,11 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         "6",
     ]);
     assert_eq!(run.code, 3, "violations are findings, and the outcome stays at 3");
-    assert!(!run.json()["findings"].as_array().expect("findings").is_empty());
+    let report = run.json();
+    assert_eq!(report["reason_code"], "topology-mode");
+    let findings = report["findings"].as_array().expect("findings");
+    assert!(!findings.is_empty(), "violations are reported in full");
+    // And specifically the ones the corpus carries deliberately.
+    let codes: Vec<&str> = findings.iter().filter_map(|finding| finding["code"].as_str()).collect();
+    assert!(codes.contains(&"signature-does-not-verify"), "{codes:?}");
 }

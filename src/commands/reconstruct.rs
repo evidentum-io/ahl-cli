@@ -351,8 +351,7 @@ fn assemble(
     let mut effective_triggers = Vec::new();
     let mut governing: Option<(u64, Value)> = None;
 
-    for (index, envelope) in anchored.statements.iter().enumerate() {
-        let index = index as u64;
+    for (index, envelope) in anchored.statements.iter() {
         let Some(payload) = envelope.get("payload") else { continue };
         match payload.get("type").and_then(Value::as_str) {
             Some("ingestion")
@@ -413,10 +412,7 @@ fn assemble(
     });
 
     let (status, replacement) = governing_ref.as_ref().map_or(("as-asserted", None), |reference| {
-        let payload = anchored
-            .statements
-            .get(usize::try_from(reference.entry_index).unwrap_or(usize::MAX))
-            .and_then(|envelope| envelope.get("payload"));
+        let payload = anchored.statements.payload(reference.entry_index);
         match reference.statement_type.as_str() {
             "retraction" => ("retracted", None),
             "correction" => (

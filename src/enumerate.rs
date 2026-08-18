@@ -199,22 +199,25 @@ impl<'a, F: Fetcher> Enumerator<'a, F> {
         // The cache key binds the locally selected checkpoint identity, so material from the
         // wrong branch of an equivocating log can never be served for this request.
         let key = cache::request_key(&selected.identity(), &request);
-        let response = self
-            .fetcher
-            .fetch(&request.cached_under(key))
-            .map_err(crate::net::FetchFailure::into_cli_error)?;
+        let request = request.cached_under(key);
 
-        if response.status != 200 {
-            return Err(CliError::EvidenceMissing(format!(
-                "the mirror answered {} for range [{from}, {to}); a status is an operational \
-                 failure, never refusal evidence",
-                response.status
-            )));
-        }
-        let value: Value = serde_json::from_slice(&response.body).map_err(|source| {
-            CliError::EvidenceMissing(format!("range response is not JSON: {source}"))
-        })?;
-        verify_range_response(&value, selected, self.leaf_form, from, to)
+        // Verification is handed to `fetch_revalidating`, so a cached answer that passes the
+        // cache's own integrity check and is nevertheless the wrong answer is evicted and
+        // refetched exactly once, then reported. A digest check on stored bytes cannot catch
+        // that; only these proof checks can, which is why they are what drives the eviction.
+        crate::net::fetch_revalidating(self.fetcher, &request, |response| {
+            if response.status != 200 {
+                return Err(CliError::EvidenceMissing(format!(
+                    "the mirror answered {} for range [{from}, {to}); a status is an \
+                     operational failure, never refusal evidence",
+                    response.status
+                )));
+            }
+            let value: Value = serde_json::from_slice(&response.body).map_err(|source| {
+                CliError::EvidenceMissing(format!("range response is not JSON: {source}"))
+            })?;
+            verify_range_response(&value, selected, self.leaf_form, from, to)
+        })
     }
 
     /// Enumerate `[0, tree_size)` and **recompute** the checkpoint's root from the result.

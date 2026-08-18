@@ -164,11 +164,60 @@ pub trait Fetcher: std::fmt::Debug {
     ///
     /// A [`FetchFailure`] naming which of the §7 rules the attempt ran into.
     fn fetch(&self, request: &Request) -> Result<Response, FetchFailure>;
+
+    /// Discard any cached answer for `request`, reporting whether one was discarded.
+    ///
+    /// A digest check on stored bytes is an integrity check on *storage*; it says nothing
+    /// about whether the bytes are the right answer. Design note §5 requires a cached object
+    /// failing re-verification to be **evicted and refetched once, then reported** — and
+    /// "re-verification" there means the same proof checks a fresh response gets, which only
+    /// the caller can run. This is how the caller says so. Layers with no cache answer
+    /// `false`, which is what stops [`fetch_revalidating`] from retrying a live endpoint.
+    fn invalidate(&self, _request: &Request) -> bool {
+        false
+    }
+}
+
+/// Fetch, verify, and — if verification fails on an answer that came from a cache — evict it
+/// and try **exactly once** more.
+///
+/// This is the whole of design note §5's "a cached object failing re-verification is evicted
+/// and refetched once, then reported". The retry is conditional on something actually having
+/// been evicted, so a live endpoint that answers badly is reported immediately rather than
+/// hammered, and a poisoned cache can change *what work happens* without ever changing *what
+/// is accepted*.
+///
+/// # Errors
+///
+/// The verifier's own error, from the second attempt where there was one.
+pub fn fetch_revalidating<F, T>(
+    fetcher: &F,
+    request: &Request,
+    verify: impl Fn(Response) -> crate::error::CliResult<T>,
+) -> crate::error::CliResult<T>
+where
+    F: Fetcher + ?Sized,
+{
+    let first = fetcher.fetch(request).map_err(FetchFailure::into_cli_error)?;
+    match verify(first) {
+        Ok(value) => Ok(value),
+        Err(reported) => {
+            if !fetcher.invalidate(request) {
+                return Err(reported);
+            }
+            let second = fetcher.fetch(request).map_err(FetchFailure::into_cli_error)?;
+            verify(second)
+        }
+    }
 }
 
 impl Fetcher for Box<dyn Fetcher> {
     fn fetch(&self, request: &Request) -> Result<Response, FetchFailure> {
         (**self).fetch(request)
+    }
+
+    fn invalidate(&self, request: &Request) -> bool {
+        (**self).invalidate(request)
     }
 }
 
@@ -221,6 +270,10 @@ impl<F: Fetcher> Budgeted<F> {
 }
 
 impl<F: Fetcher> Fetcher for Budgeted<F> {
+    fn invalidate(&self, request: &Request) -> bool {
+        self.inner.invalidate(request)
+    }
+
     fn fetch(&self, request: &Request) -> Result<Response, FetchFailure> {
         if self.started.elapsed() > Duration::from_secs(self.limits.wall_clock_seconds) {
             return Err(FetchFailure::Budget(format!(
