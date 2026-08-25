@@ -342,12 +342,13 @@ fn row_series_order_decides_the_selection_so_a_divergence_reaches_its_own_row() 
 // --- exit 3: required evidence could not be established ---------------------------------
 
 #[test]
-fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complete_answer() {
-    // Design note §3 item 3 requires the predecessor relationship always. Adaptor §5.2.2 item
-    // 3 exempts one member — the earliest the deployment published — and nothing else. Here
-    // tree_size 8 was published but is signed by a key no manifest version declares, so the
-    // predecessor relationship for tree_size 13 could not be verified: `3` with the missing
-    // element named, never `0` with a finding attached.
+fn row_a_withheld_predecessor_is_unverifiable_never_a_complete_answer() {
+    // The deployment published members below tree_size 13; this mirror serves only 13 and
+    // upward. Design note §3 item 3 requires the predecessor relationship always, and adaptor
+    // §5.2.2 item 3's exemption is a fact about the *deployment* that no client can establish:
+    // a short answer from `/v1/checkpoints` is a server label, and §2 rule 3 makes server
+    // labels not evidence. Reading it as the exemption would hand every mirror a switch that
+    // turns a missing relationship into a complete answer.
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path());
     let run = ahl_cli(&[
@@ -356,7 +357,7 @@ fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complet
         AT,
         FIXED,
         "--transcript",
-        &fixtures().join("mirror-transcript-foreign-key.json").display().to_string(),
+        &fixtures().join("mirror-transcript-withheld-predecessor.json").display().to_string(),
         "--json",
         "closure",
         "--trigger-index",
@@ -368,11 +369,13 @@ fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complet
     ]);
     assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
     assert_eq!(run.json()["reason_code"], "evidence-missing");
-    assert!(run.output().contains("predecessor relationship"), "{}", run.output());
+    assert!(run.output().contains("no authenticated series member precedes"), "{}", run.output());
+    assert!(run.output().contains("server label"), "{}", run.output());
     assert_ne!(run.json()["completeness"], "complete");
 
-    // The exemption still applies where it belongs: on the honest transcript tree_size 8 is
-    // the earliest published member, and the run completes with the gap named.
+    // The very same checkpoint, from a mirror serving the history the deployment published.
+    // The trigger is the one that governs there: at tree_size 13 entry 12 supersedes entry 6,
+    // which is a different rule and not what this row is about.
     let run = ahl_cli(&[
         "--policy",
         &policy_path.display().to_string(),
@@ -380,6 +383,59 @@ fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complet
         FIXED,
         "--transcript",
         &fixtures().join("mirror-transcript.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "12",
+        "--checkpoint",
+        "13",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_a_second_root_at_the_grounded_size_is_unverifiable_never_answered_from_one_branch() {
+    // The second member at tree_size 13 is signed by a key this corpus's manifest chain does
+    // not declare — the shape a second branch has when seen from inside the first. Its own
+    // chain would authorize its own log key, and the entries behind its root cannot be
+    // requested at all: adaptor §10.3 addresses an enumeration by `tree_size` alone. Answering
+    // from the branch that happens to resolve would report a complete closure over a size the
+    // client cannot show carries one tree.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-foreign-divergence.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "13",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("this result would be grounded on"), "{}", run.output());
+    // `3` is not an accusation: §7 reserves that for two members that both authenticate.
+    assert!(!run.stdout.contains("equivocat"), "{}", run.stdout);
+
+    // A second root at a size the result is not grounded on is carried as a finding instead:
+    // members away from a divergence remain usable.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-foreign-divergence.json").display().to_string(),
         "--json",
         "closure",
         "--trigger-index",
@@ -396,7 +452,155 @@ fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complet
         .iter()
         .map(|finding| finding["code"].as_str().unwrap_or_default().to_owned())
         .collect();
-    assert!(codes.iter().any(|code| code == "series-predecessor-unpublished"), "{codes:?}");
+    assert!(codes.iter().any(|code| code == "mirror-served-differing-roots"), "{codes:?}");
+}
+
+#[test]
+fn row_a_log_key_that_is_not_active_yet_is_unverifiable() {
+    // Design note §2 rule 4: the signing key must be in the governing version's `log.keys`
+    // **and active by `valid_from_index`**. The manifest version governing this checkpoint
+    // declares the key that signed it, but declares it as activating at an entry index the
+    // checkpoint does not commit — so the corpus had not adopted it yet.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-inactive-log-key.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "33",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("does not verify"), "{}", run.output());
+
+    // Checkpoints that version does not govern are unaffected.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-inactive-log-key.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_a_log_key_id_that_does_not_recompute_is_unverifiable() {
+    // Adaptor §7.2: "A verifier MUST recompute a key id from the public key it is given and
+    // MUST reject a mismatch"; §6.5 step 4 repeats it where a checkpoint signature resolves.
+    // The manifest version here files one party's public key under another party's key id and
+    // the checkpoint names that id, so a client that trusts the carried value resolves the
+    // name to the key the manifest chose and the signature verifies.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-mismatched-key-id.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "33",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    // Specifically because the borrowed id resolves to nothing once the version carrying it is
+    // rejected — not because some later rule happened to fire at this checkpoint.
+    assert!(run.output().contains("does not verify"), "{}", run.output());
+
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-mismatched-key-id.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_a_manifest_version_moving_the_cadence_epoch_is_unverifiable() {
+    // Core §7.3 and adaptor §7.3.2: `cadence_epoch` is declared once, by the genesis manifest,
+    // and repeated unchanged by every later version. The rotation here links correctly and is
+    // signed by a producer key in force at its own entry index — every test of §7.4.1 passes —
+    // but it moves the epoch, so it is malformed and must not govern. The checkpoint over it is
+    // signed by the log key only that version declares.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-moved-epoch.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "33",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    // Specifically because the rejected version's log key never governs — not because some
+    // later rule happened to fire at this checkpoint.
+    assert!(run.output().contains("does not verify"), "{}", run.output());
+
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-moved-epoch.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
 }
 
 #[test]

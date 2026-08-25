@@ -42,10 +42,30 @@ fn main() -> std::process::ExitCode {
     let tampered = MirrorFixture::conformance().with_tampered_entry(3);
     let forged_manifest = MirrorFixture::conformance().with_forged_manifest();
     let unknown_statement = MirrorFixture::conformance().with_unknown_statement_type();
+    // The four adversarial series the outcome table needs and an honest transcript cannot
+    // carry: a mirror withholding the history below the checkpoint a result is grounded on, a
+    // second root at that size signed by a key this corpus does not authorize, a manifest
+    // version declaring a log key that is not active yet, one whose log key object files a
+    // public key under another party's id, and one that moves `cadence_epoch`.
+    let withheld_predecessor = MirrorFixture::conformance().with_series_from(13);
+    let foreign_divergence = MirrorFixture::conformance().with_foreign_divergence_at(13);
+    let inactive_log_key = MirrorFixture::conformance().with_future_activated_log_key();
+    let mismatched_key_id = MirrorFixture::conformance().with_mismatched_log_key_id();
+    let moved_epoch = MirrorFixture::conformance().with_moved_cadence_epoch();
 
-    for fixture in
-        [&honest, &equivocating, &foreign_key, &tampered, &forged_manifest, &unknown_statement]
-    {
+    for fixture in [
+        &honest,
+        &equivocating,
+        &foreign_key,
+        &tampered,
+        &forged_manifest,
+        &unknown_statement,
+        &withheld_predecessor,
+        &foreign_divergence,
+        &inactive_log_key,
+        &mismatched_key_id,
+        &moved_epoch,
+    ] {
         // Drive every request path the integration tests replay: an authenticated closure at
         // several checkpoints, and a reconstruction, which additionally reads the witness.
         let mut sizes = ahl_cli::testing::CHECKPOINT_SIZES.to_vec();
@@ -85,6 +105,11 @@ fn main() -> std::process::ExitCode {
         ("mirror-transcript-tampered.json", tampered.transcript()),
         ("mirror-transcript-forged-manifest.json", forged_manifest.transcript()),
         ("mirror-transcript-unknown-statement.json", unknown_statement.transcript()),
+        ("mirror-transcript-withheld-predecessor.json", withheld_predecessor.transcript()),
+        ("mirror-transcript-foreign-divergence.json", foreign_divergence.transcript()),
+        ("mirror-transcript-inactive-log-key.json", inactive_log_key.transcript()),
+        ("mirror-transcript-mismatched-key-id.json", mismatched_key_id.transcript()),
+        ("mirror-transcript-moved-epoch.json", moved_epoch.transcript()),
         ("tree-material.json", tree_material(&MirrorFixture::corpus_root())),
     ];
     for (name, value) in written {

@@ -280,9 +280,14 @@ impl Governance {
 
             match kind {
                 "manifest" => {
-                    if let Some(finding) =
-                        manifest_refusal(*index, payload, previous_manifest_entry_id.as_deref())
-                    {
+                    let genesis_epoch =
+                        resolved.manifests.first().and_then(|(_, first)| cadence_epoch_of(first));
+                    if let Some(finding) = manifest_refusal(
+                        *index,
+                        payload,
+                        previous_manifest_entry_id.as_deref(),
+                        genesis_epoch,
+                    ) {
                         findings.push(finding);
                     } else {
                         previous_manifest_entry_id = Some(entry_id(envelope));
@@ -392,7 +397,13 @@ impl Governance {
         let Some((snapshot_index, manifest)) = self.snapshot_manifest(index) else {
             return keys;
         };
-        for (key_id, pubkey) in manifest_key_pairs(manifest) {
+        // A key object is in force from its own `valid_from_index` forward (§7.2): declaring
+        // a key is not the same as it being in force, and an envelope signed before its
+        // activation index is signed by a key the corpus had not yet adopted. The comparison
+        // is `<=` here, unlike the `<` of `log_keys_for`, because both sides are entry indexes
+        // — an envelope *at* the activation index may already use the key, whereas a
+        // checkpoint of size `n` commits only `[0, n)`.
+        for (key_id, pubkey) in in_force_key_pairs(manifest, index) {
             keys.insert(key_id, pubkey);
         }
         for event in self
@@ -426,7 +437,24 @@ impl Governance {
             })
     }
 
-    /// The log checkpoint-signing keys declared for a checkpoint of size `tree_size`.
+    /// The log checkpoint-signing keys **active** for a checkpoint of size `tree_size`.
+    ///
+    /// Two rules, and the second is the one an implementation forgets:
+    ///
+    /// * the key set comes from the manifest version **governing that checkpoint** — the
+    ///   manifest with the greatest entry index smaller than `tree_size` ([`Self::active_for`]),
+    ///   and each version's log key objects replace the prior set in full (adaptor §7.4);
+    /// * within that version, a key counts only once it is **active by `valid_from_index`**
+    ///   (design note §2 rule 4). Declaring a key is not the same as it being in force: a
+    ///   version may name a key that starts signing later, and a checkpoint signed by it before
+    ///   then is signed by a key the corpus had not yet adopted.
+    ///
+    /// `valid_from_index` is an *entry index*, and a checkpoint of size `tree_size` commits
+    /// exactly `[0, tree_size)`. A key is therefore active for it when its activation index
+    /// falls inside that range — `valid_from_index < tree_size` — which is the same boundary
+    /// [`Self::active_for`] uses to choose the governing version, applied to the same scale.
+    /// Returning a key that is declared but not yet active is a direct path to accepting a
+    /// checkpoint no active key signed.
     ///
     /// # Errors
     ///
@@ -436,11 +464,16 @@ impl Governance {
         let log = manifest.get("log").filter(|value| value.is_object()).ok_or_else(|| {
             CliError::RuleFired("the active manifest carries no `log` object".to_owned())
         })?;
-        Ok(manifest_key_pairs(log).into_iter().collect())
+        Ok(active_key_pairs(log, tree_size).into_iter().collect())
     }
 
-    /// The witness keys declared for a checkpoint of size `tree_size`, across every declared
+    /// The witness keys **active** for a checkpoint of size `tree_size`, across every declared
     /// witness. Each manifest version's witness key objects replace the prior set in full.
+    ///
+    /// Witness key objects share the §7.2 form with log key objects, `valid_from_index`
+    /// included, and adaptor §7.4 states the binding rule for both together — so the activation
+    /// filter of [`Self::log_keys_for`] applies here unchanged. A cosignature raises assurance,
+    /// and assurance resting on a key the corpus had not yet adopted is not assurance.
     ///
     /// # Errors
     ///
@@ -449,7 +482,7 @@ impl Governance {
         let (_, manifest) = self.active_for(tree_size)?;
         let mut keys = BTreeMap::new();
         for witness in manifest.get("witnesses").and_then(Value::as_array).unwrap_or(&Vec::new()) {
-            for (key_id, pubkey) in manifest_key_pairs(witness) {
+            for (key_id, pubkey) in active_key_pairs(witness, tree_size) {
                 keys.insert(key_id, pubkey);
             }
         }
@@ -613,7 +646,12 @@ impl Governance {
 /// Both are refusals of *this statement*, never of the corpus: adaptor §7.4.1 is explicit that
 /// such an entry "is not a fork of the corpus and does not need to be reconciled with the real
 /// chain", so the version active before it simply keeps governing.
-fn manifest_refusal(index: u64, payload: &Value, active: Option<&str>) -> Option<Finding> {
+fn manifest_refusal(
+    index: u64,
+    payload: &Value,
+    active: Option<&str>,
+    genesis_epoch: Option<&str>,
+) -> Option<Finding> {
     let declared = payload.get("predecessor").and_then(Value::as_str);
     if declared != active {
         return Some(Finding::new(
@@ -626,6 +664,18 @@ fn manifest_refusal(index: u64, payload: &Value, active: Option<&str>) -> Option
             ),
         ));
     }
+    if let Some(detail) = moved_epoch(payload, genesis_epoch) {
+        return Some(Finding::new(
+            "manifest-schema-invalid",
+            format!(
+                "the manifest at entry index {index} {detail}; core spec §7.3 and adaptor \
+                 §7.3.2 declare `cadence_epoch` once, in the genesis manifest, and require \
+                 every later version to repeat it unchanged, so it is rejected and does not \
+                 govern. A movable epoch would let an operator re-anchor the series after the \
+                 fact and erase an interval it failed to cover"
+            ),
+        ));
+    }
     validate_manifest_schema(payload).err().map(|detail| {
         Finding::new(
             "manifest-schema-invalid",
@@ -635,6 +685,38 @@ fn manifest_refusal(index: u64, payload: &Value, active: Option<&str>) -> Option
                  every member of the `log` object REQUIRED, and a version that omits one \
                  declares no cadence, no epoch and no key set to resolve against"
             ),
+        )
+    })
+}
+
+/// The `cadence_epoch` this manifest payload declares, if it declares a readable one.
+fn cadence_epoch_of(payload: &Value) -> Option<&str> {
+    payload.get("log")?.get("cadence_epoch")?.as_str()
+}
+
+/// Whether `payload` moves the corpus epoch away from the genesis value, and how.
+///
+/// Adaptor §7.3.2 fixes both halves. "Unchanged" means **by value, not by spelling**: a
+/// different offset form, or added trailing zeros in the fractional part, denotes the same
+/// instant and is a repetition. A rendering denoting a *different* instant is a change, and a
+/// verifier MUST reject that version rather than adopting the new value or reading the change
+/// as a re-anchoring. Instants are therefore compared parsed, never as strings.
+fn moved_epoch(payload: &Value, genesis_epoch: Option<&str>) -> Option<String> {
+    let genesis_epoch = genesis_epoch?;
+    let declared = cadence_epoch_of(payload)?;
+    let parse = |value: &str| {
+        crate::evaluation::parse_artifact_time("cadence_epoch", value)
+            .ok()
+            .map(time::OffsetDateTime::unix_timestamp_nanos)
+    };
+    let (Some(anchored), Some(here)) = (parse(genesis_epoch), parse(declared)) else {
+        // An unparseable epoch is caught by the schema check, which runs next.
+        return None;
+    };
+    (anchored != here).then(|| {
+        format!(
+            "declares `cadence_epoch` `{declared}`, which is a different instant from the \
+             `{genesis_epoch}` the genesis manifest anchored"
         )
     })
 }
@@ -749,6 +831,20 @@ fn family_string(what: &str, value: &str) -> Result<(), String> {
 /// quietly shrink the key set a signature is resolved against, which turns a malformed
 /// manifest into a *stricter-looking* one — the failure mode a verifier can least afford,
 /// because it never surfaces as an error.
+///
+/// # The key id is recomputed, never trusted
+///
+/// Adaptor §7.2 makes `key_id` `"sha256:<hex of SHA-256 over the raw 32-byte public key>"` and
+/// states the duty directly: "A verifier MUST recompute a key id from the public key it is
+/// given and MUST reject a mismatch." §6.5 step 4 repeats it for checkpoint signatures —
+/// resolve the signing key by `key_id` "recomputing the key id from the carried public key
+/// rather than trusting the carried value".
+///
+/// Without the recomputation a `key_id -> pubkey` map is only an assertion the manifest makes
+/// about itself. A manifest that files one party's public key under another party's key id
+/// makes every later lookup resolve the *name* the checkpoint carries to the *key* the
+/// manifest chose, and a checkpoint signed by the wrong key then verifies. Doing this once,
+/// where the map is built, is what makes every consumer of the map safe.
 fn key_objects(container: &Value, what: &str) -> Result<(), String> {
     let keys = container
         .get("keys")
@@ -760,8 +856,19 @@ fn key_objects(container: &Value, what: &str) -> Result<(), String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("`{what}[{at}].key_id` is REQUIRED"))?;
         family_string(&format!("{what}[{at}].key_id"), key_id)?;
-        if !object.get("pubkey").is_some_and(Value::is_string) {
-            return Err(format!("`{what}[{at}].pubkey` is REQUIRED and must be a string"));
+        let pubkey = object
+            .get("pubkey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("`{what}[{at}].pubkey` is REQUIRED and must be a string"))?;
+        let decoded = ahl_core::decode_pubkey(pubkey)
+            .map_err(|source| format!("`{what}[{at}].pubkey` is unreadable: {source}"))?;
+        let recomputed = ahl_core::sha256_hex(decoded.as_bytes());
+        if recomputed != key_id {
+            return Err(format!(
+                "`{what}[{at}].key_id` is `{key_id}` but its `pubkey` recomputes to \
+                 `{recomputed}`; adaptor §7.2 and §6.5 step 4 require the id to be recomputed \
+                 from the carried public key and a mismatch to be rejected"
+            ));
         }
         if object.get("valid_from_index").and_then(Value::as_u64).is_none() {
             return Err(format!("`{what}[{at}].valid_from_index` is not an entry index"));
@@ -793,6 +900,66 @@ fn string_member(value: &Value, member: &str) -> CliResult<String> {
     value.get(member).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| {
         CliError::RuleFired(format!("governance object carries no string `{member}`"))
     })
+}
+
+/// `key_id -> pubkey` for the key objects of `container` that are **active** for a checkpoint
+/// of size `tree_size`, by the `valid_from_index` rule of [`Governance::log_keys_for`].
+fn active_key_pairs(container: &Value, tree_size: u64) -> Vec<(String, String)> {
+    container
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|objects| {
+            objects
+                .iter()
+                .filter(|object| {
+                    object
+                        .get("valid_from_index")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|valid_from| valid_from < tree_size)
+                })
+                .filter_map(|object| {
+                    Some((
+                        object.get("key_id")?.as_str()?.to_owned(),
+                        object.get("pubkey")?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `key_id -> pubkey` for the key objects of `container` in force at **entry index** `index`.
+///
+/// The comparison is `<=`, unlike the `<` of [`active_key_pairs`], because both sides are
+/// entry indexes here: a key is valid *from* its `valid_from_index`, so an envelope anchored at
+/// exactly that index may already use it. `log_keys_for` converts between scales — a checkpoint
+/// of size `n` commits `[0, n)` — and is strict for that reason.
+fn in_force_key_pairs(container: &Value, index: u64) -> Vec<(String, String)> {
+    manifest_key_pairs(container)
+        .into_iter()
+        .zip(key_activation_indexes(container))
+        .filter_map(|(pair, valid_from)| (valid_from <= index).then_some(pair))
+        .collect()
+}
+
+/// The `valid_from_index` of each readable key object of `container`, positionally aligned with
+/// [`manifest_key_pairs`]. A key object missing one never survives schema validation, so the
+/// fallback only ever applies to a chain built by `structural_only`, where nothing is evidence.
+fn key_activation_indexes(container: &Value) -> Vec<u64> {
+    container
+        .get("keys")
+        .and_then(Value::as_array)
+        .map(|objects| {
+            objects
+                .iter()
+                .filter(|object| {
+                    object.get("key_id").and_then(Value::as_str).is_some()
+                        && object.get("pubkey").and_then(Value::as_str).is_some()
+                })
+                .map(|object| object.get("valid_from_index").and_then(Value::as_u64).unwrap_or(0))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn manifest_key_pairs(container: &Value) -> Vec<(String, String)> {
@@ -1357,6 +1524,205 @@ mod tests {
             assert_eq!(resolved.manifest_indexes(), vec![0], "rejected, not silently trimmed");
             assert!(findings.iter().any(|f| f.code == "manifest-schema-invalid"), "{object}");
         }
+    }
+
+    #[test]
+    fn the_key_id_derivation_is_the_family_one_and_this_crate_does_not_own_a_second_copy() {
+        // A cross-crate binding vector. This crate re-derives governance rules from the frozen
+        // text because `ahl-core` resolves governance only inside `verify_receipt`, from the
+        // chain a receipt carries, and exposes no entry point for a live enumeration. A copy
+        // can drift, and two rules already had; this test ties the half that is a *derivation*
+        // to the family's own.
+        //
+        // The left-hand side is what this module recomputes when it validates a key object.
+        // The right-hand side is `ahl-core`'s `TestKey::key_id`, which runs through
+        // `atl_core::compute_key_id` — the derivation adaptor §7.2 names. If the family
+        // changes it, this fails here rather than leaving the client resolving key ids nobody
+        // else computes.
+        for seed in [1_u8, 3, 8] {
+            let key = producer(seed);
+            let decoded = ahl_core::decode_pubkey(&key.pubkey()).expect("family encoding");
+            assert_eq!(
+                ahl_core::sha256_hex(decoded.as_bytes()),
+                key.key_id(),
+                "the key id this crate recomputes must be the family derivation"
+            );
+        }
+
+        // And the encodings the derivation rests on are the ones §7.2 fixes.
+        let key = producer(1);
+        assert!(key.pubkey().starts_with("base64:"), "{}", key.pubkey());
+        assert!(key.key_id().starts_with("sha256:"), "{}", key.key_id());
+        assert_eq!(key.key_id().len(), "sha256:".len() + 64);
+    }
+
+    #[test]
+    fn a_key_id_is_recomputed_from_its_public_key_and_a_mismatch_is_rejected() {
+        // Adaptor §7.2: "A verifier MUST recompute a key id from the public key it is given and
+        // MUST reject a mismatch." §6.5 step 4 repeats it where a checkpoint signature resolves.
+        // The pinned genesis here is correctly signed and otherwise conformant; what it does is
+        // file one party's public key under another party's key id. Without the recomputation
+        // the map resolves the name a checkpoint carries to the key the manifest chose, and a
+        // checkpoint signed by that key verifies under a `key_id` its holder never owned.
+        let honest = producer(1);
+        let borrowed_id = producer(8).key_id();
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": log_object(
+                    &family(0xaa),
+                    &[json!({
+                        "key_id": borrowed_id,
+                        "pubkey": producer(3).pubkey(),
+                        "valid_from_index": 0,
+                    })],
+                ),
+            }),
+            &honest,
+        );
+        let entries = vec![(0, genesis)];
+        let error = Governance::resolve(&entries, &policy_for(&entries, &honest))
+            .expect_err("the id does not recompute");
+        assert!(error.to_string().contains("recomputes to"), "{error}");
+        assert!(error.to_string().contains(&producer(3).key_id()), "{error}");
+
+        // Filed under its own id, the same object is fine.
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
+            }),
+            &honest,
+        );
+        let entries = vec![(0, genesis)];
+        let (resolved, _) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("conformant");
+        assert!(resolved.log_keys_for(1).expect("log keys").contains_key(&producer(3).key_id()));
+    }
+
+    #[test]
+    fn a_log_key_counts_only_once_it_is_active_by_its_valid_from_index() {
+        // Design note §2 rule 4: the signing key must be in the governing version's `log.keys`
+        // **and active by `valid_from_index`**. `valid_from_index` is an entry index and a
+        // checkpoint of size `n` commits exactly `[0, n)`, so a key activating at an index the
+        // checkpoint does not commit has not been adopted yet.
+        let honest = producer(1);
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0) ],
+                "log": log_object(
+                    &family(0xaa),
+                    &[
+                        json!({ "key_id": producer(3).key_id(), "pubkey": producer(3).pubkey(),
+                                "valid_from_index": 0 }),
+                        json!({ "key_id": producer(4).key_id(), "pubkey": producer(4).pubkey(),
+                                "valid_from_index": 14 }),
+                    ],
+                ),
+                "witnesses": [ {
+                    "witness_id": "w1",
+                    "keys": [ json!({ "key_id": producer(5).key_id(),
+                                      "pubkey": producer(5).pubkey(),
+                                      "valid_from_index": 14 }) ],
+                } ],
+            }),
+            &honest,
+        );
+        let entries = vec![(0, genesis)];
+        let (resolved, _) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("conformant");
+
+        let at_eight = resolved.log_keys_for(8).expect("log keys");
+        assert!(at_eight.contains_key(&producer(3).key_id()), "the active key is in force");
+        assert!(
+            !at_eight.contains_key(&producer(4).key_id()),
+            "a key activating at entry index 14 is not in force for a checkpoint of size 8"
+        );
+        let at_thirteen = resolved.log_keys_for(13).expect("log keys");
+        assert!(
+            !at_thirteen.contains_key(&producer(4).key_id()),
+            "nor for one of size 13, which commits [0, 13) and never reaches index 14"
+        );
+        // It comes into force for the first checkpoint that commits its activation index.
+        assert!(resolved.log_keys_for(15).expect("log keys").contains_key(&producer(4).key_id()));
+        assert!(!resolved.log_keys_for(14).expect("log keys").contains_key(&producer(4).key_id()));
+
+        // Witness key objects share the §7.2 form, and adaptor §7.4 binds both the same way.
+        assert!(!resolved
+            .witness_keys_for(13)
+            .expect("witness keys")
+            .contains_key(&producer(5).key_id()));
+        assert!(resolved
+            .witness_keys_for(15)
+            .expect("witness keys")
+            .contains_key(&producer(5).key_id()));
+    }
+
+    #[test]
+    fn a_producer_key_counts_only_from_its_own_activation_index() {
+        // The same rule on the entry-index scale, where the comparison is `<=`: a key is valid
+        // *from* its `valid_from_index`, so an envelope anchored at exactly that index may
+        // already use it.
+        let honest = producer(1);
+        let later = producer(2);
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.key_object(0), later.key_object(7) ],
+                "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
+            }),
+            &honest,
+        );
+        let entries = vec![(0, genesis)];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: BTreeSet::from([honest.key_id(), later.key_id()]),
+            ..TrustPolicy::default()
+        };
+        let (resolved, _) = Governance::resolve(&entries, &policy).expect("conformant");
+        assert!(!resolved.producer_keys_at(6).contains_key(&later.key_id()));
+        assert!(resolved.producer_keys_at(7).contains_key(&later.key_id()));
+    }
+
+    #[test]
+    fn a_later_manifest_version_that_moves_the_cadence_epoch_never_governs() {
+        // Core §7.3 and adaptor §7.3.2: the epoch is declared once, by the genesis manifest,
+        // and repeated unchanged by every later version. A movable epoch would let an operator
+        // re-anchor the series after the fact and erase an interval it failed to cover.
+        let honest = producer(1);
+        let first = genesis("log_id");
+        let rotation = |epoch: &str| {
+            let mut log = log_object(&family(0xcc), &[producer(3).key_object(0)]);
+            log["cadence_epoch"] = json!(epoch);
+            ahl_core::envelope(
+                json!({
+                    "type": "manifest",
+                    "predecessor": entry_id(&first),
+                    "keys": [ honest.key_object(0) ],
+                    "log": log,
+                }),
+                &honest,
+            )
+        };
+
+        let entries = vec![(0, first.clone()), (5, rotation("2026-01-01T01:00:00Z"))];
+        let (resolved, findings) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert_eq!(resolved.manifest_indexes(), vec![0], "a moved epoch must not govern");
+        assert!(findings.iter().any(|f| f.code == "manifest-schema-invalid"), "{findings:?}");
+        assert!(findings.iter().any(|f| f.detail.contains("different instant")), "{findings:?}");
+        // The version before it keeps governing, so nothing is silently re-pointed.
+        assert_eq!(resolved.log_id_for(9).expect("log id"), family(0xaa));
+
+        // "Unchanged" is by value, not by spelling: another rendering of the same instant is a
+        // repetition, and adopting it is not a re-anchoring (adaptor §7.3.2).
+        let entries = vec![(0, first.clone()), (5, rotation("2026-01-01T00:00:00.000+00:00"))];
+        let (resolved, _) =
+            Governance::resolve(&entries, &policy_for(&entries, &honest)).expect("anchor holds");
+        assert_eq!(resolved.manifest_indexes(), vec![0, 5], "the same instant, respelled");
     }
 
     #[test]

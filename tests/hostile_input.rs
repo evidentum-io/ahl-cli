@@ -554,31 +554,47 @@ fn an_http_status_is_an_operational_failure_never_refusal_evidence() {
 // §7 bullet 6: equivocation requires two authenticated checkpoints
 // ---------------------------------------------------------------------------
 
+/// Inject a second, badly signed member at `tree_size` into the recorded series.
+fn with_garbage_branch_at(dir: &std::path::Path, name: &str, tree_size: u64) -> std::path::PathBuf {
+    common::mutate_transcript(dir, "mirror-transcript.json", name, |value| {
+        let mut injected = false;
+        for exchange in value["exchanges"].as_array_mut().expect("array") {
+            if exchange["url"].as_str().unwrap_or_default().ends_with("/v1/checkpoints") {
+                let mut body = common::exchange_body(exchange);
+                let members = body.as_array_mut().expect("series");
+                let at = members
+                    .iter()
+                    .position(|member| member["tree_size"] == json!(tree_size))
+                    .expect("the size is in the recorded series");
+                let mut forged = members[at].clone();
+                forged["root_hash"] = json!(root(0xee));
+                forged["signature"] = json!("base64:AAAA");
+                members.push(forged);
+                common::set_exchange_body(exchange, &body);
+                injected = true;
+            }
+        }
+        assert!(injected, "no series response was recorded to mutate");
+    })
+}
+
 #[test]
 fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusation() {
-    // A hostile mirror injecting a badly signed second checkpoint at one size must not make
-    // the CLI accuse an honest log.
+    // A hostile mirror injecting a badly signed second checkpoint must not make the CLI accuse
+    // an honest log. §7 reserves an accusation for two members that **both** authenticate, so
+    // neither run below may say the log equivocated.
+    //
+    // What the injection does change is whether a result can be grounded. Away from the
+    // grounded size, members either side of a divergence remain usable and the object is
+    // carried as a finding, so one bogus object cannot derail an honest run. **At** the
+    // grounded size the client cannot establish that the second root fails to authenticate
+    // under a chain of its own — adaptor §10.3 addresses an enumeration by `tree_size` alone,
+    // so the entries behind that root cannot even be requested — and §5.2.2 forbids grounding
+    // anything at a divergence. That is `3`, which is still not an accusation.
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path()).display().to_string();
-    let transcript = common::mutate_transcript(
-        dir.path(),
-        "mirror-transcript.json",
-        "garbage-branch.json",
-        |value| {
-            for exchange in value["exchanges"].as_array_mut().expect("array") {
-                if exchange["url"].as_str().unwrap_or_default().ends_with("/v1/checkpoints") {
-                    let mut body = common::exchange_body(exchange);
-                    if let Some(members) = body.as_array_mut() {
-                        let mut forged = members[0].clone();
-                        forged["root_hash"] = json!(root(0xee));
-                        forged["signature"] = json!("base64:AAAA");
-                        members.push(forged);
-                    }
-                    common::set_exchange_body(exchange, &body);
-                }
-            }
-        },
-    );
+
+    let elsewhere = with_garbage_branch_at(dir.path(), "garbage-branch-elsewhere.json", 20);
     let run = ahl_cli(&[
         "--policy",
         &policy_path,
@@ -586,7 +602,7 @@ fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusatio
         FIXED,
         "--json",
         "--transcript",
-        &transcript.display().to_string(),
+        &elsewhere.display().to_string(),
         "closure",
         "--trigger-index",
         "6",
@@ -598,10 +614,35 @@ fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusatio
     assert_eq!(
         run.code,
         0,
-        "untrusted garbage from a mirror is never an equivocation accusation: {}",
+        "a bogus object away from the grounded size must not derail an honest run: {}",
         run.output()
     );
     assert!(!run.stdout.contains("equivocat"), "{}", run.stdout);
+
+    let grounded = with_garbage_branch_at(dir.path(), "garbage-branch-grounded.json", 8);
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path,
+        AT,
+        FIXED,
+        "--json",
+        "--transcript",
+        &grounded.display().to_string(),
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(
+        run.code,
+        3,
+        "nothing may be grounded at a size the client cannot show carries one tree: {}",
+        run.output()
+    );
+    assert!(!run.stdout.contains("equivocat"), "still not an accusation: {}", run.stdout);
 }
 
 // ---------------------------------------------------------------------------

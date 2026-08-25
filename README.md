@@ -248,27 +248,28 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    entry in the log; trusting entries needs `C`'s root. The design note orders them 1 then 2,
    which cannot be executed as a sequence. They are established here as a **joint fixed
    point** — see `src/anchored.rs` — and nothing is trusted on the way round.
-4. **A series' earliest published member has no predecessor — and that is the only exemption.**
+4. **The sources exempt one member from the predecessor rule, and no client can tell which.**
    Adaptor §6.6 requires the predecessor consistency relationship for series-usability, while
-   §5.2.2 item 3 explicitly permits an operator to publish no earlier member than the one it
-   started at. The two cannot both hold for that member, and refusing it outright would make
-   the whole series permanently unusable, so it is exempted and the gap is named
-   (`series-predecessor-unpublished`).
+   §5.2.2 item 3 permits a deployment to have published no earlier member than the one it
+   started at — so that member has nothing to relate to. Design note §3 item 3 nevertheless
+   states the client rule as predecessor **always**, against successor *where one exists*.
 
-   **The exemption is decided on what the mirror published, never on what authenticated.** The
-   design note §3 requires the predecessor relationship *always*, and the two cases must not
-   collapse into one:
+   The asymmetry survives here because the exemption is a fact about the **deployment**, and
+   the only thing a client sees is what one mirror answered. "The mirror served nothing
+   earlier" is not "the deployment published nothing earlier": a `/v1/checkpoints` response is
+   a server label, §2 rule 3 makes server labels not evidence, and §10 records that the frozen
+   sources define no authenticated completeness proof over *any* history a server publishes —
+   the same missing primitive that stops "where a successor exists" from being decidable.
 
-   - the selected checkpoint is the earliest member the deployment published — nothing exists
-     to relate it to, the §5.2.2 carve-out applies, the finding is raised and the run may still
-     be `valid` / `complete`. Completeness below that member is not provable and is not
-     assumed;
-   - earlier members *were* published but none of them authenticates, or their authentication
-     material was withheld — the relationship §6.6 requires simply was not established. That is
-     `3` with the missing element named, never `0` with a finding attached. Otherwise a mirror
-     that withholds a predecessor borrows an exemption written for a deployment that published
-     nothing earlier, and hands back a complete-looking answer resting on an unverified
-     relationship.
+   So **the exemption is never claimed.** Where no authenticated predecessor relationship is
+   established the outcome is `3` with the missing element named, exactly as for any other
+   evidence the client was not handed. Reading a short series response as the carve-out would
+   hand every mirror a switch that turns a missing relationship into a complete answer: withhold
+   the predecessor and a run that should report missing evidence reports `valid` instead. The
+   practical consequence is stated rather than hidden — a result grounded on the smallest member
+   a mirror serves is always `unverifiable`, and completeness below it was never provable
+   anyway.
+
 5. **"Where a successor exists" is not decidable.** No authenticated completeness proof over
    checkpoint-series history is defined, so a mirror can withhold a successor and make an older
    `C` look newest. Series usability is claimed only as `run-observed`, with the finding
@@ -322,22 +323,43 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
     series by `(tree_size, checkpoint_time)` and makes the **earliest** `checkpoint_time` govern
     where a selection lands on a size carrying several members — but that rule presupposes the
     other half of the same paragraph, that members sharing a `tree_size` carry the same
-    `root_hash`. Where they do not, the sources say what the *consequence* of a confirmed
-    divergence is (§5.2.2: the series ends at its floor, and choosing a branch is a conformance
-    violation) without saying which member a verifier may enumerate under in order to find out
-    whether the divergence is confirmed at all — and confirmation needs an authenticated key
-    set, which needs a recomputable enumeration, which needs a member.
+    `root_hash`. Where they do not, the sources fix the *consequence* of a confirmed divergence
+    (§5.2.2: the series ends at its floor, and choosing a branch is a conformance violation)
+    without saying how a verifier is to find out whether the divergence is confirmed at all.
+    Confirmation needs both members **authenticated**, authentication resolves the signing key
+    through the manifest version governing each member's own `tree_size` in its own corpus
+    (§6.5 step 4), and adaptor §10.3 addresses an enumeration by `tree_size` alone — there is no
+    request that asks for "the entries behind that other root". One of the two branches is
+    therefore unreachable by construction.
 
-    This crate resolves the deadlock without choosing a branch: candidates at the requested size
-    are attempted in series order, one per distinct root, until one establishes; the divergence
-    check then runs over **every** authenticated member and refuses outright at or beyond the
-    floor, whichever candidate got there. The attempt order therefore decides only which branch
-    supplies the governance chain, never the verdict. A branch that does not authenticate is
-    untrusted material from a mirror (design note §7) and is reported as such
-    (`mirror-served-differing-roots`), because refusing to continue past one bogus object would
-    let any mirror derail an honest run.
+    This crate does not answer from the branch that happens to resolve. Where the mirror
+    publishes more than one root at the size a result would be **grounded on**:
 
-15. **A member republished at one `tree_size` is a series neighbour.** A quiet log MUST keep
+    - if a second root authenticates under the chain this corpus authorizes, both members are
+      authenticated and the floor rule applies — outcome `1`, with the floor named;
+    - otherwise the client cannot establish that the second root fails to authenticate under a
+      chain of its own, and §5.2.2 forbids grounding anything at a divergence — outcome `3`,
+      naming what could not be established. That is not an accusation: design note §7 reserves
+      an accusation for two members that both authenticate.
+
+    At any **other** size the second root is carried as a finding
+    (`mirror-served-differing-roots`) and the outcome is unchanged, because the result is not
+    grounded there, members away from a divergence remain usable, and one bogus object from a
+    mirror must not derail an honest run.
+
+15. **`valid_from_index` compares on two scales, and the boundary differs.** Design note §2
+    rule 4 requires a checkpoint's signing key to be in the governing version's `log.keys`
+    *and* active by `valid_from_index`, which core §7.3 calls an entry index — but a checkpoint
+    is selected by `tree_size`, and the sources never spell out the conversion. This crate
+    reads it the way the manifest-selection rule already reads it: a checkpoint of size `n`
+    commits exactly `[0, n)`, so a log or witness key is active for it when
+    `valid_from_index < n`, the same strict boundary §7.3 uses to pick the governing version.
+    On the entry-index scale — a producer key against an envelope's own index — both sides are
+    entry indexes and the comparison is `valid_from_index <= index`, because a key is valid
+    *from* that index. Recorded because the two boundaries differ and the sources state
+    neither.
+
+16. **A member republished at one `tree_size` is a series neighbour.** A quiet log MUST keep
     publishing at unchanged size, and series order is `(tree_size, checkpoint_time)`, so the
     republication is a genuine later member and §6.6's "where a following member exists" is
     satisfied by it. No consistency proof is fetched for such a pair: RFC 9162 defines none
@@ -345,6 +367,21 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
     append-only extension of length zero, and unequal roots are the divergence adjudicated by
     the floor rule. Inventing a `from == to` request the profile does not define would be worse
     than checking what the two objects already say.
+
+17. **A private rule in `ahl-core` cannot be safely mirrored by copying.** The client resolves
+    governance from a **live enumeration**, which `ahl-core` does not expose an entry point for
+    — it resolves governance only inside `verify_receipt`, from the chain a receipt carries — so
+    the same normative rules are re-derived here against the same text. Two of them had already
+    drifted out of that copy and were caught in review: the `key_id` recomputation of adaptor
+    §7.2 / §6.5 step 4, and the cross-version `cadence_epoch` invariant of core §7.3 / adaptor
+    §7.3.2. Both are now enforced and pinned.
+
+    The structural fix is not in this crate's gift: it wants either a typed validation and
+    binding primitive both crates consume, or cross-crate vectors both are run against. Until
+    one exists, the client carries the vectors — `governance`'s manifest-schema and key-binding
+    tests, including one that ties this crate's key-id recomputation to the family derivation
+    `ahl-core` and `atl-core` use, so a change to that derivation fails here rather than
+    diverging quietly.
 
 ### Settled since the first round
 
@@ -356,13 +393,18 @@ for them are gone:
   incompatible dialects survive, and the value is load-bearing for binding a checkpoint to the
   corpus's Data Tree, so its absence is a check that cannot be performed rather than a
   reportable irregularity;
-* `cadence_epoch` is present in the corpus manifests, and the manifest schema of core §7.3 is
+* `cadence_epoch` is present in the corpus manifests; it is also **immutable across versions**
+  (core §7.3, adaptor §7.3.2), compared by value rather than by spelling, and a later version
+  that moves it is rejected. The manifest schema of core §7.3 is
   now **checked rather than reported** wherever governance is resolved for real: "Every member
   is REQUIRED", so a signed manifest that omits one — or that carries a key object which cannot
   be read — is rejected and does not govern, and a genesis that breaks the schema is fatal
   because no later version can repair the corpus trust anchor. The
   `manifest-log-object-incomplete` finding survives only in `--unauthenticated` topology mode,
-  where nothing is evidence and every violation is a finding rather than a verdict;
+  where nothing is evidence and every violation is a finding rather than a verdict. Every key
+  object's `key_id` is **recomputed from its `pubkey`** and a mismatch rejected (adaptor §7.2,
+  §6.5 step 4), so the `key_id -> pubkey` map is never an assertion the manifest makes about
+  itself;
 * corpus entries 28, 29 and 31 no longer share one payload, and the witness refusal vector now
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.

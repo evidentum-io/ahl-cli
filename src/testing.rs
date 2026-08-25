@@ -40,7 +40,13 @@ pub const WITNESS: &str = "https://witness.example";
 pub const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
 
 /// The tree sizes the fixture publishes checkpoints at.
-pub const CHECKPOINT_SIZES: [u64; 5] = [8, 13, 20, 28, 32];
+///
+/// The smallest is here so that a checkpoint the tests ground results on has an authenticated
+/// predecessor: adaptor §6.6 requires that relationship and the client never assumes it away,
+/// because "the mirror served nothing earlier" is a server label rather than evidence about
+/// what the deployment published. A run grounded on the smallest member itself is therefore
+/// `unverifiable`, which is what `with_series_from` exercises.
+pub const CHECKPOINT_SIZES: [u64; 6] = [4, 8, 13, 20, 28, 32];
 
 /// One recorded exchange, in the shape [`crate::transcript`] replays.
 #[derive(Debug, Clone)]
@@ -72,15 +78,22 @@ pub struct MirrorFixture {
     equivocate_first: bool,
     /// Republish the checkpoint at this size unchanged, with a later `checkpoint_time`.
     republish_at: Option<u64>,
-    /// Anchor a correctly signed statement of a type core §2.3 does not define.
-    unknown_statement_type: bool,
+    /// An entry was appended beyond the corpus, so the resulting total is published too.
+    appended: bool,
+    /// Serve only the members of the published series at or above this size, as a mirror that
+    /// withholds the earlier ones does.
+    series_from: Option<u64>,
+    /// Publish a second, diverging member at this size, signed by a key no manifest version
+    /// this corpus authorizes declares.
+    foreign_divergence_at: Option<u64>,
+    /// The `key_id` the checkpoint at the appended size names, where that must differ from the
+    /// key that actually signs it.
+    appended_key_id: Option<String>,
     /// Sign the checkpoint at this size with a key the manifest does not declare.
     foreign_key_at: Option<u64>,
     /// Serve different bytes for this entry index.
     tampered: Option<usize>,
-    /// A forged later manifest was appended, and the newest checkpoint is signed by the log
-    /// key it names.
-    forged_manifest: bool,
+
     recorded: Mutex<Vec<Recorded>>,
 }
 
@@ -153,10 +166,12 @@ impl MirrorFixture {
             equivocate_at: None,
             equivocate_first: false,
             republish_at: None,
-            unknown_statement_type: false,
+            appended: false,
+            series_from: None,
+            foreign_divergence_at: None,
+            appended_key_id: None,
             foreign_key_at: None,
             tampered: None,
-            forged_manifest: false,
             recorded: Mutex::new(Vec::new()),
         }
     }
@@ -215,8 +230,135 @@ impl MirrorFixture {
             &producer,
         );
         self.entries.push(ahl_core::jcs(&statement));
-        self.unknown_statement_type = true;
+        self.appended = true;
         self
+    }
+
+    /// Serve only the members of the series at or above `tree_size`.
+    ///
+    /// This is a mirror withholding history the deployment did publish. Nothing about the
+    /// response says so — which is the point: a short series answer is a server label, and
+    /// adaptor §10.3 defines no authenticated completeness proof over published history, so a
+    /// withheld predecessor is indistinguishable from an absent one.
+    #[must_use]
+    pub const fn with_series_from(mut self, tree_size: u64) -> Self {
+        self.series_from = Some(tree_size);
+        self
+    }
+
+    /// Publish a second, diverging member at `tree_size`, signed by a key **no manifest
+    /// version this corpus authorizes declares**.
+    ///
+    /// From the client's side this is exactly the shape of a second branch whose own manifest
+    /// chain authorizes its own log key: the signature does not resolve under this corpus's
+    /// chain, and the entries behind the other root cannot be requested at all, because
+    /// adaptor §10.3 addresses an enumeration by `tree_size` alone.
+    #[must_use]
+    pub const fn with_foreign_divergence_at(mut self, tree_size: u64) -> Self {
+        self.foreign_divergence_at = Some(tree_size);
+        self
+    }
+
+    /// Anchor an authorized manifest version whose `log` object is built by `alter`, and
+    /// publish a checkpoint over it.
+    ///
+    /// The version links correctly to the one active before it and is signed by a producer key
+    /// in force at its entry index, so every test of adaptor §7.4.1 passes: what the fixture
+    /// varies is the `log` object itself.
+    fn with_appended_manifest(mut self, alter: impl FnOnce(&mut Value)) -> Self {
+        let producer = seed(&Self::corpus_root(), "producer-1");
+        let predecessor = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|bytes| {
+                let value: Value = serde_json::from_slice(bytes).ok()?;
+                (value.get("payload")?.get("type")?.as_str()? == "manifest")
+                    .then(|| ahl_core::sha256_hex(bytes))
+            })
+            .unwrap_or_default();
+        let mut log = json!({
+            "log_id": self.log_id(),
+            "operator": "log-operator-1",
+            "adaptor": {
+                "id": TEST_LOG_PROFILE,
+                "hash": format!("sha256:{}", hex::encode([0u8; 32])),
+            },
+            "checkpoint_cadence": "PT1H",
+            "cadence_epoch": self.genesis_cadence_epoch(),
+            "witness_grace_period": "PT15M",
+            "keys": [ self.log_key.key_object(0) ],
+        });
+        alter(&mut log);
+        let manifest = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "producer": "producer-1",
+                "predecessor": predecessor,
+                "keys": [ producer.key_object(0) ],
+                "log": log,
+            }),
+            &producer,
+        );
+        self.entries.push(ahl_core::jcs(&manifest));
+        self.appended = true;
+        self
+    }
+
+    /// Anchor an authorized manifest version declaring a log key that is **not yet active** at
+    /// the checkpoint it governs, and publish a checkpoint signed by that key.
+    ///
+    /// Declaring a key is not the same as it being in force. `valid_from_index` is an entry
+    /// index; a checkpoint of size `n` commits `[0, n)`, so a key activating at an index the
+    /// checkpoint does not commit has not been adopted yet (design note §2 rule 4).
+    #[must_use]
+    pub fn with_future_activated_log_key(self) -> Self {
+        let key = self.log_key.key_object(u64::MAX);
+        self.with_appended_manifest(move |log| log["keys"] = json!([key]))
+    }
+
+    /// Anchor an authorized manifest version whose log key object files one party's public key
+    /// under another party's `key_id`, and publish a checkpoint naming that id.
+    ///
+    /// Adaptor §7.2: "A verifier MUST recompute a key id from the public key it is given and
+    /// MUST reject a mismatch"; §6.5 step 4 repeats it at the point of use.
+    #[must_use]
+    pub fn with_mismatched_log_key_id(mut self) -> Self {
+        let borrowed_id = self.foreign_key.key_id();
+        let object = json!({
+            "key_id": borrowed_id,
+            "pubkey": self.log_key.pubkey(),
+            "valid_from_index": 0,
+        });
+        self.appended_key_id = Some(borrowed_id);
+        self.with_appended_manifest(move |log| log["keys"] = json!([object]))
+    }
+
+    /// Anchor an authorized manifest version that moves `cadence_epoch`, and publish a
+    /// checkpoint signed by the log key only that version declares.
+    ///
+    /// Core §7.3 and adaptor §7.3.2: the epoch is declared once, by the genesis manifest, and
+    /// repeated unchanged by every later version. A movable epoch would let an operator
+    /// re-anchor the series after the fact and erase an interval it failed to cover.
+    #[must_use]
+    pub fn with_moved_cadence_epoch(mut self) -> Self {
+        let key = self.foreign_key.key_object(0);
+        self.foreign_key_at = Some(self.appended_tree_size() + 1);
+        self.with_appended_manifest(move |log| {
+            log["cadence_epoch"] = json!("2026-08-16T12:30:00Z");
+            log["keys"] = json!([key]);
+        })
+    }
+
+    /// The `cadence_epoch` the corpus genesis manifest anchored, read rather than restated.
+    fn genesis_cadence_epoch(&self) -> String {
+        self.entries
+            .first()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .and_then(|value| {
+                value.get("payload")?.get("log")?.get("cadence_epoch")?.as_str().map(str::to_owned)
+            })
+            .unwrap_or_default()
     }
 
     /// The tree size whose checkpoint commits the appended statement, if one was appended.
@@ -281,7 +423,11 @@ impl MirrorFixture {
             &attacker,
         );
         self.entries.push(ahl_core::jcs(&forged));
-        self.forged_manifest = true;
+        self.appended = true;
+        // The checkpoint over the forged manifest is signed by the key that manifest declares:
+        // that is what makes the attack complete, and what an unauthenticated chain would
+        // resolve and accept.
+        self.foreign_key_at = Some(self.forged_tree_size());
         self
     }
 
@@ -295,8 +441,11 @@ impl MirrorFixture {
         let total = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         let mut sizes: Vec<u64> =
             CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
-        if (self.forged_manifest || self.unknown_statement_type) && !sizes.contains(&total) {
+        if self.appended && !sizes.contains(&total) {
             sizes.push(total);
+        }
+        if let Some(from) = self.series_from {
+            sizes.retain(|size| *size >= from);
         }
         sizes
     }
@@ -348,12 +497,7 @@ impl MirrorFixture {
     }
 
     fn checkpoint(&self, tree_size: u64, root: &str, time: &str, foreign: bool) -> Checkpoint {
-        // A checkpoint over the forged manifest is signed by the key that manifest declares:
-        // that is what makes the attack complete, and what an unauthenticated chain would
-        // resolve and accept.
-        let attacker_signs =
-            foreign || (self.forged_manifest && tree_size == self.forged_tree_size());
-        let key = if attacker_signs { &self.foreign_key } else { &self.log_key };
+        let key = if foreign { &self.foreign_key } else { &self.log_key };
         let mut checkpoint = Checkpoint {
             log_id: self.log_id(),
             tree_size,
@@ -362,6 +506,13 @@ impl MirrorFixture {
             key_id: key.key_id(),
             signature: String::new(),
         };
+        if let Some(borrowed) =
+            self.appended_key_id.as_ref().filter(|_| tree_size == self.appended_tree_size())
+        {
+            // Named before signing: the id is inside the JCS bytes the log signs, so a
+            // checkpoint that names one key and is signed by another has to be built this way.
+            checkpoint.key_id.clone_from(borrowed);
+        }
         if let Ok(bytes) = checkpoint.signing_bytes(SigningForm::CanonicalJson) {
             checkpoint.signature = key.sign(&bytes);
         }
@@ -392,6 +543,12 @@ impl MirrorFixture {
             } else {
                 series.push(member);
             }
+        }
+        if let Some(size) = self.foreign_divergence_at {
+            // A second root at one size, signed by a key this corpus's manifest chain does not
+            // declare — the shape a second branch has when seen from the first one.
+            let divergent = format!("sha256:{}", hex::encode([0xdd_u8; 32]));
+            series.push(self.checkpoint(size, &divergent, "2026-08-16T13:00:00Z", true));
         }
         if let Some(size) = self.republish_at {
             // A quiet log restating one tree: same size, same root, later time — and

@@ -411,64 +411,39 @@ pub fn establish<F: Fetcher>(
     tree_size: u64,
 ) -> CliResult<Anchored> {
     let series = mirror.series()?;
-    let candidates = candidates_at(&series, tree_size)?;
-
-    // One root at the requested size is the ordinary case and there is exactly one candidate.
-    // Several distinct roots at one size is a series core §7.3 forbids, and which of them
-    // authenticates cannot be known before one of them has supplied a recomputable
-    // enumeration — the manifest that resolves the log key set is itself an entry in the tree.
-    // Candidates are therefore attempted in series order until one establishes.
-    //
-    // This is **not** choosing a branch, which adaptor §5.2.2 makes a conformance violation.
-    // The attempt order decides only which branch supplies the governance chain; the verdict
-    // does not depend on it, because the divergence check below runs over *every*
-    // authenticated member and refuses outright at or beyond the floor whichever candidate got
-    // there. A branch that does not authenticate is untrusted material from a mirror (§7), and
-    // continuing past it is what stops a hostile mirror from derailing an honest run by
-    // publishing one bogus object.
-    let mut reported: Option<CliError> = None;
-    for selected in candidates {
-        match establish_under(mirror, policy, &series, selected) {
-            Ok(anchored) => return Ok(anchored),
-            // A rule that fired against the log's own contents — divergence between
-            // authenticated members, an unknown statement type — is a verdict, not this
-            // branch failing to establish, and is never retried under another branch.
-            Err(error) if error.outcome() == crate::outcome::Outcome::Invalid => return Err(error),
-            Err(error) => reported = Some(error),
-        }
-    }
-    Err(reported.unwrap_or_else(|| {
-        CliError::EvidenceMissing(format!(
-            "no published checkpoint at tree_size {tree_size} could be established"
-        ))
-    }))
+    let published_roots = roots_at(&series, tree_size);
+    let selected = governing_member(&series, tree_size)?;
+    establish_under(mirror, policy, &series, selected, published_roots)
 }
 
-/// The published members at `tree_size`, in series order, one per distinct `root_hash`.
-///
-/// Ordering is core §7.3's `(tree_size, checkpoint_time)`, so the member with the earliest
-/// `checkpoint_time` comes first: a quiet log republishes at unchanged size, and the earliest
-/// such member is the one the specification makes govern. Taking whichever member the mirror
-/// happened to serialize first would let the server pick.
-///
-/// Members restating one root are collapsed, because they describe the same tree and
-/// re-enumerating under each would be repeated work with a fixed answer.
-fn candidates_at(series: &[Checkpoint], tree_size: u64) -> CliResult<Vec<Checkpoint>> {
-    let mut at_size: Vec<&Checkpoint> =
-        series.iter().filter(|member| member.tree_size == tree_size).collect();
-    at_size.sort_by_key(|member| series_order_key(member));
+/// How many distinct `root_hash` values the mirror published at `tree_size`.
+fn roots_at(series: &[Checkpoint], tree_size: u64) -> usize {
+    series
+        .iter()
+        .filter(|member| member.tree_size == tree_size)
+        .map(|member| member.root_hash.as_str())
+        .collect::<BTreeSet<&str>>()
+        .len()
+}
 
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let candidates: Vec<Checkpoint> =
-        at_size.into_iter().filter(|member| seen.insert(&member.root_hash)).cloned().collect();
-
-    if candidates.is_empty() {
-        return Err(CliError::EvidenceMissing(format!(
-            "the mirror published no checkpoint at tree_size {tree_size}; checkpoint selection \
-             is explicit and is never inferred"
-        )));
-    }
-    Ok(candidates)
+/// The published member at `tree_size` that governs, by the series order of core §7.3.
+///
+/// Ordering is `(tree_size, checkpoint_time)`, so the member with the earliest
+/// `checkpoint_time` governs: a quiet log republishes at unchanged size, and §7.3 fixes which
+/// of those members a selection lands on. Taking whichever member the mirror happened to
+/// serialize first would let the server pick.
+fn governing_member(series: &[Checkpoint], tree_size: u64) -> CliResult<Checkpoint> {
+    series
+        .iter()
+        .filter(|member| member.tree_size == tree_size)
+        .min_by_key(|member| series_order_key(member))
+        .cloned()
+        .ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "the mirror published no checkpoint at tree_size {tree_size}; checkpoint \
+                 selection is explicit and is never inferred"
+            ))
+        })
 }
 
 /// Establish the view under one candidate checkpoint.
@@ -477,6 +452,7 @@ fn establish_under<F: Fetcher>(
     policy: &LoadedPolicy,
     series: &[Checkpoint],
     selected: Checkpoint,
+    published_roots: usize,
 ) -> CliResult<Anchored> {
     let tree_size = selected.tree_size;
     let mut findings = Vec::new();
@@ -544,8 +520,37 @@ fn establish_under<F: Fetcher>(
         ));
     }
 
+    // --- the grounded size carries exactly one root, or nothing may be grounded here ---
+    //
+    // Reaching this line means no *other* root at `tree_size` authenticates under the chain
+    // this branch established — the floor rule above would have condemned the run otherwise.
+    // That is not the same as establishing that the other root fails to authenticate: a
+    // checkpoint is authenticated under the manifest version governing **its own**
+    // `tree_size` in **its own** corpus (adaptor §6.5 step 4, §6.6), and the enumeration
+    // interface of §10.3 addresses a range by `tree_size` alone. There is no request that
+    // asks for "the entries behind that other root", so its chain cannot be resolved and its
+    // key set cannot be recovered.
+    //
+    // Two published roots at the size a result is grounded on therefore leave the client
+    // unable to tell a second authentic branch from one bogus object — and adaptor §5.2.2
+    // forbids grounding anything at or beyond a divergence. Refusing here is `3`: material
+    // that cannot be established, never an accusation about the log, which §7 reserves for two
+    // members that both authenticate. A second root at any *other* size is carried as a
+    // finding instead, because the result is not grounded there and members away from a
+    // divergence remain usable.
+    if published_roots > 1 {
+        return Err(CliError::EvidenceMissing(format!(
+            "the mirror published {published_roots} different roots at tree_size {tree_size}, \
+             the size this result would be grounded on, and only one of them resolves under \
+             the manifest chain this corpus authorizes. Whether another is authentic under a \
+             chain of its own cannot be established: adaptor §10.3 addresses an enumeration by \
+             `tree_size` alone, so there is no way to ask for the entries behind a second root \
+             at one size. Nothing may be grounded there"
+        )));
+    }
+
     // --- step 3: neighbouring consistency --------------------------------------------
-    findings.extend(check_neighbours(mirror, series, &authenticated, &selected)?);
+    findings.extend(check_neighbours(mirror, &authenticated, &selected)?);
 
     // --- step 5: the verified statement view, and nothing else carried forward ---------
     let (statements, statement_findings) = Statements::build(&entries, &governance)?;
@@ -618,23 +623,28 @@ fn unauthenticated_branch_findings(
 /// `selected`'s `tree_size` is a genuine series neighbour and skipping it would leave a
 /// relationship §6.6 requires unverified.
 ///
-/// # The predecessor is required, and only one case is exempt
+/// # The predecessor is required, and the one exemption is not observable
 ///
 /// Design note §3 item 3 requires the predecessor relationship **always**. Adaptor §5.2.2 item
-/// 3 exempts exactly one member: the earliest one the deployment **published**, because an
-/// operator may first publish at a size larger than the genesis checkpoint and no earlier
-/// member then exists to relate to. Refusing that member would make the whole series
-/// permanently unusable.
+/// 3 does describe a member that has none — the earliest one a deployment published, since an
+/// operator may first publish at a size larger than the genesis checkpoint — but that is a
+/// fact about the *deployment*, and no client can establish it.
 ///
-/// The exemption is decided on what the mirror *published*, never on what authenticated. A
-/// mirror that serves earlier members which do not authenticate — or that withholds the
-/// predecessor's authentication material — has not turned `selected` into the earliest
-/// published member; it has failed to hand over evidence §6.6 requires, which is `3`. The two
-/// cases carry different codes and different outcomes precisely so a withholding mirror cannot
-/// borrow the exemption written for an honest one.
+/// "The mirror served nothing earlier" is not "the deployment published nothing earlier". A
+/// mirror answering `/v1/checkpoints` is a server label, and design note §2 rule 3 makes server
+/// labels not evidence; §10 records that the frozen sources define no authenticated
+/// completeness proof over *any* history a server publishes, which is the same missing
+/// primitive that stops "where a successor exists" from being decidable. Reading a short series
+/// response as the exemption would hand every mirror a switch that turns a missing relationship
+/// into a complete answer: withhold the predecessor, and the run that should have reported
+/// missing evidence reports `valid` instead.
+///
+/// So the exemption is never claimed. Where no authenticated predecessor is established the
+/// outcome is `3` with the missing element named — the same answer the CLI gives for any other
+/// evidence it was not handed. The asymmetry with the successor clause is the design note's
+/// own: predecessor *always*, successor *where one exists*.
 fn check_neighbours<F: Fetcher>(
     mirror: &Mirror<'_, F>,
-    published: &[Checkpoint],
     authenticated: &[Checkpoint],
     selected: &Checkpoint,
 ) -> CliResult<Vec<Finding>> {
@@ -650,32 +660,20 @@ fn check_neighbours<F: Fetcher>(
         .filter(|member| series_order_key(member) > position)
         .min_by_key(|member| series_order_key(member));
 
-    match predecessor {
-        Some(previous) => verify_neighbour(mirror, previous, selected)?,
-        // The one exemption: nothing at all precedes this member in the published series.
-        None if !published.iter().any(|member| series_order_key(member) < position) => {
-            findings.push(Finding::new(
-                "series-predecessor-unpublished",
-                format!(
-                    "tree_size {} is the earliest member this deployment published, so the \
-                     predecessor relationship adaptor §6.6 requires has nothing to relate to; \
-                     §5.2.2 item 3 permits an operator to publish no earlier member, and the \
-                     two rules are not reconciled in the frozen sources. Completeness below \
-                     the earliest published member is not provable and is not assumed",
-                    selected.tree_size
-                ),
-            ));
-        }
-        None => {
-            return Err(CliError::EvidenceMissing(format!(
-                "the published series carries members before tree_size {}, but none of them \
-                 authenticates, so the predecessor relationship adaptor §6.6 requires could \
-                 not be verified. Design note §3 requires that relationship always; only the \
-                 earliest **published** member is exempt, and this is not it",
-                selected.tree_size
-            )));
-        }
-    }
+    let Some(previous) = predecessor else {
+        return Err(CliError::EvidenceMissing(format!(
+            "no authenticated series member precedes tree_size {} in this run, so the \
+             predecessor relationship adaptor §6.6 requires could not be verified. Design note \
+             §3 requires that relationship always. Adaptor §5.2.2 item 3 does allow a \
+             deployment to have published no earlier member, but that is a fact about the \
+             deployment and no client can establish it: a short answer from \
+             `/v1/checkpoints` is a server label, and server labels are not evidence, so a \
+             withheld predecessor is indistinguishable from an absent one. The relationship is \
+             reported as not established rather than assumed away",
+            selected.tree_size
+        )));
+    };
+    verify_neighbour(mirror, previous, selected)?;
 
     match successor {
         Some(next) => verify_neighbour(mirror, selected, next)?,
@@ -974,50 +972,123 @@ mod tests {
     }
 
     #[test]
-    fn the_predecessor_relationship_is_verified_and_a_missing_one_is_named() {
-        let fixture = MirrorFixture::conformance();
-        // tree_size 8 is the earliest published member of the fixture's series.
-        let anchored = fixture.establish(8).expect("established");
-        assert!(anchored
-            .findings
-            .iter()
-            .any(|finding| finding.code == "series-predecessor-unpublished"));
-
+    fn the_predecessor_relationship_is_verified_and_an_unverified_one_is_never_a_success() {
         // tree_size 13 has both a predecessor and a successor, so neither gap is reported.
+        let fixture = MirrorFixture::conformance();
         let anchored = fixture.establish(13).expect("established");
         assert!(!anchored
             .findings
             .iter()
-            .any(|finding| finding.code == "series-predecessor-unpublished"));
-        assert!(!anchored
-            .findings
-            .iter()
             .any(|finding| finding.code == "series-successor-not-observed"));
+
+        // A member whose only published predecessor does not authenticate is missing evidence,
+        // not a complete answer with a note attached.
+        let fixture = MirrorFixture::conformance().with_series_from(8).with_foreign_log_key(8);
+        assert!(fixture.establish(13).is_err(), "the predecessor did not authenticate");
+        let error = fixture.establish(13).expect_err("the predecessor did not authenticate");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert!(error.to_string().contains("predecessor relationship"), "{error}");
     }
 
     #[test]
-    fn a_predecessor_that_was_published_but_not_handed_over_is_never_a_complete_answer() {
-        // Design note §3 item 3 requires the predecessor relationship **always**; adaptor
-        // §5.2.2 item 3 exempts exactly one member, the earliest the deployment published.
-        // The two cases must not collapse into one, because a mirror that publishes earlier
-        // members it cannot authenticate — or withholds their authentication material — would
-        // otherwise borrow an exemption written for a deployment that published nothing
-        // earlier, and hand back a complete-looking answer resting on an unverified
-        // relationship.
-        let fixture = MirrorFixture::conformance().with_foreign_log_key(8);
-        let error = fixture.establish(13).expect_err("the predecessor was not established");
+    fn a_withheld_predecessor_never_buys_the_earliest_published_member_exemption() {
+        // The deployment published members below tree_size 13; this mirror serves only 13 and
+        // upward. Nothing in the response says so, and nothing can: adaptor §10.3 defines no
+        // authenticated completeness proof over published history, so "the mirror served
+        // nothing earlier" is a server label — design note §2 rule 3 — and not a fact about
+        // what the deployment published. Reading it as adaptor §5.2.2 item 3's exemption
+        // would hand every mirror a switch that turns a missing relationship into a complete
+        // answer, so the exemption is never claimed.
+        let withheld = MirrorFixture::conformance().with_series_from(13);
+        let error = withheld.establish(13).expect_err("the predecessor was withheld");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
-        assert!(error.to_string().contains("none of them authenticates"), "{error}");
-        assert!(error.to_string().contains("earliest **published** member is exempt"), "{error}");
+        assert!(error.to_string().contains("no authenticated series member precedes"), "{error}");
+        assert!(error.to_string().contains("server label"), "{error}");
 
-        // And the exemption still applies where it should: 8 really is the earliest member
-        // this deployment published, so it establishes and names the gap.
-        let honest = MirrorFixture::conformance();
-        let anchored = honest.establish(8).expect("the earliest published member establishes");
+        // The very same checkpoint, from a mirror that serves the history the deployment
+        // published, establishes: the predecessor relationship is verifiable there.
+        let full = MirrorFixture::conformance();
+        assert_eq!(full.establish(13).expect("established").checkpoint.tree_size, 13);
+
+        // And a run grounded on the smallest member the mirror serves is `3` for the same
+        // reason, whichever member that happens to be.
+        let error = full.establish(4).expect_err("nothing precedes the smallest member served");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+    }
+
+    #[test]
+    fn a_second_root_at_the_grounded_size_is_never_answered_from_one_branch() {
+        // The second member is signed by a key this corpus's manifest chain does not declare,
+        // which is exactly how a second branch looks from inside the first one: its own chain
+        // would authorize its own log key, and the entries behind its root cannot be requested
+        // at all, because adaptor §10.3 addresses an enumeration by `tree_size` alone.
+        //
+        // Answering from the branch that happens to resolve would report a complete closure
+        // over a size the client cannot show carries one tree. It is `3` — material that could
+        // not be established — and never `1`, which §7 reserves for two members that both
+        // authenticate.
+        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(13);
+        let error = fixture.establish(13).expect_err("two roots at the grounded size");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("this result would be grounded on"), "{error}");
+        assert!(!error.to_string().contains("equivocat"), "not an accusation: {error}");
+
+        // A second root at a size the result is *not* grounded on is carried as a finding:
+        // members away from a divergence remain usable, and one bogus object from a mirror
+        // must not derail an honest run.
+        let anchored = fixture.establish(20).expect("grounded above the second root");
         assert!(anchored
             .findings
             .iter()
-            .any(|finding| finding.code == "series-predecessor-unpublished"));
+            .any(|finding| finding.code == "mirror-served-differing-roots"));
+
+        // Where both members at the grounded size authenticate, it is `1` and the floor is
+        // named: that is positive proof, not absence of evidence.
+        let equivocating = MirrorFixture::conformance().with_equivocation_at(13);
+        let error = equivocating.establish(13).expect_err("both authenticate");
+        assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
+    }
+
+    #[test]
+    fn a_log_key_declared_but_not_yet_active_never_authenticates_a_checkpoint() {
+        // Design note §2 rule 4: the signing key must be in the governing version's `log.keys`
+        // **and active by `valid_from_index`**. Declaring a key is not adopting it, and a
+        // checkpoint signed before its activation index is signed by a key the corpus had not
+        // yet put in force.
+        let fixture = MirrorFixture::conformance().with_future_activated_log_key();
+        let size = fixture.appended_tree_size();
+        let error = fixture.establish(size).expect_err("the key is not active yet");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("does not verify"), "{error}");
+
+        // The manifest version itself is sound, so checkpoints it does not govern are
+        // unaffected.
+        assert!(fixture.establish(20).is_ok());
+    }
+
+    #[test]
+    fn a_log_key_object_whose_id_does_not_recompute_never_resolves_a_checkpoint() {
+        // Adaptor §7.2: "A verifier MUST recompute a key id from the public key it is given
+        // and MUST reject a mismatch"; §6.5 step 4 repeats it at the point of use. Without
+        // that, a manifest filing one party's public key under another party's id makes every
+        // later lookup resolve the name a checkpoint carries to the key the manifest chose.
+        let fixture = MirrorFixture::conformance().with_mismatched_log_key_id();
+        let size = fixture.appended_tree_size();
+        let error = fixture.establish(size).expect_err("the key id does not recompute");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(fixture.establish(20).is_ok(), "earlier versions are unaffected");
+    }
+
+    #[test]
+    fn a_manifest_version_that_moves_the_cadence_epoch_never_governs() {
+        // Core §7.3 and adaptor §7.3.2: the epoch is declared once, by the genesis manifest,
+        // and repeated unchanged by every later version. A movable epoch would let an operator
+        // re-anchor the series after the fact and erase an interval it failed to cover.
+        let fixture = MirrorFixture::conformance().with_moved_cadence_epoch();
+        let size = fixture.appended_tree_size();
+        let error = fixture.establish(size).expect_err("the epoch moved");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(fixture.establish(20).is_ok(), "earlier versions are unaffected");
     }
 
     #[test]
