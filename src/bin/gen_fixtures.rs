@@ -49,6 +49,8 @@ fn main() -> std::process::ExitCode {
     // public key under another party's id, and one that moves `cadence_epoch`.
     let withheld_predecessor = MirrorFixture::conformance().with_series_from(13);
     let foreign_divergence = MirrorFixture::conformance().with_foreign_divergence_at(13);
+    let divergence_below = MirrorFixture::conformance().with_foreign_divergence_at(8);
+    let forged_key_transition = MirrorFixture::conformance().with_forged_key_transition();
     let inactive_log_key = MirrorFixture::conformance().with_future_activated_log_key();
     let mismatched_key_id = MirrorFixture::conformance().with_mismatched_log_key_id();
     let moved_epoch = MirrorFixture::conformance().with_moved_cadence_epoch();
@@ -62,6 +64,8 @@ fn main() -> std::process::ExitCode {
         &unknown_statement,
         &withheld_predecessor,
         &foreign_divergence,
+        &divergence_below,
+        &forged_key_transition,
         &inactive_log_key,
         &mismatched_key_id,
         &moved_epoch,
@@ -107,6 +111,8 @@ fn main() -> std::process::ExitCode {
         ("mirror-transcript-unknown-statement.json", unknown_statement.transcript()),
         ("mirror-transcript-withheld-predecessor.json", withheld_predecessor.transcript()),
         ("mirror-transcript-foreign-divergence.json", foreign_divergence.transcript()),
+        ("mirror-transcript-divergence-below.json", divergence_below.transcript()),
+        ("mirror-transcript-forged-key-transition.json", forged_key_transition.transcript()),
         ("mirror-transcript-inactive-log-key.json", inactive_log_key.transcript()),
         ("mirror-transcript-mismatched-key-id.json", mismatched_key_id.transcript()),
         ("mirror-transcript-moved-epoch.json", moved_epoch.transcript()),

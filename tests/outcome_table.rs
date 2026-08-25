@@ -399,10 +399,10 @@ fn row_a_withheld_predecessor_is_unverifiable_never_a_complete_answer() {
 fn row_a_second_root_at_the_grounded_size_is_unverifiable_never_answered_from_one_branch() {
     // The second member at tree_size 13 is signed by a key this corpus's manifest chain does
     // not declare — the shape a second branch has when seen from inside the first. Its own
-    // chain would authorize its own log key, and the entries behind its root cannot be
-    // requested at all: adaptor §10.3 addresses an enumeration by `tree_size` alone. Answering
-    // from the branch that happens to resolve would report a complete closure over a size the
-    // client cannot show carries one tree.
+    // chain would authorize its own log key, and this run cannot ask the mirror for the
+    // entries behind its root: the request shape of adaptor §10.3 names a range and a tree
+    // size, never a root. Answering from the branch that happens to resolve would report a
+    // complete closure over a size the client cannot show carries one tree.
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path());
     let run = ahl_cli(&[
@@ -423,12 +423,13 @@ fn row_a_second_root_at_the_grounded_size_is_unverifiable_never_answered_from_on
     ]);
     assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
     assert_eq!(run.json()["reason_code"], "evidence-missing");
-    assert!(run.output().contains("this result would be grounded on"), "{}", run.output());
+    assert!(run.output().contains("would be grounded at tree_size 13"), "{}", run.output());
     // `3` is not an accusation: §7 reserves that for two members that both authenticate.
     assert!(!run.stdout.contains("equivocat"), "{}", run.stdout);
 
-    // A second root at a size the result is not grounded on is carried as a finding instead:
-    // members away from a divergence remain usable.
+    // A second root strictly *above* the grounded size is carried as a finding instead: the
+    // result sits below the floor under every reading, and members below a divergence remain
+    // usable.
     let run = ahl_cli(&[
         "--policy",
         &policy_path.display().to_string(),
@@ -453,6 +454,142 @@ fn row_a_second_root_at_the_grounded_size_is_unverifiable_never_answered_from_on
         .map(|finding| finding["code"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert!(codes.iter().any(|code| code == "mirror-served-differing-roots"), "{codes:?}");
+}
+
+#[test]
+fn row_an_unresolved_divergence_below_the_grounded_size_is_unverifiable() {
+    // Adaptor §5.2.2 ends the canonical series from the **lowest** size at which divergence
+    // occurs, so a divergence the run could not rule out at tree_size 8 is a floor that a
+    // result grounded at 20 sits beyond. The size the checkpoint was selected at is not the
+    // boundary; the size the result is grounded on is, and the comparison is `<=`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-divergence-below.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "18",
+        "--checkpoint",
+        "20",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("at tree_size 8"), "{}", run.output());
+    assert!(run.output().contains("would be grounded at tree_size 20"), "{}", run.output());
+    // Still not an accusation: §7 reserves that for two members that both authenticate.
+    assert!(!run.stdout.contains("equivocat"), "{}", run.stdout);
+
+    // The same checkpoint and trigger from a mirror that served one root at every size.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "18",
+        "--checkpoint",
+        "20",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_a_forged_key_binding_never_authorizes_a_successor_manifest() {
+    // Core §2.3.6 and adaptor §7.2 derive `key_id` from the public key and require a mismatch
+    // to be rejected — of any `key_id -> pubkey` pair, not only the ones inside a manifest. An
+    // authorized producer anchors a `key` add whose id is not derived from the key beside it;
+    // the attacker then signs a successor manifest under that borrowed name, and the log key it
+    // declares signs the checkpoint a closure would be grounded on.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-forged-key-transition.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "34",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("does not verify"), "{}", run.output());
+
+    // The refusal is of one statement, not of the corpus (adaptor §7.4.1).
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-forged-key-transition.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_the_genuinely_first_published_member_is_unverifiable_by_deliberate_refusal() {
+    // Adaptor §5.2.2 item 3 describes a member with no predecessor — an operator may first
+    // publish at a size larger than the genesis checkpoint — while §6.6 requires the
+    // relationship. Nothing is withheld here: this really is the earliest member the fixture's
+    // deployment published.
+    //
+    // The client still answers `3`, because the sources fix no way for a verifier to prove that
+    // an observed member is the first one published, so this case cannot be told apart from a
+    // withheld predecessor. Pinned as a decision: adopting the carve-out later has to change
+    // this row rather than quietly change a verdict.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "4",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("no authenticated series member precedes"), "{}", run.output());
+    assert!(run.output().contains("no client can establish it"), "{}", run.output());
+    assert_ne!(run.json()["completeness"], "complete");
 }
 
 #[test]

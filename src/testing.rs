@@ -44,8 +44,10 @@ pub const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
 /// The smallest is here so that a checkpoint the tests ground results on has an authenticated
 /// predecessor: adaptor §6.6 requires that relationship and the client never assumes it away,
 /// because "the mirror served nothing earlier" is a server label rather than evidence about
-/// what the deployment published. A run grounded on the smallest member itself is therefore
-/// `unverifiable`, which is what `with_series_from` exercises.
+/// what the deployment published. A run grounded on the smallest member is therefore
+/// `unverifiable` — the deliberate refusal of the §5.2.2 item 3 carve-out, pinned by
+/// `the_genuinely_first_published_member_is_refused_and_the_refusal_is_deliberate` so that it
+/// stays a decision rather than an artefact of which sizes this list happens to carry.
 pub const CHECKPOINT_SIZES: [u64; 6] = [4, 8, 13, 20, 28, 32];
 
 /// One recorded exchange, in the shape [`crate::transcript`] replays.
@@ -251,11 +253,89 @@ impl MirrorFixture {
     ///
     /// From the client's side this is exactly the shape of a second branch whose own manifest
     /// chain authorizes its own log key: the signature does not resolve under this corpus's
-    /// chain, and the entries behind the other root cannot be requested at all, because
-    /// adaptor §10.3 addresses an enumeration by `tree_size` alone.
+    /// chain, and this run cannot ask the mirror for the entries behind the other root, because
+    /// the request shape of adaptor §10.3 names a range and a tree size and never a root.
     #[must_use]
     pub const fn with_foreign_divergence_at(mut self, tree_size: u64) -> Self {
         self.foreign_divergence_at = Some(tree_size);
+        self
+    }
+
+    /// Anchor a `key` transition whose binding is forged, then a successor manifest that only
+    /// that forged binding can authorize.
+    ///
+    /// The shape of the attack, in three entries:
+    ///
+    /// 1. a producer key in force signs a `key` add carrying `{key_id: SHA-256(K_fake),
+    ///    pubkey: attacker_pubkey}` — a well-formed statement from an authorized signer whose
+    ///    only defect is that the id is not derived from the key beside it;
+    /// 2. the attacker signs a successor manifest naming `SHA-256(K_fake)` as its signing key
+    ///    id. A verifier that took the binding on trust resolves that name to the attacker's
+    ///    public key, and the signature verifies — so §7.4.1 test 2 passes and the manifest
+    ///    joins the chain;
+    /// 3. that manifest names a log key, and the checkpoint over it is signed by that key.
+    ///
+    /// Every test of adaptor §7.4.1 passes. What stops it is core §2.3.6 and adaptor §7.2:
+    /// the id is recomputed from the key and the mismatch refused, at step 1.
+    #[must_use]
+    pub fn with_forged_key_transition(mut self) -> Self {
+        let producer = seed(&Self::corpus_root(), "producer-1");
+        let attacker =
+            TestKey::from_seed_hex("attacker", &"7d".repeat(32)).unwrap_or_else(|_| unreachable());
+        let fake =
+            TestKey::from_seed_hex("fake", &"7c".repeat(32)).unwrap_or_else(|_| unreachable());
+
+        // 1. The forged binding, signed by a key genuinely in force.
+        let transition = ahl_core::envelope(
+            json!({
+                "type": "key",
+                "action": "add",
+                "key": { "key_id": fake.key_id(), "pubkey": attacker.pubkey() },
+            }),
+            &producer,
+        );
+        self.entries.push(ahl_core::jcs(&transition));
+
+        // 2. A successor manifest signed by the attacker under the borrowed name. Assembled by
+        //    hand because the envelope helper always names the key that signed.
+        let predecessor = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|bytes| {
+                let value: Value = serde_json::from_slice(bytes).ok()?;
+                (value.get("payload")?.get("type")?.as_str()? == "manifest")
+                    .then(|| ahl_core::sha256_hex(bytes))
+            })
+            .unwrap_or_default();
+        let payload = json!({
+            "type": "manifest",
+            "producer": "producer-1",
+            "predecessor": predecessor,
+            "keys": [ attacker.key_object(0) ],
+            "log": {
+                "log_id": self.log_id(),
+                "operator": "log-operator-1",
+                "adaptor": {
+                    "id": TEST_LOG_PROFILE,
+                    "hash": format!("sha256:{}", hex::encode([0u8; 32])),
+                },
+                "checkpoint_cadence": "PT1H",
+                "cadence_epoch": self.genesis_cadence_epoch(),
+                "witness_grace_period": "PT15M",
+                "keys": [ self.foreign_key.key_object(0) ],
+            },
+        });
+        let signature = attacker.sign(&ahl_core::jcs(&payload));
+        let manifest = json!({
+            "payload": payload,
+            "signatures": [ { "key_id": fake.key_id(), "sig": signature } ],
+        });
+        self.entries.push(ahl_core::jcs(&manifest));
+
+        self.appended = true;
+        // 3. The checkpoint over the forged chain, signed by the log key it names.
+        self.foreign_key_at = Some(self.appended_tree_size());
         self
     }
 

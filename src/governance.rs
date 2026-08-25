@@ -851,33 +851,66 @@ fn key_objects(container: &Value, what: &str) -> Result<(), String> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("`{what}` is REQUIRED and must be an array"))?;
     for (at, object) in keys.iter().enumerate() {
-        let key_id = object
-            .get("key_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("`{what}[{at}].key_id` is REQUIRED"))?;
-        family_string(&format!("{what}[{at}].key_id"), key_id)?;
-        let pubkey = object
-            .get("pubkey")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("`{what}[{at}].pubkey` is REQUIRED and must be a string"))?;
-        let decoded = ahl_core::decode_pubkey(pubkey)
-            .map_err(|source| format!("`{what}[{at}].pubkey` is unreadable: {source}"))?;
-        let recomputed = ahl_core::sha256_hex(decoded.as_bytes());
-        if recomputed != key_id {
-            return Err(format!(
-                "`{what}[{at}].key_id` is `{key_id}` but its `pubkey` recomputes to \
-                 `{recomputed}`; adaptor §7.2 and §6.5 step 4 require the id to be recomputed \
-                 from the carried public key and a mismatch to be rejected"
-            ));
-        }
+        let named = format!("{what}[{at}]");
+        bind_key(object, &named)?;
         if object.get("valid_from_index").and_then(Value::as_u64).is_none() {
-            return Err(format!("`{what}[{at}].valid_from_index` is not an entry index"));
+            return Err(format!("`{named}.valid_from_index` is not an entry index"));
         }
     }
     Ok(())
 }
 
+/// Read one `key_id -> pubkey` binding, **recomputing the id from the key**.
+///
+/// # Every such pair is read through here
+///
+/// Core §2.3.6 fixes the producer derivation outright — `key_id` is `sha256:` plus lowercase
+/// hex SHA-256 of the raw 32-byte Ed25519 public key — and adaptor §7.2 adopts the identical
+/// rule for log and witness keys, then states the duty: "A verifier MUST recompute a key id
+/// from the public key it is given and MUST reject a mismatch." §6.5 step 4 repeats it where a
+/// checkpoint signature resolves.
+///
+/// The rule is about a **pair**, not about a place. A `key_id -> pubkey` binding taken on
+/// trust is only an assertion whoever wrote it makes about itself: file one party's public key
+/// under another party's id and every later lookup resolves the *name* a signature carries to
+/// the *key* the writer chose. That holds identically whether the pair arrives in a manifest's
+/// producer, `log` or `witness` key objects or in the `key` object of a transition statement —
+/// which is why both routes into the resolved key set come through this function, and why a
+/// third route would have to as well.
+///
+/// The transition case is not the weaker one. A `key` statement is signed by a key already in
+/// force, so it is exactly the primitive a compromised-but-authorized producer would reach for
+/// to install a key under a name of its choosing, and the manifest chain that follows would
+/// then authorize against a key the corpus never adopted.
+fn bind_key(object: &Value, what: &str) -> Result<(String, String), String> {
+    let key_id = object
+        .get("key_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("`{what}.key_id` is REQUIRED"))?;
+    family_string(&format!("{what}.key_id"), key_id)?;
+    let pubkey = object
+        .get("pubkey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("`{what}.pubkey` is REQUIRED and must be a string"))?;
+    let decoded = ahl_core::decode_pubkey(pubkey)
+        .map_err(|source| format!("`{what}.pubkey` is unreadable: {source}"))?;
+    let recomputed = ahl_core::sha256_hex(decoded.as_bytes());
+    if recomputed != key_id {
+        return Err(format!(
+            "`{what}.key_id` is `{key_id}` but its `pubkey` recomputes to `{recomputed}`; core \
+             §2.3.6 and adaptor §7.2 derive the id from the key and require a mismatch to be \
+             rejected, so this binding is refused rather than believed"
+        ));
+    }
+    Ok((key_id.to_owned(), pubkey.to_owned()))
+}
+
 /// Read a `key` statement's transition, or say why it is unusable.
+///
+/// The binding goes through [`bind_key`], so a transition installs a key only under the id its
+/// own public key derives. `valid_from` is deliberately not read: core §2.3.6 makes it
+/// **informative** and orders transitions by their own entry indexes, so reading it would
+/// invent an ordering the specification denies it.
 fn read_key_event(index: u64, payload: &Value) -> Result<KeyEvent, String> {
     let key = payload
         .get("key")
@@ -888,44 +921,50 @@ fn read_key_event(index: u64, payload: &Value) -> Result<KeyEvent, String> {
         Some("retire") => false,
         other => return Err(format!("unknown key action `{}`", other.unwrap_or("<absent>"))),
     };
-    Ok(KeyEvent {
-        entry_index: index,
-        key_id: string_member(key, "key_id").map_err(|error| error.to_string())?,
-        pubkey: string_member(key, "pubkey").map_err(|error| error.to_string())?,
-        added,
-    })
+    let (key_id, pubkey) = bind_key(key, "the transition's `key` object")?;
+    Ok(KeyEvent { entry_index: index, key_id, pubkey, added })
 }
 
-fn string_member(value: &Value, member: &str) -> CliResult<String> {
-    value.get(member).and_then(Value::as_str).map(str::to_owned).ok_or_else(|| {
-        CliError::RuleFired(format!("governance object carries no string `{member}`"))
-    })
-}
-
-/// `key_id -> pubkey` for the key objects of `container` that are **active** for a checkpoint
-/// of size `tree_size`, by the `valid_from_index` rule of [`Governance::log_keys_for`].
-fn active_key_pairs(container: &Value, tree_size: u64) -> Vec<(String, String)> {
+/// Every **bound** key object of `container`, as `(key_id, pubkey, valid_from_index)`.
+///
+/// Bound means the id was recomputed from the key by [`bind_key`], so no reader below can hand
+/// out a pair that was merely asserted. Routing the readers through it rather than trusting the
+/// chain to have been validated is deliberate: `Governance::resolve` does validate every
+/// manifest it accepts, but [`Governance::structural_only`] validates nothing by design, and a
+/// key set is exactly the wrong thing to have two construction routes into.
+///
+/// A key object that does not bind is left out here rather than reported, because both callers
+/// already report it where reporting belongs: an authenticated chain never contains one — the
+/// manifest carrying it was rejected outright — and a topology-mode chain surfaces it through
+/// [`Governance::log_object_findings`], which walks the same schema. The `valid_from_index`
+/// fallback has the same shape: it is REQUIRED and enforced in the schema, so only a
+/// topology-mode chain can reach the default.
+fn bound_key_objects(container: &Value) -> Vec<(String, String, u64)> {
     container
         .get("keys")
         .and_then(Value::as_array)
         .map(|objects| {
             objects
                 .iter()
-                .filter(|object| {
-                    object
-                        .get("valid_from_index")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|valid_from| valid_from < tree_size)
-                })
                 .filter_map(|object| {
-                    Some((
-                        object.get("key_id")?.as_str()?.to_owned(),
-                        object.get("pubkey")?.as_str()?.to_owned(),
-                    ))
+                    let (key_id, pubkey) = bind_key(object, "key object").ok()?;
+                    let valid_from =
+                        object.get("valid_from_index").and_then(Value::as_u64).unwrap_or(0);
+                    Some((key_id, pubkey, valid_from))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `key_id -> pubkey` for the key objects of `container` that are **active** for a checkpoint
+/// of size `tree_size`, by the `valid_from_index` rule of [`Governance::log_keys_for`].
+fn active_key_pairs(container: &Value, tree_size: u64) -> Vec<(String, String)> {
+    bound_key_objects(container)
+        .into_iter()
+        .filter(|(_, _, valid_from)| *valid_from < tree_size)
+        .map(|(key_id, pubkey, _)| (key_id, pubkey))
+        .collect()
 }
 
 /// `key_id -> pubkey` for the key objects of `container` in force at **entry index** `index`.
@@ -935,49 +974,11 @@ fn active_key_pairs(container: &Value, tree_size: u64) -> Vec<(String, String)> 
 /// exactly that index may already use it. `log_keys_for` converts between scales — a checkpoint
 /// of size `n` commits `[0, n)` — and is strict for that reason.
 fn in_force_key_pairs(container: &Value, index: u64) -> Vec<(String, String)> {
-    manifest_key_pairs(container)
+    bound_key_objects(container)
         .into_iter()
-        .zip(key_activation_indexes(container))
-        .filter_map(|(pair, valid_from)| (valid_from <= index).then_some(pair))
+        .filter(|(_, _, valid_from)| *valid_from <= index)
+        .map(|(key_id, pubkey, _)| (key_id, pubkey))
         .collect()
-}
-
-/// The `valid_from_index` of each readable key object of `container`, positionally aligned with
-/// [`manifest_key_pairs`]. A key object missing one never survives schema validation, so the
-/// fallback only ever applies to a chain built by `structural_only`, where nothing is evidence.
-fn key_activation_indexes(container: &Value) -> Vec<u64> {
-    container
-        .get("keys")
-        .and_then(Value::as_array)
-        .map(|objects| {
-            objects
-                .iter()
-                .filter(|object| {
-                    object.get("key_id").and_then(Value::as_str).is_some()
-                        && object.get("pubkey").and_then(Value::as_str).is_some()
-                })
-                .map(|object| object.get("valid_from_index").and_then(Value::as_u64).unwrap_or(0))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn manifest_key_pairs(container: &Value) -> Vec<(String, String)> {
-    container
-        .get("keys")
-        .and_then(Value::as_array)
-        .map(|objects| {
-            objects
-                .iter()
-                .filter_map(|object| {
-                    Some((
-                        object.get("key_id")?.as_str()?.to_owned(),
-                        object.get("pubkey")?.as_str()?.to_owned(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn manifest_key_ids(manifest: &Value) -> CliResult<BTreeSet<String>> {

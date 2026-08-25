@@ -411,19 +411,8 @@ pub fn establish<F: Fetcher>(
     tree_size: u64,
 ) -> CliResult<Anchored> {
     let series = mirror.series()?;
-    let published_roots = roots_at(&series, tree_size);
     let selected = governing_member(&series, tree_size)?;
-    establish_under(mirror, policy, &series, selected, published_roots)
-}
-
-/// How many distinct `root_hash` values the mirror published at `tree_size`.
-fn roots_at(series: &[Checkpoint], tree_size: u64) -> usize {
-    series
-        .iter()
-        .filter(|member| member.tree_size == tree_size)
-        .map(|member| member.root_hash.as_str())
-        .collect::<BTreeSet<&str>>()
-        .len()
+    establish_under(mirror, policy, &series, selected)
 }
 
 /// The published member at `tree_size` that governs, by the series order of core §7.3.
@@ -452,7 +441,6 @@ fn establish_under<F: Fetcher>(
     policy: &LoadedPolicy,
     series: &[Checkpoint],
     selected: Checkpoint,
-    published_roots: usize,
 ) -> CliResult<Anchored> {
     let tree_size = selected.tree_size;
     let mut findings = Vec::new();
@@ -504,7 +492,6 @@ fn establish_under<F: Fetcher>(
             authenticated.push(member.clone());
         }
     }
-    findings.extend(unauthenticated_branch_findings(series, &authenticated));
     if let Some(floor) = equivocation_floor(&authenticated) {
         if tree_size >= floor {
             // Positive proof of misbehaviour, and a branch is never chosen.
@@ -520,34 +507,54 @@ fn establish_under<F: Fetcher>(
         ));
     }
 
-    // --- the grounded size carries exactly one root, or nothing may be grounded here ---
+    // --- an unresolved divergence is a floor too, and this result may not sit at or beyond it
     //
-    // Reaching this line means no *other* root at `tree_size` authenticates under the chain
-    // this branch established — the floor rule above would have condemned the run otherwise.
-    // That is not the same as establishing that the other root fails to authenticate: a
-    // checkpoint is authenticated under the manifest version governing **its own**
-    // `tree_size` in **its own** corpus (adaptor §6.5 step 4, §6.6), and the enumeration
-    // interface of §10.3 addresses a range by `tree_size` alone. There is no request that
-    // asks for "the entries behind that other root", so its chain cannot be resolved and its
-    // key set cannot be recovered.
+    // The floor rule above condemns a divergence both of whose members authenticate under the
+    // chain this corpus authorizes. What is left are sizes where the mirror published more
+    // than one root and only one of them resolves here. That is *not* the same as having
+    // established that the others are bogus: a checkpoint is authenticated under the manifest
+    // version governing its own `tree_size` in its own corpus (adaptor §6.5 step 4, §6.6), and
+    // this run holds one enumeration interface, whose request names a range and a tree size
+    // and never a root (§10.3) — so it has no way to ask *this* mirror for the entries behind
+    // a second root at one size. Another party might well obtain them: §10.3 leaves transport
+    // unconstrained and admits a published static archive or an independent mirror, and §6.6
+    // takes entry material from any source. The limit is on what this run established, not on
+    // what is obtainable.
     //
-    // Two published roots at the size a result is grounded on therefore leave the client
-    // unable to tell a second authentic branch from one bogus object — and adaptor §5.2.2
-    // forbids grounding anything at or beyond a divergence. Refusing here is `3`: material
-    // that cannot be established, never an accusation about the log, which §7 reserves for two
-    // members that both authenticate. A second root at any *other* size is carried as a
-    // finding instead, because the result is not grounded there and members away from a
-    // divergence remain usable.
-    if published_roots > 1 {
+    // Adaptor §5.2.2 ends the canonical series **from the lowest size at which divergence
+    // occurs**, and nothing may be grounded at or beyond that point. An unresolved divergence
+    // is a candidate for that floor, so the same boundary applies to it: at or below the size
+    // this result is grounded on it is fatal, and the honest outcome is `3` — material that
+    // could not be established, never an accusation, which §7 reserves for two members that
+    // both authenticate. Strictly *above* it the result is grounded below a floor even in the
+    // worst reading, members below a divergence remain usable, and one bogus object from a
+    // mirror must not derail an honest run — so it is carried as a finding.
+    let unresolved = unresolved_divergences(series, &authenticated);
+    if let Some(floor) = unresolved.iter().copied().find(|size| *size <= tree_size) {
         return Err(CliError::EvidenceMissing(format!(
-            "the mirror published {published_roots} different roots at tree_size {tree_size}, \
-             the size this result would be grounded on, and only one of them resolves under \
-             the manifest chain this corpus authorizes. Whether another is authentic under a \
-             chain of its own cannot be established: adaptor §10.3 addresses an enumeration by \
-             `tree_size` alone, so there is no way to ask for the entries behind a second root \
-             at one size. Nothing may be grounded there"
+            "the mirror published more than one root at tree_size {floor} and only one of them \
+             resolves under the manifest chain this corpus authorizes. Whether another is \
+             authentic under a chain of its own was not established in this run: the \
+             enumeration interface of adaptor §10.3 names a range and a tree size, never a \
+             root, so this client has no request that separates two roots at one size from \
+             this mirror. A divergence at {floor} would end the canonical series from there \
+             (§5.2.2), and this result would be grounded at tree_size {tree_size}, at or \
+             beyond it. Nothing may be grounded at or beyond a divergence that has not been \
+             ruled out"
         )));
     }
+    findings.extend(unresolved.iter().map(|size| {
+        Finding::new(
+            "mirror-served-differing-roots",
+            format!(
+                "the mirror published more than one root at tree_size {size}, of which one \
+                 authenticates for the bound log; objects that do not authenticate are \
+                 untrusted material from a server and carry no accusation about the log. This \
+                 result is grounded at tree_size {tree_size}, strictly below that size, and \
+                 members below a divergence remain usable"
+            ),
+        )
+    }));
 
     // --- step 3: neighbouring consistency --------------------------------------------
     findings.extend(check_neighbours(mirror, &authenticated, &selected)?);
@@ -571,48 +578,37 @@ fn remote_candidate(error: CliError) -> CliError {
     }
 }
 
-/// Findings about published members that share a `tree_size` with a differing `root_hash`
-/// while **not** authenticating.
+/// The tree sizes at which the mirror published more than one root **without** this run
+/// establishing that more than one of them authenticates, ascending.
 ///
-/// Design note §7: differing roots at one `tree_size` is divergence only when both objects
-/// authenticate for the bound log (adaptor §6.6.1); otherwise it is untrusted material from a
-/// mirror, and is reported as such rather than as an accusation about the log. Without the
-/// qualifier a hostile mirror publishing one bogus object can make the CLI accuse an honest
-/// log; without the report, it can make it say nothing at all.
-fn unauthenticated_branch_findings(
-    published: &[Checkpoint],
-    authenticated: &[Checkpoint],
-) -> Vec<Finding> {
+/// These are the divergences the run could neither confirm nor rule out. A size where two or
+/// more members authenticate is *not* here: that one is confirmed and the floor rule of
+/// [`equivocation_floor`] adjudicates it, because design note §7 reserves an accusation for two
+/// members that both authenticate — without the qualifier a hostile mirror publishing one bogus
+/// object could make the CLI accuse an honest log.
+///
+/// Ascending order is load-bearing: adaptor §5.2.2 ends the series from the **lowest** size at
+/// which divergence occurs, so the caller takes the first entry at or below the size it would
+/// ground on and refuses there.
+fn unresolved_divergences(published: &[Checkpoint], authenticated: &[Checkpoint]) -> BTreeSet<u64> {
     let mut roots: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
     for member in published {
         roots.entry(member.tree_size).or_default().insert(&member.root_hash);
     }
-    let mut findings = Vec::new();
-    for (tree_size, published_roots) in roots {
-        if published_roots.len() < 2 {
-            continue;
-        }
-        let authenticated_roots: BTreeSet<&str> = authenticated
-            .iter()
-            .filter(|member| member.tree_size == tree_size)
-            .map(|member| member.root_hash.as_str())
-            .collect();
-        if authenticated_roots.len() > 1 {
-            // Adjudicated by the floor rule instead; nothing to report here.
-            continue;
-        }
-        findings.push(Finding::new(
-            "mirror-served-differing-roots",
-            format!(
-                "the mirror published {} different roots at tree_size {tree_size}, of which {} \
-                 authenticates for the bound log; objects that do not authenticate are \
-                 untrusted material from a server and carry no accusation about the log",
-                published_roots.len(),
-                authenticated_roots.len()
-            ),
-        ));
-    }
-    findings
+    roots
+        .into_iter()
+        .filter(|(_, published_roots)| published_roots.len() > 1)
+        .filter(|(tree_size, _)| {
+            authenticated
+                .iter()
+                .filter(|member| member.tree_size == *tree_size)
+                .map(|member| member.root_hash.as_str())
+                .collect::<BTreeSet<&str>>()
+                .len()
+                <= 1
+        })
+        .map(|(tree_size, _)| tree_size)
+        .collect()
 }
 
 /// Verify the §6.6 neighbour relationships in **series order**: predecessor, and successor
@@ -1009,19 +1005,51 @@ mod tests {
         // published, establishes: the predecessor relationship is verifiable there.
         let full = MirrorFixture::conformance();
         assert_eq!(full.establish(13).expect("established").checkpoint.tree_size, 13);
+    }
 
-        // And a run grounded on the smallest member the mirror serves is `3` for the same
-        // reason, whichever member that happens to be.
-        let error = full.establish(4).expect_err("nothing precedes the smallest member served");
+    #[test]
+    fn the_genuinely_first_published_member_is_refused_and_the_refusal_is_deliberate() {
+        // The case adaptor §5.2.2 item 3 describes and the frozen sources leave unreconciled:
+        // an operator may first publish at a size larger than the genesis checkpoint, so that
+        // member has no predecessor to relate to, while §6.6 requires the relationship for
+        // series-usability. The fixture's smallest member is exactly that — nothing was
+        // withheld and nothing failed to authenticate; there is genuinely nothing earlier.
+        //
+        // This crate does **not** implement the carve-out. Not because the carve-out is wrong,
+        // but because a verifier cannot tell this case apart from a mirror that withheld the
+        // predecessor: the sources fix no way to prove an observed member is really the first
+        // one published. So the answer is `3` in both, and the reporting rule of design note
+        // §10 is followed — the gap is named rather than decided in the client's favour.
+        //
+        // Pinned as a deliberate refusal so that it cannot become an accident of which sizes
+        // the fixture happens to publish, and so that adopting the carve-out later is a visible
+        // change to this test rather than a silent change of verdict.
+        let fixture = MirrorFixture::conformance();
+        let smallest = crate::testing::CHECKPOINT_SIZES
+            .into_iter()
+            .min()
+            .expect("the fixture publishes a series");
+        assert!(
+            fixture.series().iter().all(|member| member.tree_size >= smallest),
+            "nothing was withheld: this really is the first member published"
+        );
+
+        let error = fixture.establish(smallest).expect_err("no predecessor exists at all");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("no authenticated series member precedes"), "{error}");
+        assert!(
+            error.to_string().contains("no client can establish it"),
+            "the refusal must name why the carve-out is not claimed: {error}"
+        );
     }
 
     #[test]
     fn a_second_root_at_the_grounded_size_is_never_answered_from_one_branch() {
         // The second member is signed by a key this corpus's manifest chain does not declare,
-        // which is exactly how a second branch looks from inside the first one: its own chain
-        // would authorize its own log key, and the entries behind its root cannot be requested
-        // at all, because adaptor §10.3 addresses an enumeration by `tree_size` alone.
+        // which is how a second branch looks from inside the first one: its own chain would
+        // authorize its own log key, and this run holds one enumeration interface whose
+        // request names a range and a tree size, never a root (§10.3) — so it has no way to
+        // ask this mirror for the entries behind the other root.
         //
         // Answering from the branch that happens to resolve would report a complete closure
         // over a size the client cannot show carries one tree. It is `3` — material that could
@@ -1030,23 +1058,46 @@ mod tests {
         let fixture = MirrorFixture::conformance().with_foreign_divergence_at(13);
         let error = fixture.establish(13).expect_err("two roots at the grounded size");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
-        assert!(error.to_string().contains("this result would be grounded on"), "{error}");
+        assert!(error.to_string().contains("would be grounded at tree_size 13"), "{error}");
         assert!(!error.to_string().contains("equivocat"), "not an accusation: {error}");
-
-        // A second root at a size the result is *not* grounded on is carried as a finding:
-        // members away from a divergence remain usable, and one bogus object from a mirror
-        // must not derail an honest run.
-        let anchored = fixture.establish(20).expect("grounded above the second root");
-        assert!(anchored
-            .findings
-            .iter()
-            .any(|finding| finding.code == "mirror-served-differing-roots"));
 
         // Where both members at the grounded size authenticate, it is `1` and the floor is
         // named: that is positive proof, not absence of evidence.
         let equivocating = MirrorFixture::conformance().with_equivocation_at(13);
         let error = equivocating.establish(13).expect_err("both authenticate");
         assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
+    }
+
+    #[test]
+    fn an_unresolved_divergence_below_the_grounded_size_is_a_floor_the_result_may_not_sit_beyond() {
+        // Adaptor §5.2.2 ends the canonical series from the **lowest** size at which divergence
+        // occurs, and nothing may be grounded at or beyond that point. A divergence the run
+        // could not rule out is a candidate for that floor, so a result grounded *above* it is
+        // grounded at or beyond a floor in the reading that has not been excluded — and the
+        // outcome cannot be `0` just because the size the divergence sits at is not the one
+        // the checkpoint was selected at.
+        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(8);
+        let error = fixture.establish(20).expect_err("grounded beyond an unresolved floor");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("at tree_size 8"), "{error}");
+        assert!(error.to_string().contains("would be grounded at tree_size 20"), "{error}");
+        assert!(!error.to_string().contains("equivocat"), "not an accusation: {error}");
+
+        // The same shape with both members authenticating is the confirmed floor, and a result
+        // grounded beyond it is positive proof: `1`, not `3`.
+        let equivocating = MirrorFixture::conformance().with_equivocation_at(8);
+        let error = equivocating.establish(20).expect_err("confirmed floor at 8");
+        assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 8 }), "{error}");
+
+        // Strictly *above* the grounded size the result sits below the floor under every
+        // reading, members below a divergence remain usable, and one bogus object from a mirror
+        // must not derail an honest run — so it is carried as a finding.
+        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(20);
+        let anchored = fixture.establish(8).expect("grounded strictly below the divergence");
+        assert!(anchored
+            .findings
+            .iter()
+            .any(|finding| finding.code == "mirror-served-differing-roots"));
     }
 
     #[test]
@@ -1063,6 +1114,31 @@ mod tests {
 
         // The manifest version itself is sound, so checkpoints it does not govern are
         // unaffected.
+        assert!(fixture.establish(20).is_ok());
+    }
+
+    #[test]
+    fn a_forged_binding_in_a_key_transition_never_authorizes_a_successor_manifest() {
+        // The recomputation of core §2.3.6 and adaptor §7.2 is about a `key_id -> pubkey`
+        // **pair**, not about a place. A producer key genuinely in force signs a `key` add
+        // carrying `{key_id: SHA-256(K_fake), pubkey: attacker_pubkey}`; the attacker then
+        // signs a successor manifest naming that borrowed id, and a verifier that took the
+        // binding on trust resolves the name to the attacker's key, verifies the signature and
+        // lets the manifest join the chain. The log key it names then authenticates the
+        // checkpoint over it, and a closure grounded there returns `0`.
+        //
+        // Every test of adaptor §7.4.1 passes on the way — the transition is signed by an
+        // authorized key, the manifest links correctly to the version active before it, and
+        // its own signature verifies against the key set the chain established. The rule that
+        // stops it is the one about the pair, applied where the pair is read.
+        let fixture = MirrorFixture::conformance().with_forged_key_transition();
+        let size = fixture.appended_tree_size();
+        let error = fixture.establish(size).expect_err("the binding does not recompute");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("does not verify"), "{error}");
+
+        // Checkpoints below the transition are unaffected: the refusal is of one statement,
+        // not of the corpus (adaptor §7.4.1).
         assert!(fixture.establish(20).is_ok());
     }
 

@@ -584,17 +584,19 @@ fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusatio
     // an honest log. §7 reserves an accusation for two members that **both** authenticate, so
     // neither run below may say the log equivocated.
     //
-    // What the injection does change is whether a result can be grounded. Away from the
-    // grounded size, members either side of a divergence remain usable and the object is
-    // carried as a finding, so one bogus object cannot derail an honest run. **At** the
-    // grounded size the client cannot establish that the second root fails to authenticate
-    // under a chain of its own — adaptor §10.3 addresses an enumeration by `tree_size` alone,
-    // so the entries behind that root cannot even be requested — and §5.2.2 forbids grounding
-    // anything at a divergence. That is `3`, which is still not an accusation.
+    // What the injection does change is whether a result can be grounded. Strictly *above* the
+    // grounded size the result sits below the floor under every reading, members below a
+    // divergence remain usable and the object is carried as a finding, so one bogus object
+    // cannot derail an honest run. At or **below** the grounded size this run could not
+    // establish that the second root fails to authenticate under a chain of its own — the
+    // request shape of adaptor §10.3 names a range and a tree size, never a root, so this
+    // client has no way to ask this mirror for the entries behind it — and §5.2.2 ends the
+    // series from the lowest size at which divergence occurs. That is `3`, which is still not
+    // an accusation.
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = common::networked_policy(dir.path()).display().to_string();
 
-    let elsewhere = with_garbage_branch_at(dir.path(), "garbage-branch-elsewhere.json", 20);
+    let above = with_garbage_branch_at(dir.path(), "garbage-branch-above.json", 20);
     let run = ahl_cli(&[
         "--policy",
         &policy_path,
@@ -602,7 +604,7 @@ fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusatio
         FIXED,
         "--json",
         "--transcript",
-        &elsewhere.display().to_string(),
+        &above.display().to_string(),
         "closure",
         "--trigger-index",
         "6",
@@ -614,7 +616,7 @@ fn bullet_two_unauthenticated_objects_differing_at_one_size_are_not_an_accusatio
     assert_eq!(
         run.code,
         0,
-        "a bogus object away from the grounded size must not derail an honest run: {}",
+        "a bogus object above the grounded size must not derail an honest run: {}",
         run.output()
     );
     assert!(!run.stdout.contains("equivocat"), "{}", run.stdout);

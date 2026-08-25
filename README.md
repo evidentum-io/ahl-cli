@@ -265,10 +265,15 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    established the outcome is `3` with the missing element named, exactly as for any other
    evidence the client was not handed. Reading a short series response as the carve-out would
    hand every mirror a switch that turns a missing relationship into a complete answer: withhold
-   the predecessor and a run that should report missing evidence reports `valid` instead. The
-   practical consequence is stated rather than hidden — a result grounded on the smallest member
-   a mirror serves is always `unverifiable`, and completeness below it was never provable
-   anyway.
+   the predecessor and a run that should report missing evidence reports `valid` instead.
+
+   **The carve-out is therefore not implemented, and the cost is stated rather than hidden.** A
+   deployment that genuinely did first publish at a larger size gets `unverifiable` on its own
+   earliest member — a correct deployment answered conservatively, because this crate cannot
+   tell that case from a withheld predecessor and the reporting rule of §10 says to name the
+   gap rather than decide it in the client's own favour. Completeness below that member was
+   never provable anyway. Both cases are pinned by their own tests, so adopting the carve-out
+   later has to change a test rather than quietly change a verdict.
 
 5. **"Where a successor exists" is not decidable.** No authenticated completeness proof over
    checkpoint-series history is defined, so a mirror can withhold a successor and make an older
@@ -324,28 +329,37 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
     where a selection lands on a size carrying several members — but that rule presupposes the
     other half of the same paragraph, that members sharing a `tree_size` carry the same
     `root_hash`. Where they do not, the sources fix the *consequence* of a confirmed divergence
-    (§5.2.2: the series ends at its floor, and choosing a branch is a conformance violation)
-    without saying how a verifier is to find out whether the divergence is confirmed at all.
-    Confirmation needs both members **authenticated**, authentication resolves the signing key
-    through the manifest version governing each member's own `tree_size` in its own corpus
-    (§6.5 step 4), and adaptor §10.3 addresses an enumeration by `tree_size` alone — there is no
-    request that asks for "the entries behind that other root". One of the two branches is
-    therefore unreachable by construction.
+    (§5.2.2: the series ends from the **lowest** size at which it occurs, and choosing a branch
+    is a conformance violation) without saying how a verifier is to find out whether the
+    divergence is confirmed at all. Confirmation needs both members **authenticated**, and
+    authentication resolves the signing key through the manifest version governing each
+    member's own `tree_size` in its own corpus (§6.5 step 4).
 
-    This crate does not answer from the branch that happens to resolve. Where the mirror
-    publishes more than one root at the size a result would be **grounded on**:
+    A run therefore has to reach the other branch's entries, and the request shape §10.3
+    defines names a range and a tree size, never a root — so this client, speaking that one
+    interface to one mirror, has no request that separates two roots at one size. **That is a
+    limit on this client's repertoire, not a property of the protocol:** §10.3 leaves transport
+    unconstrained and admits a published static archive or an independent mirror, and §6.6
+    takes entry material from any source, so another party may well hold the other branch. What
+    this crate reports is what *this run* established.
 
-    - if a second root authenticates under the chain this corpus authorizes, both members are
-      authenticated and the floor rule applies — outcome `1`, with the floor named;
-    - otherwise the client cannot establish that the second root fails to authenticate under a
-      chain of its own, and §5.2.2 forbids grounding anything at a divergence — outcome `3`,
-      naming what could not be established. That is not an accusation: design note §7 reserves
-      an accusation for two members that both authenticate.
+    Since an unresolved divergence is a candidate floor, it is treated as one. Ordered by size,
+    ascending:
 
-    At any **other** size the second root is carried as a finding
-    (`mirror-served-differing-roots`) and the outcome is unchanged, because the result is not
-    grounded there, members away from a divergence remain usable, and one bogus object from a
-    mirror must not derail an honest run.
+    - a size where a second root **does** authenticate under the chain this corpus authorizes is
+      a confirmed floor: grounded at or beyond it, outcome `1` with the floor named; strictly
+      below it, the finding `divergence-below-floor` and the outcome unchanged;
+    - a size where it does not, and where this run could not establish that it authenticates
+      under a chain of its own, is an **unresolved** floor. At or below the size the result
+      would be grounded on, outcome `3`, naming what could not be established — never an
+      accusation, which design note §7 reserves for two members that both authenticate.
+      Strictly above it the result sits below the floor under every reading, members below a
+      divergence remain usable, and it is carried as the finding
+      `mirror-served-differing-roots` so that one bogus object cannot derail an honest run.
+
+    The boundary is the size a result is grounded on, not the size the checkpoint was selected
+    at, and it is `≤` rather than `==`: a divergence at a *smaller* size ends the series there,
+    so a result grounded above it is grounded beyond a floor.
 
 15. **`valid_from_index` compares on two scales, and the boundary differs.** Design note §2
     rule 4 requires a checkpoint's signing key to be in the governing version's `log.keys`
@@ -401,10 +415,15 @@ for them are gone:
   be read — is rejected and does not govern, and a genesis that breaks the schema is fatal
   because no later version can repair the corpus trust anchor. The
   `manifest-log-object-incomplete` finding survives only in `--unauthenticated` topology mode,
-  where nothing is evidence and every violation is a finding rather than a verdict. Every key
-  object's `key_id` is **recomputed from its `pubkey`** and a mismatch rejected (adaptor §7.2,
-  §6.5 step 4), so the `key_id -> pubkey` map is never an assertion the manifest makes about
-  itself;
+  where nothing is evidence and every violation is a finding rather than a verdict. Every
+  `key_id` is **recomputed from its `pubkey`** and a mismatch rejected — core §2.3.6 for
+  producer keys, adaptor §7.2 and §6.5 step 4 for log and witness keys. The rule is about a
+  *pair*, not a place, so it applies wherever a binding enters the resolved key set: a
+  manifest's producer, `log` and `witness` key objects, **and** the `key` object of a
+  transition statement, which is the primitive an authorized-but-compromised producer would
+  otherwise use to install a key under a name of its choosing. Every reader of the key set goes
+  through the same recomputation, so neither construction route — authenticated or
+  topology-mode — can hand out a pair that was merely asserted;
 * corpus entries 28, 29 and 31 no longer share one payload, and the witness refusal vector now
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
