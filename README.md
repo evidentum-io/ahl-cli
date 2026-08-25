@@ -77,7 +77,15 @@ list of violations is the one thing this mode exists to produce: a shorter list 
 answer, it is a wrong one. Only two conditions leave nothing to walk *against* rather than
 something to report — entries that do not ascend by entry index, and a corpus carrying no
 manifest at all — and both say in as many words that signatures were not checked and why
-(`corpus-governance-unresolvable`).
+(`corpus-governance-unresolvable`). Declaring every signature unverified instead would not be
+noise but a false statement: with no key snapshot and no determinate key-state order, whether
+a signature verifies is not a question the walk answered.
+
+**Reaching either limit never discards what the walk already found.** A corpus whose only
+manifest was excluded for breaking the predecessor rule ends with no manifest — and reports
+*that*, alongside the general answer that no chain remained. Replacing the specific finding
+with the general one would be the same suppression, moved to the last line: the walk knows why
+the chain emptied, and the operator is the one who needs to be told.
 
 `inspect` exits `0` when a dump was produced and `1` when the bytes are present but are not a
 canonical receipt object. `0` there means "the dump exists" and never "the receipt is valid" —

@@ -1205,6 +1205,66 @@ fn row_a_defect_in_the_governance_chain_never_silences_the_rest_of_a_topology_co
 }
 
 #[test]
+fn row_the_reason_a_topology_chain_emptied_is_reported_beside_the_fact_that_it_did() {
+    // The terminal path of the same rule. This corpus's only manifest carries a `predecessor`
+    // the genesis manifest must not have (core §2.3.5, adaptor §7.4.1): it is excluded, and
+    // then no chain remains. Reporting only "the chain does not resolve" would replace a
+    // violation the walk had already established with a general one — the suppression §6
+    // forbids, moved to the last line.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default());
+
+    let producer = ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+    let entries = serde_json::json!([
+        { "entry_index": 0, "envelope": ahl_core::envelope(
+            serde_json::json!({
+                "type": "manifest",
+                "producer": "producer-1",
+                "predecessor": format!("sha256:{}", "aa".repeat(32)),
+                "keys": [ producer.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+            }), &producer) },
+        { "entry_index": 1, "envelope": ahl_core::envelope(
+            serde_json::json!({
+                "type": "retraction", "manifest": "sha256:aa",
+                "dataset": "d", "record": "sha256:bb",
+                "scope": { "effective_from": "2026-01-01T00:00:00Z", "retroactive": true },
+            }), &producer) },
+    ]);
+    let corpus_path = dir.path().join("corpus.json");
+    std::fs::write(&corpus_path, serde_json::to_vec(&entries).expect("serialize"))
+        .expect("write corpus");
+
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--json",
+        "closure",
+        "--unauthenticated",
+        "--corpus",
+        &corpus_path.display().to_string(),
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+        "--trigger-index",
+        "1",
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    let report = run.json();
+    let findings = report["findings"].as_array().expect("findings");
+    let codes: Vec<&str> = findings.iter().filter_map(|f| f["code"].as_str()).collect();
+    assert!(codes.contains(&"governance-element-excluded"), "{codes:?}");
+    assert!(codes.contains(&"corpus-governance-unresolvable"), "{codes:?}");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["detail"].as_str().unwrap_or_default().contains("no predecessor reference")),
+        "the rule that fired must be named: {findings:?}"
+    );
+}
+
+#[test]
 fn row_witness_unreachable_leaves_verify_unchanged() {
     // Reachability is not assurance: `verify` is offline, and no witness endpoint — reachable
     // or not — can change its verdict.

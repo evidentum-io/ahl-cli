@@ -212,9 +212,13 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
     // still walked — so the two cases below are the only ones that leave no key set at all to
     // resolve a signature against, and each is reported in as many words.
     let governance = Governance::structural_only(&corpus.entries);
-    match &governance {
-        Ok((chain, governance_findings)) => {
-            findings.extend(governance_findings.iter().cloned());
+    // Taken unconditionally: a walk that reached a limit still reports what it found before
+    // reaching it. A corpus whose only manifest was excluded for breaking the predecessor rule
+    // has to say *that*, not merely that no chain remained — the general answer alone would
+    // suppress the specific one the walk already established.
+    findings.extend(governance.findings.iter().cloned());
+    match &governance.chain {
+        Ok(chain) => {
             // The manifest side of the same duty. A key object that cannot be read is left out
             // of the key set — reading it leniently would quietly shrink the set a signature
             // resolves against — so topology mode has to be told, and this is the only caller
@@ -317,8 +321,8 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
                 ),
             )),
             Some(_) => {
-                if let Ok((governance, _)) = &governance {
-                    match governance.envelope_verifies_at(envelope, *index) {
+                if let Ok(chain) = &governance.chain {
+                    match chain.envelope_verifies_at(envelope, *index) {
                         Ok(true) => {}
                         Ok(false) => findings.push(Finding::new(
                             "signature-does-not-verify",
@@ -520,7 +524,7 @@ mod tests {
             "the exclusion must name why the binding was refused: {findings:?}"
         );
         // And the attacker's key never reached the key set through it.
-        let (governance, _) = Governance::structural_only(&corpus.entries).expect("chain");
+        let governance = Governance::structural_only(&corpus.entries).chain.expect("chain");
         assert!(!governance.producer_keys_at(2).contains_key(&fake.key_id()));
         assert!(!governance.producer_keys_at(2).contains_key(&attacker.key_id()));
 
@@ -532,6 +536,48 @@ mod tests {
         assert!(
             !codes.contains("corpus-governance-unresolvable"),
             "one bad element must not make the chain unresolvable: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn the_reason_the_chain_emptied_is_reported_beside_the_fact_that_it_did() {
+        // The terminal path. This corpus's only manifest sits at index 0 and carries a
+        // `predecessor` the genesis manifest must not have (core §2.3.5, adaptor §7.4.1). It is
+        // excluded and reported — and then nothing is left to be a chain, which is one of the
+        // two limits this walk still stops at.
+        //
+        // Both answers have to reach the report. Returning only the general one would replace
+        // an established violation with "the chain does not resolve", which is the same
+        // suppression §6 forbids, just moved to the last line: the walk *knows* why no manifest
+        // remained, and the operator is the one who needs to be told.
+        let key = producer();
+        let corpus = corpus_of(&[json!({
+            "entry_index": 0,
+            "envelope": ahl_core::envelope(
+                json!({
+                    "type": "manifest",
+                    "producer": "producer-1",
+                    "predecessor": format!("sha256:{}", "aa".repeat(32)),
+                    "keys": [ key.key_object(0) ],
+                    "log": { "log_id": "sha256:aa", "keys": [] },
+                }),
+                &key,
+            ),
+        })]);
+
+        let findings = walk(&corpus);
+        let codes: BTreeSet<&str> = findings.iter().map(|f| f.code.as_str()).collect();
+        assert!(
+            codes.contains("governance-element-excluded"),
+            "the defect that emptied the chain must be reported: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|f| f.detail.contains("no predecessor reference")),
+            "and it must name the rule that fired: {findings:?}"
+        );
+        assert!(
+            codes.contains("corpus-governance-unresolvable"),
+            "alongside the fact that no chain remained: {findings:?}"
         );
     }
 

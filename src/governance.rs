@@ -72,6 +72,38 @@ use crate::duration::parse_time_only_duration;
 use crate::error::{CliError, CliResult};
 use crate::report::Finding;
 
+/// What a structural walk produced: the chain where one could be built, and — **always** —
+/// every finding raised on the way to that answer.
+///
+/// The findings sit beside the result rather than inside its `Ok` arm, and that placement is
+/// the whole point. A walk can reach a limit that leaves no usable chain *after* it has already
+/// established, and recorded, exactly why: a corpus whose only manifest was excluded for
+/// breaking the predecessor rule ends with no manifest, and the reason it ends that way is a
+/// finding the walk is already holding. Returning it only on success would replace that
+/// specific answer with a general one — "the chain does not resolve" — which is the same
+/// suppression as ending the walk early, moved to the last line.
+///
+/// Design note §6 admits no such gap: in topology mode every violation found while walking is
+/// reported, and nothing about reaching a limit makes the violations found before it less
+/// found.
+#[derive(Debug)]
+pub struct StructuralWalk {
+    /// The chain, or why no usable one remained. See [`Governance::structural_only`] for the
+    /// two conditions that produce an error and why they are not findings.
+    pub chain: CliResult<Governance>,
+    /// Every violation found while walking, whether or not a chain remained.
+    pub findings: Vec<Finding>,
+}
+
+impl StructuralWalk {
+    /// A walk that reached a limit leaving no usable chain, carrying what it had already found.
+    fn halted(detail: &str, mut findings: Vec<Finding>) -> Self {
+        findings.sort();
+        findings.dedup();
+        Self { chain: Err(CliError::RuleFired(detail.to_owned())), findings }
+    }
+}
+
 /// A producer key-set transition, ordered by the entry index that anchored it.
 #[derive(Debug, Clone)]
 struct KeyEvent {
@@ -133,8 +165,15 @@ impl Governance {
     /// signature to be resolved against. The caller reports both — see [`crate::corpus::walk`],
     /// which says in as many words that signatures were not checked and why, rather than
     /// emitting a `signature-does-not-verify` for every entry whose real cause is the absent
-    /// chain.
-    pub fn structural_only(entries: &[(u64, Value)]) -> CliResult<(Self, Vec<Finding>)> {
+    /// chain. Declaring every signature unverified there would not be noise but a false
+    /// statement: with no key snapshot (core §7.2) and no determinate key-state order, whether
+    /// a signature verifies is not a question this walk answered.
+    ///
+    /// **Reaching either limit never discards what the walk already found.** Both are returned
+    /// through [`StructuralWalk`], whose findings are populated on the error path exactly as on
+    /// the success path — a corpus whose only manifest was excluded for breaking the
+    /// predecessor rule reports *that*, alongside the general answer that no chain remained.
+    pub fn structural_only(entries: &[(u64, Value)]) -> StructuralWalk {
         let mut manifests: Vec<(u64, Value)> = Vec::new();
         let mut events: Vec<KeyEvent> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
@@ -154,11 +193,11 @@ impl Governance {
 
         for (index, envelope) in entries {
             if previous_index.is_some_and(|previous| previous >= *index) {
-                return Err(CliError::RuleFired(
+                return StructuralWalk::halted(
                     "entries must ascend by entry index; the entry index is AHL's only \
-                     ordering primitive"
-                        .to_owned(),
-                ));
+                     ordering primitive",
+                    findings,
+                );
             }
             previous_index = Some(*index);
 
@@ -211,15 +250,15 @@ impl Governance {
         }
 
         if manifests.is_empty() {
-            return Err(CliError::RuleFired(
+            return StructuralWalk::halted(
                 "no manifest statement is anchored; a corpus always contains at least its \
-                 genesis manifest"
-                    .to_owned(),
-            ));
+                 genesis manifest",
+                findings,
+            );
         }
         findings.sort();
         findings.dedup();
-        Ok((Self { manifests, events }, findings))
+        StructuralWalk { chain: Ok(Self { manifests, events }), findings }
     }
 
     /// Resolve governance **incrementally**, per adaptor §7.4.1.
@@ -1050,12 +1089,12 @@ mod tests {
 
     /// The structural chain alone, for the many tests that only read a key set from it.
     fn structural(entries: &[(u64, Value)]) -> Governance {
-        Governance::structural_only(entries).expect("chain").0
+        Governance::structural_only(entries).chain.expect("chain")
     }
 
-    /// The findings a structural walk raised over `entries`.
+    /// The findings a structural walk raised over `entries`, whichever way it ended.
     fn structural_findings(entries: &[(u64, Value)]) -> Vec<Finding> {
-        Governance::structural_only(entries).expect("chain").1
+        Governance::structural_only(entries).findings
     }
 
     /// A `sha256:` family string, which core §7.3 requires of `log_id` and every `key_id`.
@@ -1153,7 +1192,7 @@ mod tests {
             }),
             &key,
         );
-        assert!(Governance::structural_only(&[(0, first.clone()), (5, good)]).is_ok());
+        assert!(Governance::structural_only(&[(0, first.clone()), (5, good)]).chain.is_ok());
 
         let wrong = ahl_core::envelope(
             json!({
@@ -1179,9 +1218,42 @@ mod tests {
         );
         // Excluded and reported, so the corpus's remaining entries are still walked — and with
         // the only manifest excluded there is no chain left to resolve against, which the
-        // caller reports in as many words.
-        let error = Governance::structural_only(&[(0, envelope)]).expect_err("no manifest is left");
+        // caller reports in as many words. Both answers come back: the specific defect that
+        // emptied the chain, and the general fact that nothing usable remained. Replacing the
+        // first with the second would suppress a violation the walk had already established —
+        // the same fault as ending the walk early, moved to the last line.
+        let walk = Governance::structural_only(&[(0, envelope)]);
+        let error = walk.chain.expect_err("no manifest is left");
         assert!(error.to_string().contains("no manifest statement is anchored"), "{error}");
+        assert!(
+            walk.findings.iter().any(|f| f.code == "governance-element-excluded"),
+            "the reason the chain emptied must survive the limit: {:?}",
+            walk.findings
+        );
+        assert!(
+            walk.findings.iter().any(|f| f.detail.contains("no predecessor reference")),
+            "and it must still name the rule that fired: {:?}",
+            walk.findings
+        );
+    }
+
+    #[test]
+    fn findings_survive_the_ordering_limit_as_well_as_the_no_manifest_one() {
+        // The second held error path. It can be reached after exclusions in exactly the same
+        // way, so it has to carry what was already found for exactly the same reason.
+        // (`corpus::load` sorts and de-duplicates before `walk` sees a corpus, so this limit is
+        // reachable only through this module's own API — which is why it is pinned here rather
+        // than through the binary.)
+        let broken = json!({ "signatures": [] });
+        let entries = vec![(0, broken), (7, genesis("log_id")), (3, genesis("log_id"))];
+        let walk = Governance::structural_only(&entries);
+        let error = walk.chain.expect_err("indexes do not ascend");
+        assert!(error.to_string().contains("must ascend by entry index"), "{error}");
+        assert!(
+            walk.findings.iter().any(|f| f.code == "governance-element-excluded"),
+            "the exclusion found before the limit must survive it: {:?}",
+            walk.findings
+        );
     }
 
     #[test]
@@ -1351,11 +1423,11 @@ mod tests {
     #[test]
     fn entries_must_ascend_and_a_corpus_must_carry_a_manifest() {
         let entries = vec![(5, genesis("log_id")), (1, genesis("log_id"))];
-        assert!(Governance::structural_only(&entries).is_err());
+        assert!(Governance::structural_only(&entries).chain.is_err());
 
         let key = producer(1);
         let ingestion = ahl_core::envelope(json!({ "type": "ingestion" }), &key);
-        assert!(Governance::structural_only(&[(0, ingestion)]).is_err());
+        assert!(Governance::structural_only(&[(0, ingestion)]).chain.is_err());
     }
 
     #[test]
@@ -1363,7 +1435,8 @@ mod tests {
         // Each is excluded and reported rather than ending the walk; with nothing else in the
         // corpus, what remains is a chain with no manifest, which the caller reports.
         for broken in [json!({ "signatures": [] }), json!({ "payload": { "a": 1 } })] {
-            let error = Governance::structural_only(&[(0, broken)]).expect_err("nothing usable");
+            let error =
+                Governance::structural_only(&[(0, broken)]).chain.expect_err("nothing usable");
             assert!(error.to_string().contains("no manifest statement is anchored"), "{error}");
         }
         let findings = structural_findings(&[(0, genesis("log_id")), (1, json!({ "a": 1 }))]);
