@@ -29,7 +29,7 @@ use crate::report::Finding;
 use crate::secure;
 
 /// The seven statement types (core spec §2.2).
-const STATEMENT_TYPES: [&str; 7] =
+pub const STATEMENT_TYPES: [&str; 7] =
     ["ingestion", "derivation", "retraction", "correction", "propagation", "manifest", "key"];
 
 /// A loaded corpus: entries in ascending entry-index order.

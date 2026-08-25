@@ -240,7 +240,213 @@ fn row_equivocation_at_or_beyond_the_floor_is_invalid() {
     assert_eq!(run.json()["reason_code"], "equivocation-at-or-beyond-floor");
 }
 
+#[test]
+fn row_an_anchored_statement_of_an_unknown_type_is_invalid_never_inert() {
+    // §6: "Unknown claim type or unknown statement type, authenticated mode | 1 — never
+    // skipped, never inert." The transcript anchors a correctly signed statement whose type
+    // core §2.3 does not define, committed by the checkpoint the run is grounded on.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-unknown-statement.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "33",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "rule-fired");
+    assert!(run.output().contains("attestation"), "{}", run.output());
+
+    // A checkpoint that does not commit it is unaffected.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-unknown-statement.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
+fn row_series_order_decides_the_selection_so_a_divergence_reaches_its_own_row() {
+    // Core §7.3 orders a series by `(tree_size, checkpoint_time)`. The mirror here serves the
+    // diverging member **first in the array** while giving it a later time, so a client that
+    // takes whichever member came first would ground itself on the branch whose root nothing
+    // recomputes and answer a divergence with `3` — "evidence not obtained" — instead of the
+    // `1` the divergence supports.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let transcript = mutate_transcript(
+        dir.path(),
+        "mirror-transcript-equivocating.json",
+        "divergent-served-first.json",
+        |value| {
+            for exchange in value["exchanges"].as_array_mut().expect("array") {
+                if exchange["url"].as_str().unwrap_or_default().ends_with("/v1/checkpoints") {
+                    let mut body = exchange_body(exchange);
+                    let members = body.as_array_mut().expect("series");
+                    let at = members
+                        .iter()
+                        .position(|member| {
+                            member["tree_size"] == 13
+                                && member["checkpoint_time"] != serde_json::json!(FIXED)
+                        })
+                        .expect("the divergent member is in the recorded series");
+                    let divergent = members.remove(at);
+                    members.insert(0, divergent);
+                    set_exchange_body(exchange, &body);
+                }
+            }
+        },
+    );
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &transcript.display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "13",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "equivocation-at-or-beyond-floor");
+}
+
 // --- exit 3: required evidence could not be established ---------------------------------
+
+#[test]
+fn row_a_predecessor_that_was_published_but_not_authenticated_is_never_a_complete_answer() {
+    // Design note §3 item 3 requires the predecessor relationship always. Adaptor §5.2.2 item
+    // 3 exempts one member — the earliest the deployment published — and nothing else. Here
+    // tree_size 8 was published but is signed by a key no manifest version declares, so the
+    // predecessor relationship for tree_size 13 could not be verified: `3` with the missing
+    // element named, never `0` with a finding attached.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript-foreign-key.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "13",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert_eq!(run.json()["reason_code"], "evidence-missing");
+    assert!(run.output().contains("predecessor relationship"), "{}", run.output());
+    assert_ne!(run.json()["completeness"], "complete");
+
+    // The exemption still applies where it belongs: on the honest transcript tree_size 8 is
+    // the earliest published member, and the run completes with the gap named.
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &fixtures().join("mirror-transcript.json").display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "8",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    let codes: Vec<String> = run.json()["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|finding| finding["code"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(codes.iter().any(|code| code == "series-predecessor-unpublished"), "{codes:?}");
+}
+
+#[test]
+fn row_a_consistency_proof_carrying_a_non_family_string_is_unusable_remote_evidence() {
+    // Adaptor §8.3: a consistency proof is a JSON array of `sha256:<hex>` family strings and
+    // nothing else. The element added here is one a lenient reader would drop — leaving a
+    // proof that verifies, and certifying the neighbour relationship on a proof the mirror
+    // never served. Any departure from the serialization makes the remote evidence unusable.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::networked_policy(dir.path());
+    let transcript = mutate_transcript(
+        dir.path(),
+        "mirror-transcript.json",
+        "consistency-with-a-non-string.json",
+        |value| {
+            let mut touched = false;
+            for exchange in value["exchanges"].as_array_mut().expect("array") {
+                if exchange["url"].as_str().unwrap_or_default().contains("/v1/consistency") {
+                    let mut body = exchange_body(exchange);
+                    let path = body["consistency_path"].as_array_mut().expect("path");
+                    if path.is_empty() {
+                        continue;
+                    }
+                    path.push(serde_json::json!(42));
+                    set_exchange_body(exchange, &body);
+                    touched = true;
+                }
+            }
+            assert!(touched, "no non-empty consistency proof was recorded to mutate");
+        },
+    );
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--transcript",
+        &transcript.display().to_string(),
+        "--json",
+        "closure",
+        "--trigger-index",
+        "6",
+        "--checkpoint",
+        "13",
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    assert!(run.output().contains("is not a string"), "{}", run.output());
+}
 
 #[test]
 fn row_unsupported_specification_version_is_unverifiable() {

@@ -34,6 +34,10 @@ fn index() -> serde_json::Value {
         .expect("index parses")
 }
 
+/// Corpus vectors marked `reject` whose §6 outcome is `3` rather than `1`.
+const REFUSED_AS_UNVERIFIABLE: [&str; 1] =
+    ["trigger-effective-enumerated-with-later-checkpoint-must-fail.ahl"];
+
 #[test]
 fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -72,8 +76,18 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
                 );
             }
             "reject" => {
-                assert_eq!(run.code, 1, "{file}: {}", report["reason"]);
-                assert_eq!(report["status"], "invalid", "{file}");
+                // The corpus index records *that* a receipt must be refused, never which of
+                // the four outcomes the refusal carries: that mapping is the design note's §6
+                // table and lives in this crate. A `FormatConflict` names a combination the
+                // frozen container format defines no material to evidence, so the receipt is
+                // well-formed with nothing disproved — `3`, not `1`.
+                let (code, status) = if REFUSED_AS_UNVERIFIABLE.contains(&file) {
+                    (3, "unverifiable")
+                } else {
+                    (1, "invalid")
+                };
+                assert_eq!(run.code, code, "{file}: {}", report["reason"]);
+                assert_eq!(report["status"], status, "{file}");
                 let expected = vector["reason"].as_str().expect("reason");
                 assert!(
                     report["reason"].as_str().unwrap_or_default().contains(expected),

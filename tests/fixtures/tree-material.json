@@ -1,42 +1,4 @@
 {
-  "sha256:1f742e79cbca94e9b18426e526b62bd417cedcc4e16b5c08ed7342bab940b50a": [
-    {
-      "dataset": "customers",
-      "record": "hmac-sha256:04de2effaa7ad9f21761b7338449a4aba8c9edb59a90fd96236c31fdcd8ab46d",
-      "role": "reference",
-      "statement": "sha256:8f081c6677a9176b80ec7097f2fcf771dca9b9851dda4e8ce17681dfdc14bb5e"
-    },
-    {
-      "dataset": "customers",
-      "record": "hmac-sha256:a2d4ab5d728fa03cd366fac0f6b4d65c419c353f56521302926604f11d3471c1",
-      "role": "feature",
-      "statement": "sha256:d9e0d277319b91188f16ab25b6d1f1410e218688e68dad43d6b59dc2fef7165d"
-    },
-    {
-      "dataset": "scores",
-      "record": "sha256:8465148cf16c5b91c0e6001f3e3a985ae456890500745f5893a60c0692bb1d7c",
-      "role": "feature",
-      "statement": "sha256:670d1d2ad6f994e2147a857a4c4756136dd7ef5c55c33ab061a285c40ab74188"
-    }
-  ],
-  "sha256:42510ff49b2a7613c4370da700fc0d0932967aa542311dd85ea5ced92b2006c2": [
-    {
-      "dataset": "scores",
-      "inputs": {
-        "input_set_count": 3,
-        "input_set_root": "sha256:1f742e79cbca94e9b18426e526b62bd417cedcc4e16b5c08ed7342bab940b50a"
-      },
-      "record": "sha256:2fa4f863cc3d704bd6db36bcb152e8fbbc3773cc36f5594074cecd9c016916b0"
-    },
-    {
-      "dataset": "scores",
-      "inputs": {
-        "input_set_count": 3,
-        "input_set_root": "sha256:1f742e79cbca94e9b18426e526b62bd417cedcc4e16b5c08ed7342bab940b50a"
-      },
-      "record": "sha256:5929597d694c6d57301d1d81edac6047f0676abc36fc7560d6ce0b74e5bd777c"
-    }
-  ],
   "sha256:5a40fa564bc4d3d9d87ef1a09b0187ae44bbe919ef6abaa6fc1274d937f0f7d6": [
     {
       "dataset": "scores",
@@ -44,7 +6,7 @@
       "record": "sha256:a37addcc94a342604dc765939fb85c71dd0f21a1906bbf62d64a77f4cb25e233"
     }
   ],
-  "sha256:89a5a22bd510168a1fbbbea50d506bf2808e4cc2e7c870dd2a8bad62c1e44810": [
+  "sha256:666457c5534dfcb45502fec62fa5387a462f32ebd773946f39d55c3dad26a800": [
     {
       "dataset": "scores",
       "inputs": [
@@ -52,7 +14,7 @@
           "dataset": "customers",
           "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
           "role": "feature",
-          "statement": "sha256:be698a0ade3b810614ecea0b6315162c945b6dee5143fc6ed31d98b2aee7040e"
+          "statement": "sha256:3916846c8f66b21eecd0c0b625558e0c32dc1ab45b185ca96aeea95fc32373cc"
         }
       ],
       "record": "sha256:250be06f68500436146b6cd0da75987c8eb1902e1ee650d52d4e368c8dabcdf5"
@@ -64,7 +26,7 @@
           "dataset": "customers",
           "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
           "role": "feature",
-          "statement": "sha256:be698a0ade3b810614ecea0b6315162c945b6dee5143fc6ed31d98b2aee7040e"
+          "statement": "sha256:3916846c8f66b21eecd0c0b625558e0c32dc1ab45b185ca96aeea95fc32373cc"
         }
       ],
       "record": "sha256:54805948541052fc8111ac220cbdd5bcb3892e9899ffb96697b76aa7b7d42798"
@@ -76,13 +38,33 @@
           "dataset": "customers",
           "record": "hmac-sha256:d45b7c71b3822609907522286467cc2ddceb40a77176282b31e9c81296840510",
           "role": "feature",
-          "statement": "sha256:be698a0ade3b810614ecea0b6315162c945b6dee5143fc6ed31d98b2aee7040e"
+          "statement": "sha256:3916846c8f66b21eecd0c0b625558e0c32dc1ab45b185ca96aeea95fc32373cc"
         }
       ],
       "record": "sha256:df31b93a28e3de74b910bd72977edd310e9d4dfd2c8e66d38eab5c7303d6abfe"
     }
   ],
-  "sha256:eb6da6570de702b79826d40d0e1db00a16c6f78b03ee9750d7205b85b87a3191": [
+  "sha256:6a6bee080dc4aeceab8ad96144f33f8968e2d62f250c598cfb5c4dd896eac490": [
+    {
+      "dataset": "customers",
+      "record": "hmac-sha256:04de2effaa7ad9f21761b7338449a4aba8c9edb59a90fd96236c31fdcd8ab46d",
+      "role": "reference",
+      "statement": "sha256:ac1d89dd26702f442ea58aa81e9c9e769a4e38e8d581d06a9423cfb050fff4db"
+    },
+    {
+      "dataset": "customers",
+      "record": "hmac-sha256:a2d4ab5d728fa03cd366fac0f6b4d65c419c353f56521302926604f11d3471c1",
+      "role": "feature",
+      "statement": "sha256:fc391aff2b5bc3856e6fa27658fdceb108b4aa0893ee4512257942909a055abd"
+    },
+    {
+      "dataset": "scores",
+      "record": "sha256:8465148cf16c5b91c0e6001f3e3a985ae456890500745f5893a60c0692bb1d7c",
+      "role": "feature",
+      "statement": "sha256:bffd19a6fd251101b5cd6e4daa4e1565c17857b7aa669ebb4c1787d1a42178b9"
+    }
+  ],
+  "sha256:94b48b18df843579880732f3cc9134340cff2227ddba0c98b6f82afabae2c9e9": [
     {
       "assessment": "sha256:81af6cfe105fb10380549c7290b09c7910c90cd3e860777ab7bbccc5b91be396",
       "dataset": "scores",
@@ -98,12 +80,30 @@
       "dataset": "scores",
       "disposition": "recomputed",
       "record": "sha256:7f706bff69ab07703a27a6770f401c2b302e9bca264129e57d517a10a54f25d1",
-      "successor_statement": "sha256:670d1d2ad6f994e2147a857a4c4756136dd7ef5c55c33ab061a285c40ab74188"
+      "successor_statement": "sha256:bffd19a6fd251101b5cd6e4daa4e1565c17857b7aa669ebb4c1787d1a42178b9"
     },
     {
       "dataset": "scores",
       "disposition": "invalidated",
       "record": "sha256:df31b93a28e3de74b910bd72977edd310e9d4dfd2c8e66d38eab5c7303d6abfe"
+    }
+  ],
+  "sha256:fb14f50abdd051197226ae085815f23d0893f38f7c8c25b5cd7adb8612e7f786": [
+    {
+      "dataset": "scores",
+      "inputs": {
+        "input_set_count": 3,
+        "input_set_root": "sha256:6a6bee080dc4aeceab8ad96144f33f8968e2d62f250c598cfb5c4dd896eac490"
+      },
+      "record": "sha256:2fa4f863cc3d704bd6db36bcb152e8fbbc3773cc36f5594074cecd9c016916b0"
+    },
+    {
+      "dataset": "scores",
+      "inputs": {
+        "input_set_count": 3,
+        "input_set_root": "sha256:6a6bee080dc4aeceab8ad96144f33f8968e2d62f250c598cfb5c4dd896eac490"
+      },
+      "record": "sha256:5929597d694c6d57301d1d81edac6047f0676abc36fc7560d6ce0b74e5bd777c"
     }
   ]
 }

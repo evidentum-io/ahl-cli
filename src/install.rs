@@ -99,15 +99,83 @@ impl Dir {
         Ok(Self { fd, path: path.to_path_buf() })
     }
 
-    /// Create the directory (and its parents) if needed, then open it.
+    /// Create the directory (and its parents) if needed, and return a handle to it, resolving
+    /// each component **once**, relative to the handle of its parent.
+    ///
+    /// Creating by path and then opening by path is two independent resolutions of the same
+    /// name, and the gap between them is a race: whatever the second resolution lands on need
+    /// not be what the first one made. `create_dir_all` followed by an `open` therefore hands
+    /// back a handle to a directory nobody checked was the one just created — and every
+    /// handle-relative guarantee the rest of this module provides is anchored on that handle.
+    ///
+    /// So the walk is handle-relative from the start: `mkdirat` under the parent handle (an
+    /// existing entry is the normal case and not an error), then `openat` under the same
+    /// handle, and the type of what was opened is checked on the resulting descriptor. Each
+    /// name is resolved exactly once, against a directory this process already holds open, so
+    /// no component of the path can be swapped for a different one between the two calls.
+    ///
+    /// The **final** component is opened `O_NOFOLLOW`, matching [`Self::open`]: the directory
+    /// every subsequent write lands in is never reached through a symlink. Intermediate
+    /// components are followed, because they routinely are symlinks on healthy systems — a
+    /// platform temporary directory commonly sits behind one — and refusing them would fail
+    /// closed on ordinary configurations rather than on hostile ones.
+    ///
+    /// Directories are created owner-only, on the same reasoning as the `0600` temporaries
+    /// below: nothing here is written for another user to read.
     ///
     /// # Errors
     ///
-    /// [`CliError::Output`] if it cannot be created or opened.
+    /// [`CliError::Output`] if any component cannot be created or opened, or if what was
+    /// opened is not a directory.
     pub fn create(path: &Path) -> CliResult<Self> {
-        std::fs::create_dir_all(path)
-            .map_err(|source| output_error(path, format!("cannot create directory: {source}")))?;
-        Self::open(path)
+        use std::path::Component;
+
+        let anchor = if path.is_absolute() { "/" } else { "." };
+        let mut fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            anchor,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|errno| output_error(path, format!("cannot open `{anchor}`: {errno}")))?;
+
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let name: &OsStr = match component {
+                // Already consumed by the anchor above, or a no-op step.
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => continue,
+                Component::ParentDir => OsStr::new(".."),
+                Component::Normal(name) => name,
+            };
+            let last = components.peek().is_none();
+
+            match rustix::fs::mkdirat(&fd, name, Mode::RWXU) {
+                // An existing directory is the ordinary case, not a failure.
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(errno) => {
+                    return Err(output_error(
+                        path,
+                        format!("cannot create `{}`: {errno}", name.to_string_lossy()),
+                    ))
+                }
+            }
+
+            let mut flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            if last {
+                flags |= OFlags::NOFOLLOW;
+            }
+            fd = rustix::fs::openat(&fd, name, flags, Mode::empty()).map_err(|errno| {
+                output_error(path, format!("cannot open `{}`: {errno}", name.to_string_lossy()))
+            })?;
+        }
+
+        // Checked on the handle, never by path — the same rule as `open`.
+        let stat = rustix::fs::fstat(&fd)
+            .map_err(|errno| output_error(path, format!("cannot stat directory: {errno}")))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(output_error(path, "path is not a directory"));
+        }
+        Ok(Self { fd, path: path.to_path_buf() })
     }
 
     /// The path this handle was opened from, for messages.
@@ -310,6 +378,7 @@ pub fn install(path: &Path, bytes: &[u8], force: Force) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
@@ -464,5 +533,74 @@ mod tests {
         std::fs::write(&file, b"x").expect("write");
         assert!(Dir::create(&file.join("cache")).is_err());
         assert!(Dir::open(&file).is_err());
+    }
+
+    #[test]
+    fn every_component_create_makes_is_created_by_this_module_and_is_owner_only() {
+        // The directories are created here, component by component under a handle this process
+        // already holds — not by a path-based helper that resolves the whole name once to
+        // create it and a second time to open it, leaving a window in which the two need not
+        // land on the same directory. The mode is the visible half of that: 0700 is what
+        // `mkdirat` is asked for here, where a path-based create would leave whatever the
+        // process umask happens to allow.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deep = dir.path().join("a").join("b").join("c");
+        let handle = Dir::create(&deep).expect("created");
+
+        for level in [dir.path().join("a"), dir.path().join("a").join("b"), deep.clone()] {
+            let mode = std::fs::metadata(&level).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} is not owner-only: {mode:o}", level.display());
+        }
+
+        // And the handle is usable: writes land inside the directory that was created.
+        handle.install(OsStr::new("entry"), b"payload", Force::No).expect("install");
+        assert_eq!(std::fs::read(deep.join("entry")).expect("read"), b"payload");
+
+        // Creating it again is idempotent and yields a handle to the same directory.
+        let again = Dir::create(&deep).expect("already there");
+        assert_eq!(again.read(OsStr::new("entry"), 64).as_deref(), Some(&b"payload"[..]));
+    }
+
+    #[test]
+    fn create_refuses_a_symlinked_final_component_and_follows_an_intermediate_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+
+        // The directory every later write lands in is never reached through a symlink.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(Dir::create(&link).is_err(), "a symlinked final component must be refused");
+
+        // An intermediate one is followed, deliberately: platform temporary directories
+        // routinely sit behind a symlink, and refusing those would fail closed on ordinary
+        // configurations rather than on hostile ones.
+        let handle = Dir::create(&link.join("under")).expect("intermediate symlinks are followed");
+        handle.install(OsStr::new("entry"), b"payload", Force::No).expect("install");
+        assert_eq!(std::fs::read(real.join("under").join("entry")).expect("read"), b"payload");
+    }
+
+    #[test]
+    fn a_component_that_cannot_be_created_is_named_rather_than_reported_as_a_missing_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let closed = dir.path().join("closed");
+        std::fs::create_dir(&closed).expect("mkdir");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o500)).expect("mode");
+
+        let error = Dir::create(&closed.join("under")).expect_err("no write permission");
+        assert!(error.to_string().contains("cannot create `under`"), "{error}");
+
+        // Restored so the temporary directory can be cleaned up.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+
+    #[test]
+    fn a_relative_path_is_created_and_opened_the_same_way() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `.` and `..` steps are ordinary components of the walk, not special cases.
+        let path = dir.path().join("x").join(".").join("..").join("y");
+        let handle = Dir::create(&path).expect("created");
+        handle.install(OsStr::new("entry"), b"payload", Force::No).expect("install");
+        assert_eq!(std::fs::read(dir.path().join("y").join("entry")).expect("read"), b"payload");
     }
 }

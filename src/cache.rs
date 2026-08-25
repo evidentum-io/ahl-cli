@@ -34,6 +34,20 @@
 //! * the store is bounded by a byte quota and evicts least-recently-used, so a long
 //!   enumeration cannot fill the disk.
 //!
+//! # Storing is a separate verb from fetching, and that is what makes the retry honest
+//!
+//! [`Caching::fetch`] never writes. A response reaches the store only through
+//! [`Caching::store`], which [`crate::net::fetch_revalidating`] calls **after** the caller's
+//! own proof checks have accepted it.
+//!
+//! The rule the split enforces is that a request is repeated only when the answer it refused
+//! really came out of the cache. Writing a live answer the moment it arrived would file bytes
+//! nobody had verified under the request key; the eviction that follows a refusal would then
+//! report `true`, and the caller would go back to a live endpoint that had simply answered
+//! badly — a repeat request earned by a cache entry the same run had just manufactured. With
+//! nothing stored until it verifies, an eviction can only ever have removed a genuinely cached
+//! answer, and a broken server is reported rather than hammered.
+//!
 //! # Writes
 //!
 //! Every write goes through [`crate::install::Dir`]: handle-relative, `O_NOFOLLOW`, an
@@ -225,20 +239,31 @@ impl<F: Fetcher> Fetcher for Caching<F> {
             // `invalidate` if they fail, so this cannot decide what is accepted.
             return Ok(Response { status: 200, body: bytes });
         }
-        let response = self.inner.fetch(request)?;
-        if response.status == 200 {
-            // A cache write failure is not a verification failure: the operation continues
-            // with the bytes it already has.
-            let _ = self.cache.put(key, &response.body);
-        }
-        Ok(response)
+        // A live answer is **not** written here. Storing it before the caller has verified it
+        // would file rejected bytes under the request key, and the eviction that follows would
+        // then report `true` — telling `fetch_revalidating` that the answer it just refused had
+        // come from the cache, and earning a repeat request no cached answer ever justified.
+        // The write happens in `store`, after verification.
+        self.inner.fetch(request)
     }
 
     fn invalidate(&self, request: &Request) -> bool {
         // Only a genuine eviction reports `true`: that is what stops a caller from retrying a
-        // live endpoint that simply answered badly.
+        // live endpoint that simply answered badly. Since nothing is stored until it has
+        // verified, `true` here means the refused answer really was a cached one.
         request.cache_key.as_deref().is_some_and(|key| self.cache.evict(key))
             || self.inner.invalidate(request)
+    }
+
+    fn store(&self, request: &Request, response: &Response) {
+        let Some(key) = request.cache_key.as_deref() else { return };
+        if response.status != 200 {
+            return;
+        }
+        // A cache write failure is not a verification failure: the operation continues with
+        // the bytes it already has.
+        let _ = self.cache.put(key, &response.body);
+        self.inner.store(request, response);
     }
 }
 
@@ -309,7 +334,12 @@ mod tests {
         let caching = Caching::new(Counting::new(b"payload"), cache);
         let request = Request::get("https://m/v1/x").cached_under("k1");
 
-        assert_eq!(caching.fetch(&request).expect("cold").body, b"payload");
+        // The cold answer reaches the cache when the caller accepts it, never before.
+        let cold = caching.fetch(&request).expect("cold");
+        assert_eq!(cold.body, b"payload");
+        assert!(caching.cache().get("k1").is_none(), "a fetch alone stores nothing");
+        caching.store(&request, &cold);
+
         assert_eq!(caching.fetch(&request).expect("warm").body, b"payload");
         assert_eq!(caching.inner.calls(), 1, "the warm read must not reach the network");
     }
@@ -334,7 +364,8 @@ mod tests {
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
         let caching = Caching::new(Counting::new(b"payload"), cache);
         let request = Request::get("https://m/v1/x").cached_under("k1");
-        let _ = caching.fetch(&request).expect("cold");
+        let cold = caching.fetch(&request).expect("cold");
+        caching.store(&request, &cold);
 
         // Bytes that no longer hash to the digest they are filed under: storage corruption,
         // caught by the integrity check.
@@ -355,6 +386,10 @@ mod tests {
         assert_eq!(cache.get(key).as_deref(), Some(bytes), "the plant must look genuine");
     }
 
+    fn rejecting() -> impl Fn(&Response) -> CliResult<Vec<u8>> {
+        |_: &Response| Err(CliError::EvidenceMissing("did not verify".to_owned()))
+    }
+
     #[test]
     fn a_semantically_wrong_but_digest_consistent_object_is_evicted_and_refetched_once() {
         // The heart of the §5 invariant. The digest check cannot catch this — the bytes hash
@@ -366,9 +401,9 @@ mod tests {
         let request = Request::get("https://m/v1/x").cached_under("k1");
         plant(caching.cache(), "k1", b"attacker-controlled");
 
-        let verify = |response: Response| -> CliResult<Vec<u8>> {
+        let verify = |response: &Response| -> CliResult<Vec<u8>> {
             if response.body == b"genuine" {
-                Ok(response.body)
+                Ok(response.body.clone())
             } else {
                 Err(CliError::EvidenceMissing("did not verify".to_owned()))
             }
@@ -376,6 +411,8 @@ mod tests {
         let value = fetch_revalidating(&caching, &request, verify).expect("revalidated");
         assert_eq!(value, b"genuine", "the cold answer must survive a poisoned cache");
         assert_eq!(caching.inner.calls(), 1, "evicted and refetched exactly once");
+        // And the answer that verified is the one now on disk.
+        assert_eq!(caching.cache().get("k1").as_deref(), Some(&b"genuine"[..]));
     }
 
     #[test]
@@ -386,24 +423,66 @@ mod tests {
         let request = Request::get("https://m/v1/x").cached_under("k1");
         plant(caching.cache(), "k1", b"attacker-controlled");
 
-        let verify = |_: Response| -> CliResult<Vec<u8>> {
-            Err(CliError::EvidenceMissing("never verifies".to_owned()))
-        };
-        let error = fetch_revalidating(&caching, &request, verify).expect_err("reported");
-        assert!(error.to_string().contains("never verifies"), "{error}");
+        let error = fetch_revalidating(&caching, &request, rejecting()).expect_err("reported");
+        assert!(error.to_string().contains("did not verify"), "{error}");
         assert_eq!(caching.inner.calls(), 1, "exactly one refetch, then reported");
     }
 
     #[test]
-    fn a_live_endpoint_answering_badly_is_reported_without_a_retry() {
-        // Nothing was evicted, so there is nothing to retry: a broken server is reported, not
-        // hammered.
+    fn a_live_answer_that_is_refused_is_never_cached_and_never_earns_a_repeat_request() {
+        // The invariant: a repeat request is earned only by an answer that really came out of
+        // the cache. A live answer written to the cache *before* the caller verified it would
+        // make the eviction that follows report `true`, and `fetch_revalidating` would go back
+        // to a live endpoint that had simply answered badly — the request repeated on the
+        // strength of a cache entry this run had just manufactured.
+        //
+        // The request carries a cache key and the cache is real, so nothing about this test is
+        // vacuous: with an eager write it fails on the call count, and it fails again on the
+        // cache holding bytes that never verified.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
+        let caching = Caching::new(Counting::new(b"wrong"), cache);
+        let request = Request::get("https://m/v1/x").cached_under("k1");
+        assert!(caching.cache().get("k1").is_none(), "the cache starts cold");
+
+        let error = fetch_revalidating(&caching, &request, rejecting()).expect_err("reported");
+        assert!(error.to_string().contains("did not verify"), "{error}");
+        assert_eq!(
+            caching.inner.calls(),
+            1,
+            "a broken server is reported, not hammered: nothing came from the cache, so \
+             nothing was evicted and no repeat request was earned"
+        );
+        assert!(
+            caching.cache().get("k1").is_none(),
+            "bytes the caller refused must never be filed under the request key"
+        );
+        assert!(!caching.invalidate(&request), "there was nothing to evict");
+    }
+
+    #[test]
+    fn a_verified_answer_is_what_the_cache_comes_to_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
+        let caching = Caching::new(Counting::new(b"genuine"), cache);
+        let request = Request::get("https://m/v1/x").cached_under("k1");
+
+        let accept = |response: &Response| -> CliResult<Vec<u8>> { Ok(response.body.clone()) };
+        assert_eq!(fetch_revalidating(&caching, &request, accept).expect("verified"), b"genuine");
+        assert_eq!(caching.cache().get("k1").as_deref(), Some(&b"genuine"[..]));
+
+        // Warm: served from the cache, no second call.
+        assert_eq!(fetch_revalidating(&caching, &request, accept).expect("warm"), b"genuine");
+        assert_eq!(caching.inner.calls(), 1);
+    }
+
+    #[test]
+    fn a_fetcher_with_no_cache_never_reports_an_eviction_or_stores_anything() {
         let counting = Counting::new(b"wrong");
         let request = Request::get("https://m/v1/x");
-        let verify =
-            |_: Response| -> CliResult<Vec<u8>> { Err(CliError::EvidenceMissing("no".to_owned())) };
-        assert!(fetch_revalidating(&counting, &request, verify).is_err());
+        assert!(fetch_revalidating(&counting, &request, rejecting()).is_err());
         assert_eq!(counting.calls(), 1);
+        counting.store(&request, &Response { status: 200, body: b"x".to_vec() });
     }
 
     #[test]
@@ -462,7 +541,10 @@ mod tests {
         let cache = Cache::open(dir.path(), 1 << 20).expect("open cache");
         let caching = Caching::new(NotFound, cache);
         let request = Request::get("https://m/v1/x").cached_under("k1");
-        assert_eq!(caching.fetch(&request).expect("404").status, 404);
+        let response = caching.fetch(&request).expect("404");
+        assert_eq!(response.status, 404);
+        // Even offered explicitly, a non-200 is never filed.
+        caching.store(&request, &response);
         assert!(caching.cache().get("k1").is_none());
     }
 

@@ -44,7 +44,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use crate::cache;
-use crate::checkpoint::{consistency_verifies, equivocation_floor, Checkpoint, SigningForm};
+use crate::checkpoint::{
+    consistency_verifies, equivocation_floor, series_order_key, Checkpoint, SigningForm,
+};
 use crate::enumerate::{Enumerator, LeafForm};
 use crate::error::{CliError, CliResult};
 use crate::governance::Governance;
@@ -136,7 +138,18 @@ impl Statements {
     }
 
     /// Build the view from an enumeration, applying both rules above.
-    fn build(entries: &[(u64, Value)], governance: &Governance) -> (Self, Vec<Finding>) {
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::RuleFired`] when an anchored **statement** declares a type outside core
+    /// §2.3's seven. Design note §6 fixes that row at outcome `1` in authenticated mode —
+    /// "never skipped, never inert" — and the reason is the one that makes a verifier useful:
+    /// an unknown type may carry edges, authority or scope this build cannot read, so treating
+    /// it as contributing nothing is the CLI silently deciding it contributes nothing. Only
+    /// entries that survive rule 1 are tested, because an object whose signatures do not verify
+    /// is not a statement at all and adaptor §7.4.1 requires ignoring it rather than treating
+    /// the log as compromised.
+    fn build(entries: &[(u64, Value)], governance: &Governance) -> CliResult<(Self, Vec<Finding>)> {
         let mut inner = Vec::with_capacity(entries.len());
         let mut findings = Vec::new();
         let mut seen: BTreeMap<String, u64> = BTreeMap::new();
@@ -156,6 +169,24 @@ impl Statements {
                 inner.push(voided());
                 continue;
             }
+            // An anchored statement of a type this build does not know is outcome 1, and it
+            // is checked before the duplicate rule so that "never skipped" holds for a
+            // repeated one too.
+            let kind = envelope
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !crate::corpus::STATEMENT_TYPES.contains(&kind) {
+                return Err(CliError::RuleFired(format!(
+                    "the statement at entry index {index} declares type `{kind}`, which is not \
+                     one of the seven core spec §2.3 defines. It is anchored and its signatures \
+                     verify, so it is an AHL statement whose meaning this build cannot read; \
+                     leaving it inert would be a decision that it carries no edge, no authority \
+                     and no scope, which nothing establishes"
+                )));
+            }
+
             // Rule 2, over the survivors of rule 1 only.
             match ahl_core::statement_id(envelope) {
                 Ok(statement_id) => {
@@ -184,7 +215,7 @@ impl Statements {
                 }
             }
         }
-        (Self { inner }, findings)
+        Ok((Self { inner }, findings))
     }
 }
 
@@ -283,20 +314,47 @@ impl<'a, F: Fetcher> Mirror<'a, F> {
 
     /// A consistency proof between two sizes, as this mirror serves it.
     ///
+    /// Adaptor §8.3 fixes the serialization exactly: a JSON array of `sha256:<hex>` family
+    /// strings, in the order the RFC 9162 algorithm produces, **and nothing else**. Every
+    /// element is therefore required to be such a string. Dropping the elements that are not
+    /// — which is what a `filter_map` here would do — and then certifying a neighbour
+    /// relationship on what is left would verify a *different, shorter* proof than the one the
+    /// mirror served, and an attacker choosing which elements to make non-strings would be
+    /// choosing which proof gets checked. Any departure from the serialization makes the
+    /// remote evidence unusable: outcome `3`, never a verified neighbour.
+    ///
     /// # Errors
     ///
-    /// [`CliError::EvidenceMissing`] when the mirror does not answer usably.
+    /// [`CliError::EvidenceMissing`] when the mirror does not answer usably, or answers with
+    /// anything but an array of `sha256:<hex>` family strings.
     pub fn consistency_path(&self, from: u64, to: u64) -> CliResult<Vec<String>> {
         let value = self.get(&format!("/v1/consistency?from={from}&to={to}"))?;
-        value
-            .get("consistency_path")
-            .and_then(Value::as_array)
-            .map(|path| path.iter().filter_map(|hash| hash.as_str().map(str::to_owned)).collect())
-            .ok_or_else(|| {
-                CliError::EvidenceMissing(format!(
-                    "the mirror served no `consistency_path` for {from}→{to}"
-                ))
+        let path = value.get("consistency_path").and_then(Value::as_array).ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "the mirror served no `consistency_path` array for {from}→{to}; adaptor §8.3 \
+                 serializes a consistency proof as a JSON array of `sha256:<hex>` family \
+                 strings"
+            ))
+        })?;
+        path.iter()
+            .enumerate()
+            .map(|(at, element)| {
+                let hash = element.as_str().ok_or_else(|| {
+                    CliError::EvidenceMissing(format!(
+                        "element {at} of the consistency proof for {from}→{to} is not a string; \
+                         adaptor §8.3 admits `sha256:<hex>` family strings and nothing else, so \
+                         this proof is unusable rather than partly readable"
+                    ))
+                })?;
+                ahl_core::parse_hash_hex(hash).map_err(|source| {
+                    CliError::EvidenceMissing(format!(
+                        "element {at} of the consistency proof for {from}→{to} is not a \
+                         `sha256:<hex>` family string: {source}"
+                    ))
+                })?;
+                Ok(hash.to_owned())
             })
+            .collect()
     }
 
     /// Retrieve one entry's bytes by AHL entry id, content-checked against the id requested
@@ -316,7 +374,7 @@ impl<'a, F: Fetcher> Mirror<'a, F> {
 
         // Content-addressed, and revalidating: a cached answer whose bytes do not digest to
         // the id requested is evicted and refetched once, then reported.
-        crate::net::fetch_revalidating(self.fetcher, &request, |response| {
+        crate::net::fetch_revalidating(self.fetcher, &request, |response: &crate::net::Response| {
             if response.status != 200 {
                 // Absence is a fact about the interface, not about the corpus: it is never
                 // read as evidence that no such entry was ever anchored.
@@ -352,17 +410,76 @@ pub fn establish<F: Fetcher>(
     policy: &LoadedPolicy,
     tree_size: u64,
 ) -> CliResult<Anchored> {
-    let mut findings = Vec::new();
-
-    // --- the observed series, and divergence over EVERY authenticated member -----------
     let series = mirror.series()?;
-    let selected =
-        series.iter().find(|member| member.tree_size == tree_size).cloned().ok_or_else(|| {
-            CliError::EvidenceMissing(format!(
-                "the mirror published no checkpoint at tree_size {tree_size}; checkpoint \
-                 selection is explicit and is never inferred"
-            ))
-        })?;
+    let candidates = candidates_at(&series, tree_size)?;
+
+    // One root at the requested size is the ordinary case and there is exactly one candidate.
+    // Several distinct roots at one size is a series core §7.3 forbids, and which of them
+    // authenticates cannot be known before one of them has supplied a recomputable
+    // enumeration — the manifest that resolves the log key set is itself an entry in the tree.
+    // Candidates are therefore attempted in series order until one establishes.
+    //
+    // This is **not** choosing a branch, which adaptor §5.2.2 makes a conformance violation.
+    // The attempt order decides only which branch supplies the governance chain; the verdict
+    // does not depend on it, because the divergence check below runs over *every*
+    // authenticated member and refuses outright at or beyond the floor whichever candidate got
+    // there. A branch that does not authenticate is untrusted material from a mirror (§7), and
+    // continuing past it is what stops a hostile mirror from derailing an honest run by
+    // publishing one bogus object.
+    let mut reported: Option<CliError> = None;
+    for selected in candidates {
+        match establish_under(mirror, policy, &series, selected) {
+            Ok(anchored) => return Ok(anchored),
+            // A rule that fired against the log's own contents — divergence between
+            // authenticated members, an unknown statement type — is a verdict, not this
+            // branch failing to establish, and is never retried under another branch.
+            Err(error) if error.outcome() == crate::outcome::Outcome::Invalid => return Err(error),
+            Err(error) => reported = Some(error),
+        }
+    }
+    Err(reported.unwrap_or_else(|| {
+        CliError::EvidenceMissing(format!(
+            "no published checkpoint at tree_size {tree_size} could be established"
+        ))
+    }))
+}
+
+/// The published members at `tree_size`, in series order, one per distinct `root_hash`.
+///
+/// Ordering is core §7.3's `(tree_size, checkpoint_time)`, so the member with the earliest
+/// `checkpoint_time` comes first: a quiet log republishes at unchanged size, and the earliest
+/// such member is the one the specification makes govern. Taking whichever member the mirror
+/// happened to serialize first would let the server pick.
+///
+/// Members restating one root are collapsed, because they describe the same tree and
+/// re-enumerating under each would be repeated work with a fixed answer.
+fn candidates_at(series: &[Checkpoint], tree_size: u64) -> CliResult<Vec<Checkpoint>> {
+    let mut at_size: Vec<&Checkpoint> =
+        series.iter().filter(|member| member.tree_size == tree_size).collect();
+    at_size.sort_by_key(|member| series_order_key(member));
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let candidates: Vec<Checkpoint> =
+        at_size.into_iter().filter(|member| seen.insert(&member.root_hash)).cloned().collect();
+
+    if candidates.is_empty() {
+        return Err(CliError::EvidenceMissing(format!(
+            "the mirror published no checkpoint at tree_size {tree_size}; checkpoint selection \
+             is explicit and is never inferred"
+        )));
+    }
+    Ok(candidates)
+}
+
+/// Establish the view under one candidate checkpoint.
+fn establish_under<F: Fetcher>(
+    mirror: &Mirror<'_, F>,
+    policy: &LoadedPolicy,
+    series: &[Checkpoint],
+    selected: Checkpoint,
+) -> CliResult<Anchored> {
+    let tree_size = selected.tree_size;
+    let mut findings = Vec::new();
 
     // --- steps 1 and 2, as a joint fixed point ---------------------------------------
     let enumerator = Enumerator::new(
@@ -405,12 +522,13 @@ pub fn establish<F: Fetcher>(
     // checkpoint metadata alone, and requiring usability first would let a deployment defer
     // detection indefinitely by never recomputing the branch it dislikes (adaptor §6.6.1).
     let mut authenticated = Vec::new();
-    for member in &series {
+    for member in series {
         let Ok(keys) = governance.log_keys_for(member.tree_size) else { continue };
         if member.signature_verifies(mirror.signing_form, &keys).unwrap_or(false) {
             authenticated.push(member.clone());
         }
     }
+    findings.extend(unauthenticated_branch_findings(series, &authenticated));
     if let Some(floor) = equivocation_floor(&authenticated) {
         if tree_size >= floor {
             // Positive proof of misbehaviour, and a branch is never chosen.
@@ -427,10 +545,10 @@ pub fn establish<F: Fetcher>(
     }
 
     // --- step 3: neighbouring consistency --------------------------------------------
-    findings.extend(check_neighbours(mirror, &authenticated, &selected)?);
+    findings.extend(check_neighbours(mirror, series, &authenticated, &selected)?);
 
     // --- step 5: the verified statement view, and nothing else carried forward ---------
-    let (statements, statement_findings) = Statements::build(&entries, &governance);
+    let (statements, statement_findings) = Statements::build(&entries, &governance)?;
     findings.extend(statement_findings);
 
     findings.sort();
@@ -448,63 +566,119 @@ fn remote_candidate(error: CliError) -> CliError {
     }
 }
 
-/// Verify the §6.6 neighbour relationships: predecessor, and successor where one exists.
+/// Findings about published members that share a `tree_size` with a differing `root_hash`
+/// while **not** authenticating.
+///
+/// Design note §7: differing roots at one `tree_size` is divergence only when both objects
+/// authenticate for the bound log (adaptor §6.6.1); otherwise it is untrusted material from a
+/// mirror, and is reported as such rather than as an accusation about the log. Without the
+/// qualifier a hostile mirror publishing one bogus object can make the CLI accuse an honest
+/// log; without the report, it can make it say nothing at all.
+fn unauthenticated_branch_findings(
+    published: &[Checkpoint],
+    authenticated: &[Checkpoint],
+) -> Vec<Finding> {
+    let mut roots: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    for member in published {
+        roots.entry(member.tree_size).or_default().insert(&member.root_hash);
+    }
+    let mut findings = Vec::new();
+    for (tree_size, published_roots) in roots {
+        if published_roots.len() < 2 {
+            continue;
+        }
+        let authenticated_roots: BTreeSet<&str> = authenticated
+            .iter()
+            .filter(|member| member.tree_size == tree_size)
+            .map(|member| member.root_hash.as_str())
+            .collect();
+        if authenticated_roots.len() > 1 {
+            // Adjudicated by the floor rule instead; nothing to report here.
+            continue;
+        }
+        findings.push(Finding::new(
+            "mirror-served-differing-roots",
+            format!(
+                "the mirror published {} different roots at tree_size {tree_size}, of which {} \
+                 authenticates for the bound log; objects that do not authenticate are \
+                 untrusted material from a server and carry no accusation about the log",
+                published_roots.len(),
+                authenticated_roots.len()
+            ),
+        ));
+    }
+    findings
+}
+
+/// Verify the §6.6 neighbour relationships in **series order**: predecessor, and successor
+/// where one exists.
+///
+/// Neighbours are taken in the `(tree_size, checkpoint_time)` order of core §7.3, not by
+/// `tree_size` alone. A quiet log republishes at unchanged size, so a member sharing
+/// `selected`'s `tree_size` is a genuine series neighbour and skipping it would leave a
+/// relationship §6.6 requires unverified.
+///
+/// # The predecessor is required, and only one case is exempt
+///
+/// Design note §3 item 3 requires the predecessor relationship **always**. Adaptor §5.2.2 item
+/// 3 exempts exactly one member: the earliest one the deployment **published**, because an
+/// operator may first publish at a size larger than the genesis checkpoint and no earlier
+/// member then exists to relate to. Refusing that member would make the whole series
+/// permanently unusable.
+///
+/// The exemption is decided on what the mirror *published*, never on what authenticated. A
+/// mirror that serves earlier members which do not authenticate — or that withholds the
+/// predecessor's authentication material — has not turned `selected` into the earliest
+/// published member; it has failed to hand over evidence §6.6 requires, which is `3`. The two
+/// cases carry different codes and different outcomes precisely so a withholding mirror cannot
+/// borrow the exemption written for an honest one.
 fn check_neighbours<F: Fetcher>(
     mirror: &Mirror<'_, F>,
+    published: &[Checkpoint],
     authenticated: &[Checkpoint],
     selected: &Checkpoint,
 ) -> CliResult<Vec<Finding>> {
     let mut findings = Vec::new();
+    let position = series_order_key(selected);
 
     let predecessor = authenticated
         .iter()
-        .filter(|member| member.tree_size < selected.tree_size)
-        .max_by_key(|member| member.tree_size);
+        .filter(|member| series_order_key(member) < position)
+        .max_by_key(|member| series_order_key(member));
     let successor = authenticated
         .iter()
-        .filter(|member| member.tree_size > selected.tree_size)
-        .min_by_key(|member| member.tree_size);
+        .filter(|member| series_order_key(member) > position)
+        .min_by_key(|member| series_order_key(member));
 
     match predecessor {
-        Some(previous) => {
-            let path = mirror.consistency_path(previous.tree_size, selected.tree_size)?;
-            if !consistency_verifies(previous, selected, &path)? {
-                return Err(CliError::EvidenceMissing(format!(
-                    "consistency from the preceding series member at tree_size {} to {} does \
-                     not verify",
-                    previous.tree_size, selected.tree_size
-                )));
-            }
+        Some(previous) => verify_neighbour(mirror, previous, selected)?,
+        // The one exemption: nothing at all precedes this member in the published series.
+        None if !published.iter().any(|member| series_order_key(member) < position) => {
+            findings.push(Finding::new(
+                "series-predecessor-unpublished",
+                format!(
+                    "tree_size {} is the earliest member this deployment published, so the \
+                     predecessor relationship adaptor §6.6 requires has nothing to relate to; \
+                     §5.2.2 item 3 permits an operator to publish no earlier member, and the \
+                     two rules are not reconciled in the frozen sources. Completeness below \
+                     the earliest published member is not provable and is not assumed",
+                    selected.tree_size
+                ),
+            ));
         }
-        // Adaptor §6.6 requires the predecessor relationship for series-usability but §5.2.2
-        // item 3 lets an operator first publish at a size larger than the genesis checkpoint,
-        // so the earliest published member has no predecessor and the two rules cannot both be
-        // satisfied for it. Refusing outright would make the earliest member — and therefore
-        // the whole series — permanently unusable, so the gap is named and carried instead of
-        // being decided silently in either direction. See the crate README, "Ambiguities".
-        None => findings.push(Finding::new(
-            "series-predecessor-unpublished",
-            format!(
-                "no authenticated series member precedes tree_size {}, so the predecessor \
-                 relationship adaptor §6.6 requires could not be verified; §5.2.2 item 3 \
-                 permits an operator to publish no earlier member, and the two rules are not \
-                 reconciled in the frozen sources",
+        None => {
+            return Err(CliError::EvidenceMissing(format!(
+                "the published series carries members before tree_size {}, but none of them \
+                 authenticates, so the predecessor relationship adaptor §6.6 requires could \
+                 not be verified. Design note §3 requires that relationship always; only the \
+                 earliest **published** member is exempt, and this is not it",
                 selected.tree_size
-            ),
-        )),
+            )));
+        }
     }
 
     match successor {
-        Some(next) => {
-            let path = mirror.consistency_path(selected.tree_size, next.tree_size)?;
-            if !consistency_verifies(selected, next, &path)? {
-                return Err(CliError::EvidenceMissing(format!(
-                    "consistency from tree_size {} to the following series member at {} does \
-                     not verify",
-                    selected.tree_size, next.tree_size
-                )));
-            }
-        }
+        Some(next) => verify_neighbour(mirror, selected, next)?,
         // "Where one exists" is not decidable against an untrusted mirror: no authenticated
         // completeness proof over checkpoint-series history is defined, so a mirror can
         // withhold a successor and make an older C look newest.
@@ -519,6 +693,43 @@ fn check_neighbours<F: Fetcher>(
         )),
     }
     Ok(findings)
+}
+
+/// Verify one neighbour relationship, `earlier` → `later` in series order.
+fn verify_neighbour<F: Fetcher>(
+    mirror: &Mirror<'_, F>,
+    earlier: &Checkpoint,
+    later: &Checkpoint,
+) -> CliResult<()> {
+    if earlier.tree_size == later.tree_size {
+        // Two members at one size restate one tree (adaptor §5.2.2 item 2), so their
+        // relationship is settled by their roots and there is no proof to fetch: RFC 9162
+        // defines no consistency proof between a size and itself, and inventing a request the
+        // profile does not define would be worse than checking what the objects already say.
+        // Equal roots is the append-only extension of length zero; unequal roots is divergence,
+        // which the floor rule has already adjudicated before this runs — so reaching here with
+        // unequal roots means one of the two did not authenticate, and the pair is unusable
+        // rather than an accusation.
+        if earlier.root_hash == later.root_hash {
+            return Ok(());
+        }
+        return Err(CliError::EvidenceMissing(format!(
+            "two members at tree_size {} carry different roots and only one of them \
+             authenticates, so the neighbour relationship adaptor §6.6 requires cannot be \
+             verified; an object that does not authenticate is untrusted material from a \
+             server, never a finding about the log",
+            earlier.tree_size
+        )));
+    }
+
+    let path = mirror.consistency_path(earlier.tree_size, later.tree_size)?;
+    if consistency_verifies(earlier, later, &path)? {
+        return Ok(());
+    }
+    Err(CliError::EvidenceMissing(format!(
+        "consistency from the series member at tree_size {} to the one at {} does not verify",
+        earlier.tree_size, later.tree_size
+    )))
 }
 
 /// Which trigger governs a record at `C`, established over the whole enumerated range.
@@ -720,6 +931,23 @@ mod tests {
     use super::*;
     use crate::testing::MirrorFixture;
 
+    /// A manifest `log` object carrying every member core spec §7.3 makes REQUIRED, which
+    /// `Governance::resolve` now checks before a manifest may govern.
+    fn conformant_log_object() -> Value {
+        json!({
+            "log_id": format!("sha256:{}", hex::encode([0xaa_u8; 32])),
+            "operator": "op",
+            "adaptor": {
+                "id": "ahl-test-log-v1",
+                "hash": format!("sha256:{}", hex::encode([0xbb_u8; 32])),
+            },
+            "checkpoint_cadence": "PT1H",
+            "cadence_epoch": "2026-01-01T00:00:00Z",
+            "witness_grace_period": "PT15M",
+            "keys": [],
+        })
+    }
+
     #[test]
     fn a_view_is_established_only_when_every_step_holds() {
         let fixture = MirrorFixture::conformance();
@@ -765,6 +993,100 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == "series-successor-not-observed"));
+    }
+
+    #[test]
+    fn a_predecessor_that_was_published_but_not_handed_over_is_never_a_complete_answer() {
+        // Design note §3 item 3 requires the predecessor relationship **always**; adaptor
+        // §5.2.2 item 3 exempts exactly one member, the earliest the deployment published.
+        // The two cases must not collapse into one, because a mirror that publishes earlier
+        // members it cannot authenticate — or withholds their authentication material — would
+        // otherwise borrow an exemption written for a deployment that published nothing
+        // earlier, and hand back a complete-looking answer resting on an unverified
+        // relationship.
+        let fixture = MirrorFixture::conformance().with_foreign_log_key(8);
+        let error = fixture.establish(13).expect_err("the predecessor was not established");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("none of them authenticates"), "{error}");
+        assert!(error.to_string().contains("earliest **published** member is exempt"), "{error}");
+
+        // And the exemption still applies where it should: 8 really is the earliest member
+        // this deployment published, so it establishes and names the gap.
+        let honest = MirrorFixture::conformance();
+        let anchored = honest.establish(8).expect("the earliest published member establishes");
+        assert!(anchored
+            .findings
+            .iter()
+            .any(|finding| finding.code == "series-predecessor-unpublished"));
+    }
+
+    #[test]
+    fn the_member_a_selection_lands_on_is_the_earliest_in_series_order_not_the_first_served() {
+        // Core §7.3 orders a series by `(tree_size, checkpoint_time)` and makes the earliest
+        // `checkpoint_time` govern where a selection lands on a size carrying several members.
+        // Taking whichever member the mirror serialized first lets the server choose the
+        // branch — and here the server's choice is the one whose root nothing recomputes,
+        // which would answer a divergence with "evidence not obtained" instead of the verdict
+        // the divergence actually supports.
+        let fixture = MirrorFixture::conformance().with_equivocation_first_at(13);
+        let error = fixture.establish(13).expect_err("at the floor");
+        assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid);
+    }
+
+    #[test]
+    fn a_republished_member_at_one_size_is_a_series_neighbour_not_a_member_to_skip() {
+        // A quiet log MUST keep publishing at unchanged `tree_size` (core §7.3, adaptor §16
+        // obligation 4), so a republished member is a genuine later member of the series under
+        // the `(tree_size, checkpoint_time)` order — and §6.6 requires the relationship to a
+        // following member where one exists. Neighbours taken by `tree_size` alone would step
+        // straight past it and report a successor that was published as not observed.
+        let newest = MirrorFixture::conformance().newest_tree_size();
+        let fixture = MirrorFixture::conformance().with_republish_at(newest);
+        let anchored = fixture.establish(newest).expect("established");
+
+        // The mirror serialized the later republication first. Core §7.3 makes the earliest
+        // `checkpoint_time` govern, so that is the member the result is reported against —
+        // otherwise the server chooses which of its own publications a verdict names.
+        assert_eq!(
+            anchored.checkpoint.checkpoint_time,
+            crate::testing::FIXED_TIME,
+            "the earliest member at this size governs, not the first one served"
+        );
+        assert!(
+            !anchored
+                .findings
+                .iter()
+                .any(|finding| finding.code == "series-successor-not-observed"),
+            "the republished member at this size is the successor: {:?}",
+            anchored.findings
+        );
+
+        // Without the republication the same checkpoint is the newest observed member.
+        let anchored = MirrorFixture::conformance().establish(newest).expect("established");
+        assert!(anchored
+            .findings
+            .iter()
+            .any(|finding| finding.code == "series-successor-not-observed"));
+    }
+
+    #[test]
+    fn an_anchored_statement_of_an_unknown_type_is_a_verdict_not_an_inert_entry() {
+        // §6: "Unknown claim type or unknown statement type, authenticated mode | 1 — never
+        // skipped, never inert." The entry is anchored, committed by the checkpoint, and its
+        // signature verifies under the key set in force at its index, so it is an AHL
+        // statement; what a verifier cannot do is read what it means. Leaving it inert is the
+        // CLI deciding it carries no edge, no authority and no scope — which nothing
+        // establishes.
+        let fixture = MirrorFixture::conformance().with_unknown_statement_type();
+        let error =
+            fixture.establish(fixture.appended_tree_size()).expect_err("unknown statement type");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid, "{error}");
+        assert!(error.to_string().contains("`attestation`"), "{error}");
+        assert!(error.to_string().contains("one of the seven"), "{error}");
+
+        // A checkpoint below it is unaffected: the statement is not committed there.
+        assert!(fixture.establish(8).is_ok());
     }
 
     #[test]
@@ -849,6 +1171,60 @@ mod tests {
     }
 
     #[test]
+    fn a_consistency_proof_carrying_anything_but_family_strings_is_unusable_remote_evidence() {
+        // Adaptor §8.3 serializes a consistency proof as a JSON array of `sha256:<hex>` family
+        // strings and nothing else. Dropping the elements that are not — and certifying the
+        // neighbour relationship on what is left — verifies a shorter proof than the one the
+        // mirror served, which hands the mirror the choice of which proof gets checked.
+        #[derive(Debug)]
+        struct Serving(Value);
+        impl Fetcher for Serving {
+            fn fetch(&self, _request: &Request) -> Result<crate::net::Response, FetchFailure> {
+                Ok(crate::net::Response {
+                    status: 200,
+                    body: serde_json::to_vec(&self.0).unwrap_or_default(),
+                })
+            }
+        }
+
+        let good = format!("sha256:{}", hex::encode([0x11_u8; 32]));
+        let mirror_of = |path: Value| {
+            let fetcher = Serving(json!({ "from": 8, "to": 13, "consistency_path": path }));
+            (fetcher, ())
+        };
+
+        for (path, why) in [
+            (json!([good.clone(), 42]), "a number is not a family string"),
+            (json!([good.clone(), Value::Null]), "null is not a family string"),
+            (json!([good.clone(), "sha512:beef"]), "another family is not this one"),
+            (json!([good, "not-a-hash"]), "an unprefixed string is not one either"),
+            (json!("sha256:deadbeef"), "the proof is an array, not a string"),
+        ] {
+            let (fetcher, ()) = mirror_of(path);
+            let mirror = Mirror::new(
+                &fetcher,
+                crate::testing::MIRROR,
+                crate::checkpoint::TEST_LOG_PROFILE,
+                crate::policy::NetworkLimits::default(),
+            )
+            .expect("known profile");
+            let error = mirror.consistency_path(8, 13).expect_err(why);
+            assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{why}: {error}");
+        }
+
+        // A conforming proof reads back exactly, in the order served.
+        let (fetcher, ()) = mirror_of(json!([&good, &good]));
+        let mirror = Mirror::new(
+            &fetcher,
+            crate::testing::MIRROR,
+            crate::checkpoint::TEST_LOG_PROFILE,
+            crate::policy::NetworkLimits::default(),
+        )
+        .expect("known profile");
+        assert_eq!(mirror.consistency_path(8, 13).expect("conforming"), vec![good.clone(), good]);
+    }
+
+    #[test]
     fn retrieval_by_entry_id_is_content_checked_against_the_id_requested() {
         // Adaptor §10.1.1 verifier duty 1: recompute the digest and reject unless it equals the
         // requested id. That makes retrieval self-checking — a deployment cannot substitute a
@@ -929,7 +1305,7 @@ mod tests {
             serde_json::json!({
                 "type": "manifest",
                 "keys": [ honest.key_object(0) ],
-                "log": { "log_id": "sha256:aa", "keys": [] },
+                "log": conformant_log_object(),
                 "datasets": { "d": { "commitment_mode": "plain",
                                      "authority": { "producer": "p", "key_ids": [honest.key_id()] } } },
             }),
@@ -950,7 +1326,8 @@ mod tests {
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
-        let (statements, findings) = Statements::build(&entries, &governance);
+        let (statements, findings) =
+            Statements::build(&entries, &governance).expect("known statement types");
 
         assert_eq!(
             introduction_index(&statements, "d", &record),
@@ -972,7 +1349,7 @@ mod tests {
             serde_json::json!({
                 "type": "manifest",
                 "keys": [ honest.key_object(0) ],
-                "log": { "log_id": "sha256:aa", "keys": [] },
+                "log": conformant_log_object(),
             }),
             &honest,
         );
@@ -993,7 +1370,8 @@ mod tests {
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
-        let (statements, findings) = Statements::build(&entries, &governance);
+        let (statements, findings) =
+            Statements::build(&entries, &governance).expect("known statement types");
 
         assert_eq!(statements.statement_type(1), Some("ingestion"), "the smaller index governs");
         assert_eq!(statements.statement_type(2), Some("not-a-statement"), "the later one is void");
@@ -1013,7 +1391,7 @@ mod tests {
             serde_json::json!({
                 "type": "manifest",
                 "keys": [ honest.key_object(0) ],
-                "log": { "log_id": "sha256:aa", "keys": [] },
+                "log": conformant_log_object(),
             }),
             &honest,
         );
@@ -1029,7 +1407,8 @@ mod tests {
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
-        let (statements, _) = Statements::build(&entries, &governance);
+        let (statements, _) =
+            Statements::build(&entries, &governance).expect("known statement types");
 
         assert_eq!(statements.statement_type(1), Some("not-a-statement"));
         assert_eq!(

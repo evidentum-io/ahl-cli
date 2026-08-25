@@ -176,6 +176,16 @@ pub trait Fetcher: std::fmt::Debug {
     fn invalidate(&self, _request: &Request) -> bool {
         false
     }
+
+    /// Offer a response the caller has **verified** for caching.
+    ///
+    /// Caching is a separate verb from fetching because "a cached object failing
+    /// re-verification is evicted and refetched once" is only meaningful if the cache holds
+    /// answers that once verified. A layer that stored every live response the moment it
+    /// arrived would file rejected bytes under the request key and then, on eviction, report
+    /// them as having come from the cache — turning a live endpoint that answered badly into
+    /// a cache miss worth retrying. Layers with no cache do nothing.
+    fn store(&self, _request: &Request, _response: &Response) {}
 }
 
 /// Fetch, verify, and — if verification fails on an answer that came from a cache — evict it
@@ -193,20 +203,30 @@ pub trait Fetcher: std::fmt::Debug {
 pub fn fetch_revalidating<F, T>(
     fetcher: &F,
     request: &Request,
-    verify: impl Fn(Response) -> crate::error::CliResult<T>,
+    verify: impl Fn(&Response) -> crate::error::CliResult<T>,
 ) -> crate::error::CliResult<T>
 where
     F: Fetcher + ?Sized,
 {
     let first = fetcher.fetch(request).map_err(FetchFailure::into_cli_error)?;
-    match verify(first) {
-        Ok(value) => Ok(value),
+    match verify(&first) {
+        Ok(value) => {
+            fetcher.store(request, &first);
+            Ok(value)
+        }
         Err(reported) => {
+            // The retry is earned only by an answer that really came out of the cache. Because
+            // nothing is stored until it has verified, an eviction here can only have removed
+            // an answer that was served from the cache: a live endpoint that answered badly
+            // has left nothing behind to evict, so `invalidate` reports `false` and the
+            // failure is reported rather than the endpoint hammered.
             if !fetcher.invalidate(request) {
                 return Err(reported);
             }
             let second = fetcher.fetch(request).map_err(FetchFailure::into_cli_error)?;
-            verify(second)
+            let value = verify(&second)?;
+            fetcher.store(request, &second);
+            Ok(value)
         }
     }
 }
@@ -218,6 +238,10 @@ impl Fetcher for Box<dyn Fetcher> {
 
     fn invalidate(&self, request: &Request) -> bool {
         (**self).invalidate(request)
+    }
+
+    fn store(&self, request: &Request, response: &Response) {
+        (**self).store(request, response);
     }
 }
 
@@ -272,6 +296,10 @@ impl<F: Fetcher> Budgeted<F> {
 impl<F: Fetcher> Fetcher for Budgeted<F> {
     fn invalidate(&self, request: &Request) -> bool {
         self.inner.invalidate(request)
+    }
+
+    fn store(&self, request: &Request, response: &Response) {
+        self.inner.store(request, response);
     }
 
     fn fetch(&self, request: &Request) -> Result<Response, FetchFailure> {

@@ -32,16 +32,20 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     };
 
-    // Four fixtures, because the §6 table distinguishes outcomes a single honest transcript
+    // Several fixtures, because the §6 table distinguishes outcomes a single honest transcript
     // cannot exercise: a divergent series, a checkpoint signed by a key no manifest declares,
-    // and a mirror serving bytes the checkpoint does not commit.
+    // a mirror serving bytes the checkpoint does not commit, a forged later manifest, and an
+    // anchored statement of a type core §2.3 does not define.
     let honest = MirrorFixture::conformance();
     let equivocating = MirrorFixture::conformance().with_equivocation_at(13);
     let foreign_key = MirrorFixture::conformance().with_foreign_log_key(8);
     let tampered = MirrorFixture::conformance().with_tampered_entry(3);
     let forged_manifest = MirrorFixture::conformance().with_forged_manifest();
+    let unknown_statement = MirrorFixture::conformance().with_unknown_statement_type();
 
-    for fixture in [&honest, &equivocating, &foreign_key, &tampered, &forged_manifest] {
+    for fixture in
+        [&honest, &equivocating, &foreign_key, &tampered, &forged_manifest, &unknown_statement]
+    {
         // Drive every request path the integration tests replay: an authenticated closure at
         // several checkpoints, and a reconstruction, which additionally reads the witness.
         let mut sizes = ahl_cli::testing::CHECKPOINT_SIZES.to_vec();
@@ -80,6 +84,7 @@ fn main() -> std::process::ExitCode {
         ("mirror-transcript-foreign-key.json", foreign_key.transcript()),
         ("mirror-transcript-tampered.json", tampered.transcript()),
         ("mirror-transcript-forged-manifest.json", forged_manifest.transcript()),
+        ("mirror-transcript-unknown-statement.json", unknown_statement.transcript()),
         ("tree-material.json", tree_material(&MirrorFixture::corpus_root())),
     ];
     for (name, value) in written {

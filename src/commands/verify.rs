@@ -129,6 +129,15 @@ fn classify(error: ReceiptError) -> CliError {
         ReceiptError::AdaptorUnknown { id } => CliError::ProfileNotPossessed { id },
         // Rejection, never a degraded acceptance (3).
         ReceiptError::LimitExceeded(what) => CliError::LimitExhausted(what.to_owned()),
+        // A combination the frozen container format leaves no material to evidence (3). The
+        // receipt is well-formed and nothing about it has been disproved; what is missing is
+        // evidence the format defines no way to carry, which is the same shape as the other
+        // `3` rows where a limitation of the format or profile is named. Spelled out as its
+        // own arm so the outcome is a decision recorded here, not the fall-through below.
+        ReceiptError::FormatConflict { combination, conflict } => CliError::FormatConflict {
+            combination: combination.to_owned(),
+            conflict: conflict.to_owned(),
+        },
         // Keyed binding with no authorized dataset key held (3) versus carried bytes that do
         // not recompute (1) — see the module docs on the sentinel.
         ReceiptError::ContentBindingMismatch { mode, recomputed, claimed } => {
@@ -513,6 +522,17 @@ mod tests {
         )
     }
 
+    /// Corpus vectors marked `reject` whose §6 outcome is `3` rather than `1`.
+    ///
+    /// The corpus index records *that* a receipt must be refused; it does not record which of
+    /// the four outcomes the refusal carries, because that mapping is the design note's §6
+    /// table and lives in this crate. A `FormatConflict` names a combination the frozen
+    /// container format defines no material to evidence: the receipt is well-formed and
+    /// nothing about it has been disproved, so the honest answer is "required evidence could
+    /// not be established", not "a rule fired against the artifact".
+    const REFUSED_AS_UNVERIFIABLE: [&str; 1] =
+        ["trigger-effective-enumerated-with-later-checkpoint-must-fail.ahl"];
+
     #[test]
     fn every_positive_corpus_receipt_is_valid_and_every_negative_one_is_invalid() {
         let policy = corpus_policy(true);
@@ -539,7 +559,12 @@ mod tests {
                     );
                 }
                 "reject" => {
-                    assert_eq!(report.status, "invalid", "{file}: {}", report.reason);
+                    let expected_status = if REFUSED_AS_UNVERIFIABLE.contains(&file) {
+                        "unverifiable"
+                    } else {
+                        "invalid"
+                    };
+                    assert_eq!(report.status, expected_status, "{file}: {}", report.reason);
                     let expected = vector["reason"].as_str().expect("reason");
                     assert!(
                         report.reason.contains(expected),

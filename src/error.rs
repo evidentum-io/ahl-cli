@@ -133,6 +133,22 @@ pub enum CliError {
     #[error("limit exhausted: {0}")]
     LimitExhausted(String),
 
+    /// The receipt asks for a combination the frozen container format cannot evidence.
+    ///
+    /// Not a rule fired against the artifact: a rule the format leaves no material to satisfy.
+    /// The receipt is well-formed and nothing about it has been disproved — what is absent is
+    /// evidence the format defines no way to carry — so this is `3`, alongside the other rows
+    /// where a limitation of the *format or profile* is named rather than the artifact
+    /// adjudicated. Given an explicit variant so the outcome is a decision, never the
+    /// fall-through arm for a rejection this build does not recognise.
+    #[error("{combination} cannot be evidenced under this format revision: {conflict}")]
+    FormatConflict {
+        /// The combination of receipt features that cannot be evidenced.
+        combination: String,
+        /// The conflicting requirements, each named by section.
+        conflict: String,
+    },
+
     /// Required evidence could not be obtained: an unreachable server, a malformed remote
     /// response, an enumeration that does not tile, a proof that did not verify on a
     /// **remote candidate**. A hostile server returning one bogus object disproves nothing
@@ -165,6 +181,7 @@ impl CliError {
             | Self::ProfileLimitation(_)
             | Self::DatasetKeyNotHeld { .. }
             | Self::LimitExhausted(_)
+            | Self::FormatConflict { .. }
             | Self::EvidenceMissing(_)
             | Self::TopologyMode(_) => Outcome::Unverifiable,
         }
@@ -189,6 +206,7 @@ impl CliError {
             Self::ProfileLimitation(_) => "profile-limitation",
             Self::DatasetKeyNotHeld { .. } => "dataset-key-not-held",
             Self::LimitExhausted(_) => "limit-exhausted",
+            Self::FormatConflict { .. } => "format-conflict",
             Self::EvidenceMissing(_) => "evidence-missing",
             Self::TopologyMode(_) => "topology-mode",
         }
@@ -223,6 +241,7 @@ mod tests {
             CliError::ProfileLimitation("l".to_owned()),
             CliError::DatasetKeyNotHeld { dataset: "d".to_owned() },
             CliError::LimitExhausted("l".to_owned()),
+            CliError::FormatConflict { combination: "c".to_owned(), conflict: "why".to_owned() },
             CliError::EvidenceMissing("e".to_owned()),
             CliError::TopologyMode("t".to_owned()),
         ]

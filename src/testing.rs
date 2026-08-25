@@ -67,6 +67,13 @@ pub struct MirrorFixture {
     witness_keys: BTreeMap<&'static str, TestKey>,
     /// Publish a second, diverging checkpoint at this size.
     equivocate_at: Option<u64>,
+    /// Serialize the diverging member **before** the honest one, while giving it a later
+    /// `checkpoint_time`, so array order and series order disagree.
+    equivocate_first: bool,
+    /// Republish the checkpoint at this size unchanged, with a later `checkpoint_time`.
+    republish_at: Option<u64>,
+    /// Anchor a correctly signed statement of a type core §2.3 does not define.
+    unknown_statement_type: bool,
     /// Sign the checkpoint at this size with a key the manifest does not declare.
     foreign_key_at: Option<u64>,
     /// Serve different bytes for this entry index.
@@ -144,6 +151,9 @@ impl MirrorFixture {
                 ("witness-2", seed(root, "witness-2")),
             ]),
             equivocate_at: None,
+            equivocate_first: false,
+            republish_at: None,
+            unknown_statement_type: false,
             foreign_key_at: None,
             tampered: None,
             forged_manifest: false,
@@ -156,6 +166,63 @@ impl MirrorFixture {
     pub const fn with_equivocation_at(mut self, tree_size: u64) -> Self {
         self.equivocate_at = Some(tree_size);
         self
+    }
+
+    /// Publish the diverging member at `tree_size` **first in the served array**, while
+    /// giving it a later `checkpoint_time` than the honest one.
+    ///
+    /// Array order and series order then disagree, which is the whole point: core §7.3 orders
+    /// a series by `(tree_size, checkpoint_time)`, so a client that takes whichever member the
+    /// mirror serialized first is letting the server choose. Here the server's choice is the
+    /// branch whose root nothing recomputes.
+    #[must_use]
+    pub const fn with_equivocation_first_at(mut self, tree_size: u64) -> Self {
+        self.equivocate_at = Some(tree_size);
+        self.equivocate_first = true;
+        self
+    }
+
+    /// Republish the checkpoint at `tree_size` unchanged, with a later `checkpoint_time`.
+    ///
+    /// A quiet log MUST keep publishing at its declared cadence with `tree_size` unchanged
+    /// (core §7.3, adaptor §16 obligation 4), so this is what an honest idle deployment looks
+    /// like — and the republished member is a genuine later member of the series.
+    #[must_use]
+    pub const fn with_republish_at(mut self, tree_size: u64) -> Self {
+        self.republish_at = Some(tree_size);
+        self
+    }
+
+    /// Anchor a correctly signed statement whose `type` core §2.3 does not define.
+    ///
+    /// Signed by the corpus producer key, so it passes every test that makes an anchored
+    /// object an AHL statement; what a verifier cannot do is read what it means.
+    #[must_use]
+    pub fn with_unknown_statement_type(mut self) -> Self {
+        let producer = seed(&Self::corpus_root(), "producer-1");
+        let manifest = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|bytes| {
+                let value: Value = serde_json::from_slice(bytes).ok()?;
+                (value.get("payload")?.get("type")?.as_str()? == "manifest")
+                    .then(|| ahl_core::sha256_hex(bytes))
+            })
+            .unwrap_or_default();
+        let statement = ahl_core::envelope(
+            json!({ "type": "attestation", "manifest": manifest, "dataset": "customers" }),
+            &producer,
+        );
+        self.entries.push(ahl_core::jcs(&statement));
+        self.unknown_statement_type = true;
+        self
+    }
+
+    /// The tree size whose checkpoint commits the appended statement, if one was appended.
+    #[must_use]
+    pub fn appended_tree_size(&self) -> u64 {
+        u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
     }
 
     /// Sign the checkpoint at `tree_size` with a key no manifest version declares.
@@ -228,7 +295,7 @@ impl MirrorFixture {
         let total = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         let mut sizes: Vec<u64> =
             CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
-        if self.forged_manifest && !sizes.contains(&total) {
+        if (self.forged_manifest || self.unknown_statement_type) && !sizes.contains(&total) {
             sizes.push(total);
         }
         sizes
@@ -314,9 +381,26 @@ impl MirrorFixture {
             .collect();
         if let Some(size) = self.equivocate_at {
             // A second, validly signed checkpoint at one size with a different root: no
-            // append-only tree has two roots at one size.
+            // append-only tree has two roots at one size. Its `checkpoint_time` is later, so
+            // the honest member governs under the series order of core §7.3 — and where
+            // `equivocate_first` is set it is nevertheless serialized first, so array order
+            // and series order disagree.
             let divergent = format!("sha256:{}", hex::encode([0xee_u8; 32]));
-            series.push(self.checkpoint(size, &divergent, "2026-08-16T13:00:00Z", false));
+            let member = self.checkpoint(size, &divergent, "2026-08-16T13:00:00Z", false);
+            if self.equivocate_first {
+                series.insert(0, member);
+            } else {
+                series.push(member);
+            }
+        }
+        if let Some(size) = self.republish_at {
+            // A quiet log restating one tree: same size, same root, later time — and
+            // serialized **first**, so array order and series order disagree. Core §7.3 makes
+            // the earliest `checkpoint_time` govern where a selection lands on a size carrying
+            // several members; taking whichever came first in the array would let the server
+            // decide which of its own publications a result is reported against.
+            let root = self.root_at(size);
+            series.insert(0, self.checkpoint(size, &root, "2026-08-16T13:00:00Z", false));
         }
         series
     }

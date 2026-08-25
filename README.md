@@ -52,7 +52,7 @@ makes a verifier useless in CI.
 | `0` | `valid` | every required rule verified |
 | `1` | `invalid` | a normative rule fired against the artifact: structure, signature, proof, cross-field rule, equivocation between authenticated checkpoints, unknown claim or statement type |
 | `2` | `error` | the CLI could not begin: usage, unreadable or unparseable policy, output-path I/O, internal invariant |
-| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established |
+| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established — including a combination the frozen container format defines no material to evidence (`format-conflict`) |
 
 `0`, `1` and `2` carry exactly their `atl-cli` meanings, so a consumer written against the
 family canon still reads them correctly. `3` is a documented AHL extension and is **never**
@@ -187,6 +187,15 @@ evicts and refetches exactly once (`net::fetch_revalidating`). A poisoned cache 
 change *what work happens*, never *what is accepted*. A request for the *latest* checkpoint is
 never served from cache: a valid old checkpoint is a replay.
 
+**Storing is a separate verb from fetching**, and that is what makes the retry honest. A fetch
+never writes; a response reaches the store only after the caller's own proof checks have
+accepted it. Writing a live answer the moment it arrived would file bytes nobody had verified
+under the request key, and the eviction that follows a refusal would then report that the
+refused answer had come from the cache — earning a repeat request against a live endpoint that
+had simply answered badly, on the strength of a cache entry the same run had just manufactured.
+With nothing stored until it verifies, an eviction can only ever have removed a genuinely
+cached answer.
+
 Every cache write goes through the same handle-relative, no-replace primitives as `emit`'s
 output: an `O_EXCL` temporary under an unpredictable name inside an `O_NOFOLLOW` directory
 handle. A cache entry has no evidentiary weight, but that was never a licence to let a symlink
@@ -230,18 +239,36 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    first. This crate excludes non-statements *first*, because the other order hands an attacker
    a deletion primitive: anchoring a genuine payload with a broken signature at a smaller index
    would void the real statement. Reported here; both rules are pinned by tests over fixtures
-   this crate controls.
+   this crate controls. The same silence covers a *duplicate* whose statement type is not one
+   of core §2.3's seven: §6 fixes an unknown statement type at `1` "never skipped, never
+   inert", and §2.1 voids the later duplicate, and neither says which applies. This crate tests
+   the type first, so "never skipped" holds for a repeated statement too.
 3. **Authentication and enumeration are mutually dependent.** Authenticating a checkpoint `C`
    needs the log key from the manifest version governing `tree_size(C)`; that manifest is an
    entry in the log; trusting entries needs `C`'s root. The design note orders them 1 then 2,
    which cannot be executed as a sequence. They are established here as a **joint fixed
    point** — see `src/anchored.rs` — and nothing is trusted on the way round.
-4. **A series' earliest published member has no predecessor.** Adaptor §6.6 requires the
-   predecessor consistency relationship for series-usability, while §5.2.2 item 3 explicitly
-   permits an operator to publish no earlier member. The two cannot both hold for the earliest
-   member, and refusing outright would make the whole series permanently unusable. The
-   relationship is verified where a predecessor exists and the gap is named
-   (`series-predecessor-unpublished`) where one does not.
+4. **A series' earliest published member has no predecessor — and that is the only exemption.**
+   Adaptor §6.6 requires the predecessor consistency relationship for series-usability, while
+   §5.2.2 item 3 explicitly permits an operator to publish no earlier member than the one it
+   started at. The two cannot both hold for that member, and refusing it outright would make
+   the whole series permanently unusable, so it is exempted and the gap is named
+   (`series-predecessor-unpublished`).
+
+   **The exemption is decided on what the mirror published, never on what authenticated.** The
+   design note §3 requires the predecessor relationship *always*, and the two cases must not
+   collapse into one:
+
+   - the selected checkpoint is the earliest member the deployment published — nothing exists
+     to relate it to, the §5.2.2 carve-out applies, the finding is raised and the run may still
+     be `valid` / `complete`. Completeness below that member is not provable and is not
+     assumed;
+   - earlier members *were* published but none of them authenticates, or their authentication
+     material was withheld — the relationship §6.6 requires simply was not established. That is
+     `3` with the missing element named, never `0` with a finding attached. Otherwise a mirror
+     that withholds a predecessor borrows an exemption written for a deployment that published
+     nothing earlier, and hands back a complete-looking answer resting on an unverified
+     relationship.
 5. **"Where a successor exists" is not decidable.** No authenticated completeness proof over
    checkpoint-series history is defined, so a mirror can withhold a successor and make an older
    `C` look newest. Series usability is claimed only as `run-observed`, with the finding
@@ -263,7 +290,10 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    bytes under their own matching digest, and every digest check will pass. Eviction is
    therefore driven by the **caller's** proof checks, through `net::fetch_revalidating`, and
    the invariant test poisons the cache in a digest-consistent way so it fails if that
-   coupling is ever removed.
+   coupling is ever removed. The same sentence fixes when a response may be *written*: "a
+   cached object" is one that verified once, so a fetch stores nothing and `Caching::store` is
+   called only after the caller has accepted the bytes. A repeat request is then earned only by
+   an answer that really came out of the cache.
 9. **Committed tree material has no retrieval interface.** Adaptor §9 makes the complete leaf
    material of every committed tree corpus material a deployment MUST publish, but defines no
    interface for serving it and `ahl-mirror` serves none. `closure` therefore takes
@@ -288,6 +318,34 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
     verifier did not evaluate it" (`3`), and reports upstream's own wording for the former so a
     consumer written against the family canon still reads it.
 
+14. **Series order is fixed; what to do when it cannot apply is not.** Core §7.3 orders a
+    series by `(tree_size, checkpoint_time)` and makes the **earliest** `checkpoint_time` govern
+    where a selection lands on a size carrying several members — but that rule presupposes the
+    other half of the same paragraph, that members sharing a `tree_size` carry the same
+    `root_hash`. Where they do not, the sources say what the *consequence* of a confirmed
+    divergence is (§5.2.2: the series ends at its floor, and choosing a branch is a conformance
+    violation) without saying which member a verifier may enumerate under in order to find out
+    whether the divergence is confirmed at all — and confirmation needs an authenticated key
+    set, which needs a recomputable enumeration, which needs a member.
+
+    This crate resolves the deadlock without choosing a branch: candidates at the requested size
+    are attempted in series order, one per distinct root, until one establishes; the divergence
+    check then runs over **every** authenticated member and refuses outright at or beyond the
+    floor, whichever candidate got there. The attempt order therefore decides only which branch
+    supplies the governance chain, never the verdict. A branch that does not authenticate is
+    untrusted material from a mirror (design note §7) and is reported as such
+    (`mirror-served-differing-roots`), because refusing to continue past one bogus object would
+    let any mirror derail an honest run.
+
+15. **A member republished at one `tree_size` is a series neighbour.** A quiet log MUST keep
+    publishing at unchanged size, and series order is `(tree_size, checkpoint_time)`, so the
+    republication is a genuine later member and §6.6's "where a following member exists" is
+    satisfied by it. No consistency proof is fetched for such a pair: RFC 9162 defines none
+    between a size and itself, so the relationship is settled by the roots — equal roots are the
+    append-only extension of length zero, and unequal roots are the divergence adjudicated by
+    the floor rule. Inventing a `from == to` request the profile does not define would be worse
+    than checking what the two objects already say.
+
 ### Settled since the first round
 
 Three items this file previously recorded have been resolved upstream and the accommodations
@@ -298,8 +356,13 @@ for them are gone:
   incompatible dialects survive, and the value is load-bearing for binding a checkpoint to the
   corpus's Data Tree, so its absence is a check that cannot be performed rather than a
   reportable irregularity;
-* `cadence_epoch` is present, so the `manifest-log-object-incomplete` finding now fires only
-  for members no rule of this build consults;
+* `cadence_epoch` is present in the corpus manifests, and the manifest schema of core §7.3 is
+  now **checked rather than reported** wherever governance is resolved for real: "Every member
+  is REQUIRED", so a signed manifest that omits one — or that carries a key object which cannot
+  be read — is rejected and does not govern, and a genesis that breaks the schema is fatal
+  because no later version can repair the corpus trust anchor. The
+  `manifest-log-object-incomplete` finding survives only in `--unauthenticated` topology mode,
+  where nothing is evidence and every violation is a finding rather than a verdict;
 * corpus entries 28, 29 and 31 no longer share one payload, and the witness refusal vector now
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.

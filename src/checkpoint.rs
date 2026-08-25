@@ -265,6 +265,33 @@ pub fn parse_atl_time(value: &str) -> CliResult<u64> {
         .ok_or_else(|| reject("overflows a nanosecond counter"))
 }
 
+/// The canonical series order of core §7.3: `(tree_size, checkpoint_time)`, ascending.
+///
+/// `tree_size` alone does not order a series, because a quiet log republishes at unchanged size
+/// (adaptor §5.2.2 item 2, §16 obligation 4), so `checkpoint_time` breaks the tie and the
+/// **earliest** time governs where a selection lands on a size carrying several members.
+///
+/// Two details this encodes rather than leaves to a caller:
+///
+/// * times are compared as **instants**, never as strings — two conforming RFC 3339 renderings
+///   of one instant may differ byte for byte, and a lexicographic comparison would order them
+///   by spelling;
+/// * a member whose `checkpoint_time` is not RFC 3339 sorts after every member whose is, so a
+///   malformed time can never win a selection. The remaining components make the order total,
+///   so two runs over the same series select the same member.
+#[must_use]
+pub fn series_order_key(checkpoint: &Checkpoint) -> (u64, bool, i128, &str, &str) {
+    let instant =
+        crate::evaluation::parse_artifact_time("checkpoint_time", &checkpoint.checkpoint_time).ok();
+    (
+        checkpoint.tree_size,
+        instant.is_none(),
+        instant.map_or(0, time::OffsetDateTime::unix_timestamp_nanos),
+        &checkpoint.root_hash,
+        &checkpoint.signature,
+    )
+}
+
 /// The lowest `tree_size` at which two **authenticated** members carry different roots.
 ///
 /// From that size the series is no longer canonical: no incorporation bound, enumeration
