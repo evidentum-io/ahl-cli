@@ -98,7 +98,8 @@ fn payload_of(envelope: &Value) -> CliResult<&Value> {
 }
 
 impl Governance {
-    /// Collect governance statements after **structural validation only**.
+    /// Collect governance statements after **structural validation only**, plus the findings
+    /// raised while collecting them.
     ///
     /// No producer signature is checked and no trust anchor is consulted, so the result is
     /// **not** an authenticated key set and must never be used to authenticate anything. It
@@ -106,14 +107,50 @@ impl Governance {
     /// operator-supplied file rather than to believe it. Authenticated callers use
     /// [`Self::resolve`].
     ///
+    /// # Nothing found while walking may end the walk
+    ///
+    /// Design note §6 fixes topology mode's whole contract in one sentence: rule violations
+    /// found while walking such a corpus are **findings, not verdicts — reported in full and
+    /// never suppressed**, with the outcome fixed at `3`. A defect in one entry that ended the
+    /// collection would silence every check that runs *after* it, so the corpus's remaining
+    /// violations would vanish from the output — and the one thing this mode exists to produce
+    /// is the list of violations. A shorter list is not a safer answer here; it is a wrong one.
+    ///
+    /// Every per-entry defect is therefore handled the way [`Self::resolve`] handles a
+    /// structurally broken envelope: the element is **excluded and reported**, its position in
+    /// the sequence is kept, and the walk continues. That covers an unreadable payload, a
+    /// missing statement type, a manifest whose `predecessor` does not link to the version
+    /// active immediately before it, and a `key` transition that is unusable — including one
+    /// whose `key_id` does not recompute from its `pubkey`, which must never join a key set
+    /// (core §2.3.6, adaptor §7.2) but equally must not take the rest of the corpus's report
+    /// down with it.
+    ///
     /// # Errors
     ///
-    /// [`CliError::RuleFired`] naming the structural rule that failed.
-    pub fn structural_only(entries: &[(u64, Value)]) -> CliResult<Self> {
+    /// Only for the two conditions that leave nothing to walk *against* rather than something
+    /// to report: entries that do not ascend by entry index, which is AHL's only ordering
+    /// primitive, and a corpus carrying no manifest at all, which leaves no key set for any
+    /// signature to be resolved against. The caller reports both — see [`crate::corpus::walk`],
+    /// which says in as many words that signatures were not checked and why, rather than
+    /// emitting a `signature-does-not-verify` for every entry whose real cause is the absent
+    /// chain.
+    pub fn structural_only(entries: &[(u64, Value)]) -> CliResult<(Self, Vec<Finding>)> {
         let mut manifests: Vec<(u64, Value)> = Vec::new();
         let mut events: Vec<KeyEvent> = Vec::new();
+        let mut findings: Vec<Finding> = Vec::new();
         let mut previous_manifest_entry_id: Option<String> = None;
         let mut previous_index: Option<u64> = None;
+
+        let excluded = |index: &u64, detail: String| {
+            Finding::new(
+                "governance-element-excluded",
+                format!(
+                    "the entry at entry index {index} is excluded from the corpus's governance \
+                     chain, its position in the sequence kept: {detail}. Nothing here is \
+                     evidence, so this is reported and the walk continues"
+                ),
+            )
+        };
 
         for (index, envelope) in entries {
             if previous_index.is_some_and(|previous| previous >= *index) {
@@ -125,46 +162,50 @@ impl Governance {
             }
             previous_index = Some(*index);
 
-            let payload = payload_of(envelope)?;
+            let payload = match payload_of(envelope) {
+                Ok(payload) => payload,
+                Err(source) => {
+                    findings.push(excluded(index, source.to_string()));
+                    continue;
+                }
+            };
             let Some(kind) = payload.get("type").and_then(Value::as_str) else {
-                return Err(CliError::RuleFired(format!(
-                    "entry at index {index} carries no statement type"
-                )));
+                findings.push(excluded(index, "it carries no statement type".to_owned()));
+                continue;
             };
             match kind {
                 "manifest" => {
                     let predecessor = payload.get("predecessor").and_then(Value::as_str);
-                    match (&previous_manifest_entry_id, predecessor) {
-                        (None, Some(_)) => {
-                            return Err(CliError::RuleFired(
-                                "the genesis manifest must carry no predecessor reference"
-                                    .to_owned(),
-                            ))
-                        }
+                    let refusal = match (&previous_manifest_entry_id, predecessor) {
+                        (None, Some(_)) => Some(
+                            "the genesis manifest must carry no predecessor reference".to_owned(),
+                        ),
                         (Some(_), None) => {
-                            return Err(CliError::RuleFired(
-                                "a non-genesis manifest must reference its predecessor".to_owned(),
-                            ))
+                            Some("a non-genesis manifest must reference its predecessor".to_owned())
                         }
                         // By *entry* id: signature identity matters for chain links (§2.3.5),
                         // and it must be the version active immediately before, not merely
                         // some earlier manifest in the log (adaptor §7.4.1 rule 3).
-                        (Some(want), Some(got)) if want != got => {
-                            return Err(CliError::RuleFired(format!(
-                                "manifest at entry index {index} references `{got}`, but the \
-                                 version active immediately before it is `{want}`"
-                            )))
-                        }
-                        _ => {}
+                        (Some(want), Some(got)) if want != got => Some(format!(
+                            "it references `{got}`, but the version active immediately before \
+                             it is `{want}`"
+                        )),
+                        _ => None,
+                    };
+                    if let Some(detail) = refusal {
+                        findings.push(excluded(index, detail));
+                        continue;
                     }
                     previous_manifest_entry_id = Some(entry_id(envelope));
                     manifests.push((*index, payload.clone()));
                 }
-                "key" => events.push(read_key_event(*index, payload).map_err(|detail| {
-                    CliError::RuleFired(format!(
-                        "`key` statement at entry index {index} is unusable: {detail}"
-                    ))
-                })?),
+                "key" => match read_key_event(*index, payload) {
+                    Ok(event) => events.push(event),
+                    Err(detail) => findings.push(excluded(
+                        index,
+                        format!("the `key` statement is unusable: {detail}"),
+                    )),
+                },
                 _ => {}
             }
         }
@@ -176,7 +217,9 @@ impl Governance {
                     .to_owned(),
             ));
         }
-        Ok(Self { manifests, events })
+        findings.sort();
+        findings.dedup();
+        Ok((Self { manifests, events }, findings))
     }
 
     /// Resolve governance **incrementally**, per adaptor §7.4.1.
@@ -1005,6 +1048,16 @@ mod tests {
         TestKey::from_seed_hex("producer", &format!("{seed:02x}").repeat(32)).expect("seed")
     }
 
+    /// The structural chain alone, for the many tests that only read a key set from it.
+    fn structural(entries: &[(u64, Value)]) -> Governance {
+        Governance::structural_only(entries).expect("chain").0
+    }
+
+    /// The findings a structural walk raised over `entries`.
+    fn structural_findings(entries: &[(u64, Value)]) -> Vec<Finding> {
+        Governance::structural_only(entries).expect("chain").1
+    }
+
     /// A `sha256:` family string, which core §7.3 requires of `log_id` and every `key_id`.
     fn family(byte: u8) -> String {
         format!("sha256:{}", hex::encode([byte; 32]))
@@ -1070,7 +1123,7 @@ mod tests {
 
         let mut incomplete = log_object(&family(0xaa), &[]);
         incomplete.as_object_mut().expect("object").remove("cadence_epoch");
-        let governance = Governance::structural_only(&[(0, manifest(incomplete))]).expect("chain");
+        let governance = structural(&[(0, manifest(incomplete))]);
         let findings = governance.log_object_findings();
         assert!(findings.iter().any(|f| f.code == "manifest-log-object-incomplete"));
         assert!(findings.iter().any(|f| f.detail.contains("cadence_epoch")), "{findings:?}");
@@ -1078,12 +1131,12 @@ mod tests {
         // A key object that cannot be read is reported too, rather than dropped: dropping one
         // shrinks the key set a signature resolves against without ever surfacing as an error.
         let broken = log_object(&family(0xaa), &[json!({ "key_id": family(0x11) })]);
-        let governance = Governance::structural_only(&[(0, manifest(broken))]).expect("chain");
+        let governance = structural(&[(0, manifest(broken))]);
         let findings = governance.log_object_findings();
         assert!(findings.iter().any(|f| f.detail.contains("pubkey")), "{findings:?}");
 
         // A conformant one raises nothing.
-        let governance = Governance::structural_only(&[(0, genesis("log_id"))]).expect("chain");
+        let governance = structural(&[(0, genesis("log_id"))]);
         assert!(governance.log_object_findings().is_empty());
     }
 
@@ -1111,9 +1164,9 @@ mod tests {
             }),
             &key,
         );
-        let error =
-            Governance::structural_only(&[(0, first), (5, wrong)]).expect_err("wrong predecessor");
-        assert!(error.to_string().contains("active immediately before"), "{error}");
+        let findings = structural_findings(&[(0, first), (5, wrong)]);
+        assert!(findings.iter().any(|f| f.code == "governance-element-excluded"), "{findings:?}");
+        assert!(findings.iter().any(|f| f.detail.contains("active immediately before")));
     }
 
     #[test]
@@ -1124,8 +1177,11 @@ mod tests {
                     "log": log_object(&family(0xaa), &[]) }),
             &key,
         );
-        let error = Governance::structural_only(&[(0, envelope)]).expect_err("genesis predecessor");
-        assert!(error.to_string().contains("no predecessor"), "{error}");
+        // Excluded and reported, so the corpus's remaining entries are still walked — and with
+        // the only manifest excluded there is no chain left to resolve against, which the
+        // caller reports in as many words.
+        let error = Governance::structural_only(&[(0, envelope)]).expect_err("no manifest is left");
+        assert!(error.to_string().contains("no manifest statement is anchored"), "{error}");
     }
 
     #[test]
@@ -1135,9 +1191,8 @@ mod tests {
             json!({ "type": "manifest", "keys": [], "log": log_object(&family(0xaa), &[]) }),
             &key,
         );
-        let error = Governance::structural_only(&[(0, genesis("log_id")), (5, second)])
-            .expect_err("no predecessor");
-        assert!(error.to_string().contains("must reference its predecessor"), "{error}");
+        let findings = structural_findings(&[(0, genesis("log_id")), (5, second)]);
+        assert!(findings.iter().any(|f| f.detail.contains("must reference its predecessor")));
     }
 
     #[test]
@@ -1155,7 +1210,7 @@ mod tests {
             &first_key,
         );
         let entries = vec![(0, first), (5, rotation)];
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
 
         // Before the rotation the first key is in force; after it, only the second.
         assert!(governance.producer_keys_at(3).contains_key(&first_key.key_id()));
@@ -1181,7 +1236,7 @@ mod tests {
             &first_key,
         );
         let entries = vec![(0, first), (3, add), (7, retire)];
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
 
         assert!(!governance.producer_keys_at(2).contains_key(&added.key_id()));
         assert!(governance.producer_keys_at(4).contains_key(&added.key_id()));
@@ -1195,7 +1250,8 @@ mod tests {
             json!({ "type": "key", "action": "borrow", "key": key.key_object(1) }),
             &key,
         );
-        assert!(Governance::structural_only(&[(0, genesis("log_id")), (1, bad)]).is_err());
+        let findings = structural_findings(&[(0, genesis("log_id")), (1, bad)]);
+        assert!(findings.iter().any(|f| f.detail.contains("unknown key action")), "{findings:?}");
     }
 
     #[test]
@@ -1216,7 +1272,7 @@ mod tests {
             &key,
         );
         let entries = vec![(0, first), (5, second)];
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
 
         // tree_size 5 commits [0, 5), so index 5 is NOT yet committed and genesis governs.
         assert_eq!(governance.log_id_for(5).expect("log id"), family(0xaa));
@@ -1237,7 +1293,7 @@ mod tests {
             }),
             &key,
         );
-        let governance = Governance::structural_only(&[(0, envelope)]).expect("chain");
+        let governance = structural(&[(0, envelope)]);
         let error = governance.cadence_and_grace_for(1).expect_err("prohibited component");
         assert!(error.to_string().contains("prohibited"), "{error}");
     }
@@ -1254,14 +1310,14 @@ mod tests {
             }),
             &key,
         );
-        let governance = Governance::structural_only(&[(0, envelope)]).expect("chain");
+        let governance = structural(&[(0, envelope)]);
         assert!(governance.cadence_and_grace_for(1).is_err());
     }
 
     #[test]
     fn log_and_witness_keys_come_from_the_active_manifest_version() {
         let entries = chain("log_id");
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
         assert!(governance.log_keys_for(1).expect("log keys").contains_key(&producer(3).key_id()));
         assert!(governance
             .witness_keys_for(1)
@@ -1272,7 +1328,7 @@ mod tests {
     #[test]
     fn dataset_authority_and_commitment_mode_are_read_from_the_snapshot() {
         let entries = chain("log_id");
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
         let authority = governance.dataset_authority(1, "customers").expect("declared");
         assert!(authority.contains(&producer(1).key_id()));
         assert_eq!(governance.dataset_commitment_mode(1, "customers").as_deref(), Some("keyed"));
@@ -1284,7 +1340,7 @@ mod tests {
         let key = producer(1);
         let stranger = producer(9);
         let entries = chain("log_id");
-        let governance = Governance::structural_only(&entries).expect("chain");
+        let governance = structural(&entries);
 
         let good = ahl_core::envelope(json!({ "type": "ingestion" }), &key);
         assert!(governance.envelope_verifies_at(&good, 1).expect("well-formed"));
@@ -1304,8 +1360,14 @@ mod tests {
 
     #[test]
     fn a_typeless_or_payloadless_entry_is_refused() {
-        assert!(Governance::structural_only(&[(0, json!({ "signatures": [] }))]).is_err());
-        assert!(Governance::structural_only(&[(0, json!({ "payload": { "a": 1 } }))]).is_err());
+        // Each is excluded and reported rather than ending the walk; with nothing else in the
+        // corpus, what remains is a chain with no manifest, which the caller reports.
+        for broken in [json!({ "signatures": [] }), json!({ "payload": { "a": 1 } })] {
+            let error = Governance::structural_only(&[(0, broken)]).expect_err("nothing usable");
+            assert!(error.to_string().contains("no manifest statement is anchored"), "{error}");
+        }
+        let findings = structural_findings(&[(0, genesis("log_id")), (1, json!({ "a": 1 }))]);
+        assert!(findings.iter().any(|f| f.code == "governance-element-excluded"), "{findings:?}");
     }
 
     // -- adaptor §7.4.1: governance is not self-authorizing ---------------------------
@@ -1848,7 +1910,7 @@ mod tests {
         let forged = forged_manifest(&first, &attacker, &producer(8));
         let entries = vec![(0, first), (5, forged)];
 
-        let structural = Governance::structural_only(&entries).expect("structurally fine");
+        let structural = structural(&entries);
         assert_eq!(structural.manifest_indexes(), vec![0, 5]);
 
         let (resolved, _) =
@@ -1860,14 +1922,14 @@ mod tests {
     #[test]
     fn a_log_object_without_the_specification_spelling_has_no_check_to_perform() {
         let entries = vec![(0, genesis("id"))];
-        let governance = Governance::structural_only(&entries).expect("structurally fine");
+        let governance = structural(&entries);
         let error = governance.log_id_for(1).expect_err("no log_id");
         assert!(error.to_string().contains("REQUIRED"), "{error}");
         assert!(error.to_string().contains("no check to perform"), "{error}");
 
         // The specification spelling resolves.
         let entries = vec![(0, genesis("log_id"))];
-        let governance = Governance::structural_only(&entries).expect("structurally fine");
+        let governance = structural(&entries);
         assert_eq!(governance.log_id_for(1).expect("log id"), family(0xaa));
     }
 }

@@ -1128,6 +1128,83 @@ fn row_a_rule_violation_inside_a_topology_corpus_keeps_the_outcome_at_three() {
 }
 
 #[test]
+fn row_a_defect_in_the_governance_chain_never_silences_the_rest_of_a_topology_corpus() {
+    // §6 fixes topology mode's contract: violations are findings, reported **in full** and
+    // never suppressed, with the outcome at `3`. Entry 1's `key` add carries a `key_id` that
+    // does not recompute from the `pubkey` beside it — it must never join a key set (core
+    // §2.3.6, adaptor §7.2) — and entry 2 is signed by a key nothing declares. Excluding the
+    // first must not take the second out of the report.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default());
+
+    // Two published test keys of the conformance corpus, used here only as key material: the
+    // id names one and the payload carries the other's public key.
+    let producer = ahl_core::TestKey::from_seed_hex("producer", &"01".repeat(32)).expect("seed");
+    let attacker = ahl_core::TestKey::from_seed_hex("attacker", &"7d".repeat(32)).expect("seed");
+    let fake = ahl_core::TestKey::from_seed_hex("fake", &"7c".repeat(32)).expect("seed");
+    let stranger = ahl_core::TestKey::from_seed_hex("stranger", &"09".repeat(32)).expect("seed");
+
+    let entries = serde_json::json!([
+        { "entry_index": 0, "envelope": ahl_core::envelope(
+            serde_json::json!({
+                "type": "manifest",
+                "producer": "producer-1",
+                "keys": [ producer.key_object(0) ],
+                "log": { "log_id": "sha256:aa", "keys": [] },
+            }), &producer) },
+        { "entry_index": 1, "envelope": ahl_core::envelope(
+            serde_json::json!({
+                "type": "key",
+                "action": "add",
+                "manifest": "sha256:aa",
+                "key": { "key_id": fake.key_id(), "pubkey": attacker.pubkey() },
+            }), &producer) },
+        { "entry_index": 2, "envelope": ahl_core::envelope(
+            serde_json::json!({
+                "type": "retraction", "manifest": "sha256:aa",
+                "dataset": "d", "record": "sha256:bb",
+                "scope": { "effective_from": "2026-01-01T00:00:00Z", "retroactive": true },
+            }), &stranger) },
+    ]);
+    let corpus_path = dir.path().join("corpus.json");
+    std::fs::write(&corpus_path, serde_json::to_vec(&entries).expect("serialize"))
+        .expect("write corpus");
+
+    let run = ahl_cli(&[
+        "--policy",
+        &policy_path.display().to_string(),
+        AT,
+        FIXED,
+        "--json",
+        "closure",
+        "--unauthenticated",
+        "--corpus",
+        &corpus_path.display().to_string(),
+        "--tree-material",
+        &fixtures().join("tree-material.json").display().to_string(),
+        "--trigger-index",
+        "2",
+    ]);
+    assert_eq!(run.code, 3, "{}{}", run.stdout, run.stderr);
+    let report = run.json();
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter_map(|finding| finding["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"governance-element-excluded"), "{codes:?}");
+    assert!(
+        codes.contains(&"signature-does-not-verify"),
+        "entry 2's violation disappeared behind the excluded element: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"corpus-governance-unresolvable"),
+        "one bad element must not make the chain unresolvable: {codes:?}"
+    );
+}
+
+#[test]
 fn row_witness_unreachable_leaves_verify_unchanged() {
     // Reachability is not assurance: `verify` is offline, and no witness endpoint — reachable
     // or not — can change its verdict.

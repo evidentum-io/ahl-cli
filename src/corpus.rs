@@ -207,17 +207,28 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
     let mut findings = corpus.findings.clone();
     let mut statement_ids: BTreeMap<String, u64> = BTreeMap::new();
 
-    // Governance may or may not be resolvable from an unauthenticated corpus; where it is not,
-    // that is itself reported rather than silently skipping every signature check.
+    // Governance may or may not be resolvable from an unauthenticated corpus. A defect in one
+    // entry never ends the collection — it is excluded and reported, and every later entry is
+    // still walked — so the two cases below are the only ones that leave no key set at all to
+    // resolve a signature against, and each is reported in as many words.
     let governance = Governance::structural_only(&corpus.entries);
-    if let Err(error) = &governance {
-        findings.push(Finding::new(
+    match &governance {
+        Ok((chain, governance_findings)) => {
+            findings.extend(governance_findings.iter().cloned());
+            // The manifest side of the same duty. A key object that cannot be read is left out
+            // of the key set — reading it leniently would quietly shrink the set a signature
+            // resolves against — so topology mode has to be told, and this is the only caller
+            // that builds a structural chain. `resolve` rejects such a manifest outright, so on
+            // an authenticated chain there is nothing here to say.
+            findings.extend(chain.log_object_findings());
+        }
+        Err(error) => findings.push(Finding::new(
             "corpus-governance-unresolvable",
             format!(
                 "producer signatures were not checked because the corpus's governance chain \
                  does not resolve: {error}"
             ),
-        ));
+        )),
     }
 
     for (index, envelope) in &corpus.entries {
@@ -306,7 +317,7 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
                 ),
             )),
             Some(_) => {
-                if let Ok(governance) = &governance {
+                if let Ok((governance, _)) = &governance {
                     match governance.envelope_verifies_at(envelope, *index) {
                         Ok(true) => {}
                         Ok(false) => findings.push(Finding::new(
@@ -466,6 +477,107 @@ mod tests {
         let path = dir.path().join("c.json");
         std::fs::write(&path, serde_json::to_vec(items).expect("serialize")).expect("write");
         load(&path, limits()).expect("loads")
+    }
+
+    #[test]
+    fn a_defect_in_the_governance_chain_never_silences_the_entries_after_it() {
+        // Design note §6 fixes topology mode's whole contract: rule violations found while
+        // walking are findings, reported **in full** and never suppressed, with the outcome at
+        // `3`. A defect that ended the collection would take every later check down with it,
+        // and the list of violations is the one thing this mode exists to produce — a shorter
+        // list is not a safer answer, it is a wrong one.
+        //
+        // The corpus is the smallest shape that shows it. Entry 1 carries a `key` add whose
+        // `key_id` does not recompute from the `pubkey` beside it: it must never join a key set
+        // (core §2.3.6, adaptor §7.2), so it is excluded — and its exclusion must not hide the
+        // ordinary signature violation sitting at entry 2.
+        let key = producer();
+        let attacker = TestKey::from_seed_hex("attacker", &"7d".repeat(32)).expect("seed");
+        let fake = TestKey::from_seed_hex("fake", &"7c".repeat(32)).expect("seed");
+        let stranger = TestKey::from_seed_hex("stranger", &"09".repeat(32)).expect("seed");
+
+        let corpus = corpus_of(&[
+            genesis(),
+            json!({ "entry_index": 1, "envelope": ahl_core::envelope(
+                json!({
+                    "type": "key",
+                    "action": "add",
+                    "manifest": "sha256:aa",
+                    "key": { "key_id": fake.key_id(), "pubkey": attacker.pubkey() },
+                }), &key) }),
+            json!({ "entry_index": 2, "envelope": ahl_core::envelope(
+                json!({ "type": "ingestion", "manifest": "sha256:aa", "dataset": "d",
+                        "record": "sha256:bb" }), &stranger) }),
+        ]);
+
+        let findings = walk(&corpus);
+        let codes: BTreeSet<&str> = findings.iter().map(|f| f.code.as_str()).collect();
+
+        // The forged binding is excluded, and said so.
+        assert!(codes.contains("governance-element-excluded"), "{findings:?}");
+        assert!(
+            findings.iter().any(|f| f.detail.contains("recomputes to")),
+            "the exclusion must name why the binding was refused: {findings:?}"
+        );
+        // And the attacker's key never reached the key set through it.
+        let (governance, _) = Governance::structural_only(&corpus.entries).expect("chain");
+        assert!(!governance.producer_keys_at(2).contains_key(&fake.key_id()));
+        assert!(!governance.producer_keys_at(2).contains_key(&attacker.key_id()));
+
+        // The violation *after* it is still reported — the whole point.
+        assert!(
+            codes.contains("signature-does-not-verify"),
+            "entry 2's signature violation disappeared behind the excluded element: {findings:?}"
+        );
+        assert!(
+            !codes.contains("corpus-governance-unresolvable"),
+            "one bad element must not make the chain unresolvable: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_broken_manifest_key_object_is_reported_without_silencing_the_entries_after_it() {
+        // The symmetric case. A manifest key object that cannot be read is left out of the key
+        // set — reading it leniently would quietly shrink the set a signature resolves against
+        // — but the structural walk does not stop there either, so entry 2's signature
+        // violation is still enumerated.
+        let key = producer();
+        let stranger = TestKey::from_seed_hex("stranger", &"09".repeat(32)).expect("seed");
+        let broken = json!({
+            "entry_index": 0,
+            "envelope": ahl_core::envelope(
+                json!({
+                    "type": "manifest",
+                    "producer": "producer-1",
+                    "keys": [ key.key_object(0) ],
+                    "log": { "log_id": "sha256:aa",
+                             "keys": [ { "key_id": "sha256:aa", "pubkey": "base64:zzz" } ] },
+                }),
+                &key,
+            ),
+        });
+        let corpus = corpus_of(&[
+            broken,
+            json!({ "entry_index": 1, "envelope": ahl_core::envelope(
+                json!({ "type": "ingestion", "manifest": "sha256:aa", "dataset": "d",
+                        "record": "sha256:aa" }), &key) }),
+            json!({ "entry_index": 2, "envelope": ahl_core::envelope(
+                json!({ "type": "ingestion", "manifest": "sha256:aa", "dataset": "d",
+                        "record": "sha256:bb" }), &stranger) }),
+        ]);
+
+        let findings = walk(&corpus);
+        let codes: BTreeSet<&str> = findings.iter().map(|f| f.code.as_str()).collect();
+        assert!(codes.contains("manifest-log-object-incomplete"), "{findings:?}");
+        assert!(codes.contains("signature-does-not-verify"), "{findings:?}");
+        assert!(!codes.contains("corpus-governance-unresolvable"), "{findings:?}");
+        // Entry 1 is signed by a key the manifest really does declare, so it is not reported.
+        assert!(
+            findings
+                .iter()
+                .all(|f| !(f.code == "signature-does-not-verify" && f.detail.contains("entry 1 "))),
+            "{findings:?}"
+        );
     }
 
     #[test]

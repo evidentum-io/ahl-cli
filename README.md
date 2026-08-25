@@ -67,6 +67,18 @@ nothing can be disproved: rule violations found while walking an operator-suppli
 **findings, not verdicts**, reported in full and never suppressed, with the outcome fixed at
 `3`. Only a failure to read or parse the file at all is `2`.
 
+"Never suppressed" is a rule about the whole walk, not about one entry. A defect found while
+collecting the corpus's governance chain — an unreadable payload, a missing statement type, a
+manifest whose `predecessor` does not link to the version active immediately before it, a `key`
+transition whose `key_id` does not recompute from its `pubkey` — **excludes that element and
+reports it** (`governance-element-excluded`), keeps its position in the sequence, and the walk
+continues. Ending the collection there would silence every check that runs after it, and the
+list of violations is the one thing this mode exists to produce: a shorter list is not a safer
+answer, it is a wrong one. Only two conditions leave nothing to walk *against* rather than
+something to report — entries that do not ascend by entry index, and a corpus carrying no
+manifest at all — and both say in as many words that signatures were not checked and why
+(`corpus-governance-unresolvable`).
+
 `inspect` exits `0` when a dump was produced and `1` when the bytes are present but are not a
 canonical receipt object. `0` there means "the dump exists" and never "the receipt is valid" —
 the output carries no verdict field for a consumer to misread.
@@ -231,8 +243,10 @@ the following is also visible at runtime, as a `findings[]` entry or a named rea
    key set in force at its own entry index — can only be applied by building the chain
    **incrementally**. `Governance::resolve` does that; `Governance::structural_only` explicitly
    does not, is named so, and is used only in topology mode where nothing is evidence. A
-   statement that fails is *ignored and reported* (`governance-statement-not-authorized`),
-   never fatal: §7.4.1 says such an entry "is not a fork of the corpus".
+   statement that fails is *ignored and reported* — `governance-statement-not-authorized` when
+   the chain is being resolved for real, `governance-element-excluded` when it is being
+   described in topology mode — never fatal: §7.4.1 says such an entry "is not a fork of the
+   corpus".
 2. **The order between core §2.1's two rules is unstated.** An envelope whose signatures do not
    all verify is not an AHL statement; separately, "if duplicates occur, the one with the
    smallest entry index governs and later ones are void". §2.1 does not say which applies
@@ -415,7 +429,9 @@ for them are gone:
   be read — is rejected and does not govern, and a genesis that breaks the schema is fatal
   because no later version can repair the corpus trust anchor. The
   `manifest-log-object-incomplete` finding survives only in `--unauthenticated` topology mode,
-  where nothing is evidence and every violation is a finding rather than a verdict. Every
+  where nothing is evidence and every violation is a finding rather than a verdict — and the
+  topology walk now asks for those findings, which it previously did not, so a manifest key
+  object that cannot be read is reported there rather than only left out of the key set. Every
   `key_id` is **recomputed from its `pubkey`** and a mismatch rejected — core §2.3.6 for
   producer keys, adaptor §7.2 and §6.5 step 4 for log and witness keys. The rule is about a
   *pair*, not a place, so it applies wherever a binding enters the resolved key set: a
