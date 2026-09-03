@@ -106,7 +106,15 @@ fn verify(
         what: "receipt",
         detail: "carries no `anchoring.adaptor.id`".to_owned(),
     })?;
-    let _resolved = profile::resolve(policy, &pinned)?;
+    let resolved = profile::resolve(policy, &pinned)?;
+    // The core recomputes the profile digest over the document it HOLDS, so it is handed the
+    // bytes this run read and hashed rather than a value asserted about them. The clone is
+    // what carries them; its own dataset-key bytes are wiped when it is dropped.
+    let mut held = policy.clone();
+    if let Some(capabilities) = policy.profiles.get(&pinned).map(|entry| entry.capabilities) {
+        held.trust.adaptor_profiles.insert(pinned.clone(), resolved.as_core(capabilities));
+    }
+    let policy = &held;
 
     let verdict = verify_receipt(&receipt, &policy.trust).map_err(|error| match error {
         // Never let a verifier incapability surface as a rule fired against the artifact.
@@ -427,9 +435,9 @@ fn freshness(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
-    use ahl_core::receipt::{AdaptorProfile, TrustPolicy};
+    use ahl_core::receipt::TrustPolicy;
     use serde_json::json;
 
     use super::*;
@@ -474,18 +482,19 @@ mod tests {
                     .as_str()
                     .expect("anchor")
                     .to_owned(),
-                genesis_key_ids: policy_block["genesis_key_ids"]
-                    .as_array()
-                    .expect("key ids")
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_owned))
-                    .collect(),
-                adaptor_profiles: BTreeMap::from([(
-                    "ahl-test-log-v1".to_owned(),
-                    AdaptorProfile { hash: profile_hash.clone(), capabilities },
-                )]),
+                genesis_key_ids: Some(
+                    policy_block["genesis_key_ids"]
+                        .as_array()
+                        .expect("key ids")
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_owned))
+                        .collect(),
+                ),
+                // Empty exactly as `policy::load` leaves it: the held document is installed
+                // from the resolution, at the point of use.
+                adaptor_profiles: BTreeMap::new(),
                 dataset_keys,
-                trusted_witness_key_ids: BTreeSet::new(),
+                trusted_witness_keys: BTreeMap::new(),
                 limits: ahl_core::receipt::Limits::default(),
             },
             profiles: BTreeMap::from([(
@@ -681,6 +690,7 @@ mod tests {
                 witnessed: false,
                 continued_history: false,
                 content_binding: "none".to_owned(),
+                canonicalization_namespace: None,
             },
             boundary: "anchored".to_owned(),
             embedded_receipts: 0,

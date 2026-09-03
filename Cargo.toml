@@ -1,6 +1,6 @@
 [package]
 name = "ahl-cli"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -34,7 +34,7 @@ name = "ahl-cli"
 path = "src/bin/ahl-cli.rs"
 
 [dependencies]
-ahl-core = { version = "0.1.0", path = "../ahl-core" }
+ahl-core = { version = "0.2.0", path = "../ahl-core" }
 # Anti-drift with the ATL family: Merkle root computation, inclusion and consistency proof
 # verification are never reimplemented here. Pinned by the same revision the siblings use.
 atl-core = { git = "https://github.com/evidentum-io/atl-core", rev = "79ac9c085857", version = "0.23.2", default-features = false }

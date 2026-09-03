@@ -323,7 +323,7 @@ fn with_locally_trusted(
     policy: &LoadedPolicy,
 ) -> std::collections::BTreeMap<String, String> {
     let mut trusted = declared.clone();
-    for key_id in &policy.trust.trusted_witness_key_ids {
+    for key_id in policy.trust.trusted_witness_keys.keys() {
         if let Some(pubkey) = declared.get(key_id) {
             trusted.insert(key_id.clone(), pubkey.clone());
         }

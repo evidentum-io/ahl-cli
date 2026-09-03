@@ -1,9 +1,20 @@
 //! The local trust policy, and the three kinds of input the boundaries between them define.
 //!
 //! **Trusted — `[policy]`.** Exactly the fields of [`ahl_core::receipt::TrustPolicy`]:
-//! `genesis_entry_id`, `genesis_key_ids`, `adaptor_profiles`, `trusted_witness_key_ids`,
+//! `genesis_entry_id`, `genesis_key_ids`, `adaptor_profiles`, `trusted_witness_keys`,
 //! `limits`. Operator-configured, never derived from an artifact. A missing
 //! `genesis_entry_id` is a configuration error, never an accept.
+//!
+//! A trusted witness key is configured as a whole entry — `pubkey` and `witness_id` beside the
+//! key id — because the identity is inside the cosignature preimage: a key trusted to cosign
+//! for one witness is not thereby trusted to cosign as another.
+//!
+//! `[policy.limits]` carries the two verifier-local budgets and nothing else. The embedded
+//! nesting depth and embedded-receipt count are fixed properties of the artifact
+//! ([`ahl_core::receipt::MAX_EMBEDDED_DEPTH`], [`ahl_core::receipt::MAX_EMBEDDED_RECEIPTS`]),
+//! so there is no key for them: a verifier able to lower either would refuse a receipt another
+//! verifier accepts. A policy still carrying `max_depth` or `max_embedded` is refused as an
+//! unknown key, like any other, rather than silently ignored.
 //!
 //! **Trusted only as secrets, held apart — `[policy.dataset_keys]`.** HMAC keys whose entire
 //! purpose is that unauthorized parties cannot compute the commitment. Read from a separate
@@ -21,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use ahl_core::receipt::{AdaptorCapabilities, AdaptorProfile, Limits, TrustPolicy};
+use ahl_core::receipt::{AdaptorCapabilities, Limits, TrustPolicy, TrustedWitnessKey};
 use serde::Deserialize;
 use zeroize::Zeroize as _;
 
@@ -147,13 +158,21 @@ struct PolicySection {
     genesis_entry_id: String,
     genesis_key_ids: Vec<String>,
     #[serde(default)]
-    trusted_witness_key_ids: Vec<String>,
+    trusted_witness_keys: BTreeMap<String, WitnessKeySection>,
     #[serde(default)]
     adaptor_profiles: BTreeMap<String, ProfileSection>,
     #[serde(default)]
     dataset_keys: BTreeMap<String, DatasetKeySection>,
     #[serde(default)]
     limits: Option<ReceiptLimitsSection>,
+}
+
+/// One witness key local policy already trusts, keyed by its `key_id`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WitnessKeySection {
+    pubkey: String,
+    witness_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,15 +196,12 @@ struct DatasetKeySection {
 }
 
 // As above: these field names are the `[policy.limits]` TOML keys, and they mirror
-// `ahl_core::receipt::Limits` member for member.
+// `ahl_core::receipt::Limits` member for member — the two verifier-local budgets, and nothing
+// else. `deny_unknown_fields` is what refuses a policy still carrying the fixed limits.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptLimitsSection {
-    #[serde(default)]
-    max_depth: Option<usize>,
-    #[serde(default)]
-    max_embedded: Option<usize>,
     #[serde(default)]
     max_decoded_bytes: Option<usize>,
     #[serde(default)]
@@ -326,22 +342,38 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
         require_family_string("policy.genesis_key_ids", key_id)?;
         genesis_key_ids.insert(key_id.clone());
     }
-    let mut trusted_witness_key_ids = BTreeSet::new();
-    for key_id in &file.policy.trusted_witness_key_ids {
-        require_family_string("policy.trusted_witness_key_ids", key_id)?;
-        trusted_witness_key_ids.insert(key_id.clone());
+    let mut trusted_witness_keys = BTreeMap::new();
+    for (key_id, section) in &file.policy.trusted_witness_keys {
+        require_family_string("policy.trusted_witness_keys.<key_id>", key_id)?;
+        if !section.pubkey.starts_with("base64:") {
+            return Err(CliError::Policy(format!(
+                "`policy.trusted_witness_keys.{key_id}.pubkey` must be a `base64:<...>` family \
+                 string, got `{}`",
+                section.pubkey
+            )));
+        }
+        if section.witness_id.is_empty() {
+            return Err(CliError::Policy(format!(
+                "`policy.trusted_witness_keys.{key_id}.witness_id` is empty; a key trusted to \
+                 cosign for one witness is not thereby trusted to cosign as another"
+            )));
+        }
+        trusted_witness_keys.insert(
+            key_id.clone(),
+            TrustedWitnessKey {
+                pubkey: section.pubkey.clone(),
+                witness_id: section.witness_id.clone(),
+            },
+        );
     }
 
     let mut profiles = BTreeMap::new();
-    let mut adaptor_profiles = BTreeMap::new();
     for (id, section) in file.policy.adaptor_profiles {
         require_family_string("policy.adaptor_profiles.<id>.hash", &section.hash)?;
         let capabilities = AdaptorCapabilities {
             checkpoint_raw: section.checkpoint_raw,
             consistency_proofs: section.consistency_proofs,
         };
-        adaptor_profiles
-            .insert(id.clone(), AdaptorProfile { hash: section.hash.clone(), capabilities });
         profiles.insert(
             id,
             ConfiguredProfile {
@@ -387,8 +419,6 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
 
     let default_limits = Limits::default();
     let limits = file.policy.limits.map_or(default_limits, |section| Limits {
-        max_depth: section.max_depth.unwrap_or(default_limits.max_depth),
-        max_embedded: section.max_embedded.unwrap_or(default_limits.max_embedded),
         max_decoded_bytes: section.max_decoded_bytes.unwrap_or(default_limits.max_decoded_bytes),
         max_work_units: section.max_work_units.unwrap_or(default_limits.max_work_units),
     });
@@ -420,10 +450,16 @@ fn from_parsed(file: PolicyFile, base: &Path) -> CliResult<LoadedPolicy> {
     Ok(LoadedPolicy {
         trust: TrustPolicy {
             genesis_entry_id: file.policy.genesis_entry_id,
-            genesis_key_ids,
-            adaptor_profiles,
+            // Held, and therefore compared. `None` is the core's "policy holds no genesis key
+            // fingerprints, so the comparison does not arise"; this CLI refuses an empty list
+            // above rather than reading one as the absence of a trust anchor.
+            genesis_key_ids: Some(genesis_key_ids),
+            // The held profile document is installed at the point of use, from the bytes that
+            // run read and hashed against the pinned value. Storing a document here would put
+            // a copy read at load time under a digest recomputed later.
+            adaptor_profiles: BTreeMap::new(),
             dataset_keys,
-            trusted_witness_key_ids,
+            trusted_witness_keys,
             limits,
         },
         profiles,
@@ -623,7 +659,7 @@ mod tests {
         );
         let loaded = load(&write_policy(dir.path(), &text)).expect("valid policy");
         assert_eq!(loaded.trust.limits.max_work_units, 7);
-        assert_eq!(loaded.trust.limits.max_depth, Limits::default().max_depth);
+        assert_eq!(loaded.trust.limits.max_decoded_bytes, Limits::default().max_decoded_bytes);
         assert_eq!(loaded.network.max_entries, 11);
         assert_eq!(loaded.network.max_total_bytes, NetworkLimits::default().max_total_bytes);
         assert_eq!(loaded.local.max_corpus_entries, 13);

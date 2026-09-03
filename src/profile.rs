@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use ahl_core::receipt::{AdaptorCapabilities, AdaptorProfile};
 use ahl_core::sha256_hex;
 
 use crate::error::{CliError, CliResult};
@@ -24,15 +25,34 @@ use crate::secure;
 /// Byte cap on an adaptor profile document.
 const PROFILE_CAP: usize = 8 << 20;
 
-/// A resolved profile: the id, the digest recomputed over the held bytes, and its size.
+/// A resolved profile: the id, the digest recomputed over the held bytes, and the bytes.
+///
+/// The document travels with the resolution because `ahl_core::receipt::AdaptorProfile` stores
+/// the artifact and recomputes its digest, never a digest asserted about it. Handing the core
+/// the very bytes this run read and checked is what keeps the two digests over one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProfile {
     /// The profile id, as pinned.
     pub id: String,
     /// The digest recomputed over the held document.
     pub hash: String,
-    /// Bytes of the held document, for the record.
-    pub size: usize,
+    /// The held document itself.
+    pub document: Vec<u8>,
+}
+
+impl ResolvedProfile {
+    /// Size of the held document in bytes.
+    #[must_use]
+    pub const fn size(&self) -> usize {
+        self.document.len()
+    }
+
+    /// The core's view of this profile: the held document, under the capabilities configured
+    /// for it.
+    #[must_use]
+    pub fn as_core(&self, capabilities: AdaptorCapabilities) -> AdaptorProfile {
+        AdaptorProfile { document: self.document.clone(), capabilities }
+    }
 }
 
 /// Resolve one profile by id against local possession.
@@ -66,7 +86,7 @@ fn resolve_configured(id: &str, configured: &ConfiguredProfile) -> CliResult<Res
             detail: format!("document hashes to {computed}, policy pins {}", configured.hash),
         });
     }
-    Ok(ResolvedProfile { id: id.to_owned(), hash: computed, size: bytes.len() })
+    Ok(ResolvedProfile { id: id.to_owned(), hash: computed, document: bytes })
 }
 
 /// Resolve every configured profile, so a broken local configuration is reported before any
@@ -116,7 +136,7 @@ mod tests {
         );
         let resolved = resolve(&policy, "p").expect("resolves");
         assert_eq!(resolved.hash, hash);
-        assert_eq!(resolved.size, document.len());
+        assert_eq!(resolved.size(), document.len());
     }
 
     #[test]

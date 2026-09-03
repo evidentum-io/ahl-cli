@@ -369,7 +369,7 @@ mod tests {
     use crate::testing::MirrorFixture;
 
     fn corpus_dir() -> PathBuf {
-        MirrorFixture::corpus_root().join("vectors/statements")
+        crate::testing::statements_with_published_tree_material(&std::env::temp_dir())
     }
 
     fn at_corpus_time() -> EvaluationTime {
@@ -648,7 +648,7 @@ mod tests {
     fn an_entry_that_is_not_a_statement_is_excluded_and_reported() {
         let fixture = MirrorFixture::conformance();
         let report =
-            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(31), 32));
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(29), 32));
         assert_eq!(report.status, "valid", "{}", report.reason);
         assert!(report.findings.iter().any(|f| f.code == "entry-is-not-a-statement"));
     }

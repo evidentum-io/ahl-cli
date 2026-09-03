@@ -468,7 +468,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "producer": "producer-1",
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa", "keys": [] },
                 }),
                 &key,
@@ -558,7 +558,7 @@ mod tests {
                     "type": "manifest",
                     "producer": "producer-1",
                     "predecessor": format!("sha256:{}", "aa".repeat(32)),
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa", "keys": [] },
                 }),
                 &key,
@@ -595,7 +595,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "producer": "producer-1",
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa",
                              "keys": [ { "key_id": "sha256:aa", "pubkey": "base64:zzz" } ] },
                 }),

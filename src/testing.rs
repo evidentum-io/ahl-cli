@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ahl_core::receipt::{AdaptorProfile, TrustPolicy};
+use ahl_core::receipt::TrustPolicy;
 use ahl_core::TestKey;
 use atl_core::core::merkle::{compute_root, Hash};
 use serde_json::{json, Value};
@@ -48,7 +48,7 @@ pub const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
 /// `unverifiable` — the deliberate refusal of the §5.2.2 item 3 carve-out, pinned by
 /// `the_genuinely_first_published_member_is_refused_and_the_refusal_is_deliberate` so that it
 /// stays a decision rather than an artefact of which sizes this list happens to carry.
-pub const CHECKPOINT_SIZES: [u64; 6] = [4, 8, 13, 20, 28, 32];
+pub const CHECKPOINT_SIZES: [u64; 7] = [4, 8, 13, 20, 28, 32, 38];
 
 /// One recorded exchange, in the shape [`crate::transcript`] replays.
 #[derive(Debug, Clone)]
@@ -312,7 +312,7 @@ impl MirrorFixture {
             "type": "manifest",
             "producer": "producer-1",
             "predecessor": predecessor,
-            "keys": [ attacker.key_object(0) ],
+            "keys": [ attacker.producer_key_object() ],
             "log": {
                 "log_id": self.log_id(),
                 "operator": "log-operator-1",
@@ -375,7 +375,7 @@ impl MirrorFixture {
                 "type": "manifest",
                 "producer": "producer-1",
                 "predecessor": predecessor,
-                "keys": [ producer.key_object(0) ],
+                "keys": [ producer.producer_key_object() ],
                 "log": log,
             }),
             &producer,
@@ -488,7 +488,7 @@ impl MirrorFixture {
                 "type": "manifest",
                 "producer": "producer-1",
                 "predecessor": predecessor,
-                "keys": [ attacker.key_object(0) ],
+                "keys": [ attacker.producer_key_object() ],
                 "log": {
                     "log_id": self.log_id(),
                     "operator": "log-operator-1",
@@ -931,14 +931,11 @@ pub fn corpus_policy(root: &Path) -> LoadedPolicy {
             genesis_key_ids: block
                 .get("genesis_key_ids")
                 .and_then(Value::as_array)
-                .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect())
-                .unwrap_or_default(),
-            adaptor_profiles: BTreeMap::from([(
-                TEST_LOG_PROFILE.to_owned(),
-                AdaptorProfile { hash: hash.clone(), capabilities },
-            )]),
+                .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect()),
+            // The held document is installed at the point of use; see `policy::load`.
+            adaptor_profiles: BTreeMap::new(),
             dataset_keys,
-            trusted_witness_key_ids: std::collections::BTreeSet::new(),
+            trusted_witness_keys: BTreeMap::new(),
             limits: ahl_core::receipt::Limits::default(),
         },
         profiles: BTreeMap::from([(
@@ -980,6 +977,57 @@ pub fn tree_material(root: &Path) -> Value {
     Value::Object(material)
 }
 
+/// The corpus statements a closure can be answered over, copied into a fresh directory.
+///
+/// A closure collects every committed tree root the corpus references **before** traversal
+/// begins, so that missing material is named rather than discovered halfway through. The
+/// conformance corpus deliberately contains a derivation whose committed tree the corpus
+/// publishes only inside the negative receipt vectors built on it, and a walk over the whole
+/// directory is therefore `unverifiable` for want of that material — correctly, and for a
+/// reason unrelated to what a topology-mode test is exercising. This is the same corpus
+/// without the statements whose roots [`tree_material`] does not carry, selected by that rule
+/// rather than by file name so a corpus that later publishes them needs no edit here.
+#[must_use]
+pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = dir.join(format!("statements.{}.{unique}", std::process::id()));
+    let _ = std::fs::create_dir_all(&out);
+
+    let root = MirrorFixture::corpus_root();
+    let material = tree_material(&root);
+    let published = |value: &Value| -> bool {
+        let Some(payload) = value.get("envelope").and_then(|e| e.get("payload")) else {
+            return true;
+        };
+        ["outputs_root", "affected_root"].iter().all(|member| {
+            payload
+                .get(*member)
+                .and_then(Value::as_str)
+                .is_none_or(|hash| material.get(hash).is_some())
+        })
+    };
+
+    let Ok(entries) = std::fs::read_dir(root.join("vectors/statements")) else { return out };
+    let mut files: Vec<PathBuf> =
+        entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+    files.sort();
+    for file in files {
+        if file.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&file) else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        if !published(&value) {
+            continue;
+        }
+        if let Some(name) = file.file_name() {
+            let _ = std::fs::write(out.join(name), &bytes);
+        }
+    }
+    out
+}
+
 /// Write [`tree_material`] into `dir` and return the path.
 ///
 /// The file name is unique per call: callers routinely pass a shared temporary directory, and
@@ -1013,9 +1061,9 @@ mod tests {
     #[test]
     fn the_fixture_loads_the_whole_conformance_corpus() {
         let fixture = MirrorFixture::conformance();
-        assert_eq!(fixture.entries.len(), 32, "the toy corpus is 32 entries");
+        assert_eq!(fixture.entries.len(), 38, "the toy corpus is 38 entries");
         assert!(fixture.log_id().starts_with("sha256:"));
-        assert_eq!(fixture.newest_tree_size(), 32);
+        assert_eq!(fixture.newest_tree_size(), 38);
     }
 
     #[test]
@@ -1094,7 +1142,10 @@ mod tests {
     fn the_corpus_policy_carries_the_published_anchor_and_dataset_key() {
         let policy = corpus_policy(&MirrorFixture::corpus_root());
         assert!(policy.trust.genesis_entry_id.starts_with("sha256:"));
-        assert_eq!(policy.trust.genesis_key_ids.len(), 1);
+        assert_eq!(
+            policy.trust.genesis_key_ids.as_ref().map(std::collections::BTreeSet::len),
+            Some(1)
+        );
         assert_eq!(policy.trust.dataset_keys["customers"].len(), 32);
         assert_eq!(identity_at(&MirrorFixture::conformance(), 8).tree_size, 8);
     }

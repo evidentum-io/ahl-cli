@@ -1284,8 +1284,8 @@ mod tests {
         let (dataset, record) = fixture.record_f();
         let governing = governing_trigger(&anchored, &dataset, &record).expect("governs");
         // Entry 22 is the authorized retraction; entry 23 is a challenge by a non-authority
-        // key, 28 and 29 carry non-verifying signatures, and 31 is co-signed by the authority.
-        assert_eq!(governing.entry_index, 31);
+        // key, 32 and 33 carry non-verifying signatures, and 29 is co-signed by the authority.
+        assert_eq!(governing.entry_index, 29);
         let codes: BTreeSet<&str> =
             governing.findings.iter().map(|finding| finding.code.as_str()).collect();
         assert!(codes.contains("trigger-anchored-as-challenge"));
@@ -1451,7 +1451,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             serde_json::json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": conformant_log_object(),
                 "datasets": { "d": { "commitment_mode": "plain",
                                      "authority": { "producer": "p", "key_ids": [honest.key_id()] } } },
@@ -1469,7 +1469,7 @@ mod tests {
         let entries = vec![(0, genesis), (1, forged), (2, genuine)];
         let policy = ahl_core::receipt::TrustPolicy {
             genesis_entry_id: ahl_core::entry_id(&entries[0].1),
-            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            genesis_key_ids: Some(std::collections::BTreeSet::from([honest.key_id()])),
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
@@ -1495,7 +1495,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             serde_json::json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": conformant_log_object(),
             }),
             &honest,
@@ -1513,7 +1513,7 @@ mod tests {
         let entries = vec![(0, genesis), (4, first), (9, second)];
         let policy = ahl_core::receipt::TrustPolicy {
             genesis_entry_id: ahl_core::entry_id(&entries[0].1),
-            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            genesis_key_ids: Some(std::collections::BTreeSet::from([honest.key_id()])),
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
@@ -1537,7 +1537,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             serde_json::json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": conformant_log_object(),
             }),
             &honest,
@@ -1550,7 +1550,7 @@ mod tests {
         let entries = vec![(0, genesis), (1, forged_first), (2, genuine_later)];
         let policy = ahl_core::receipt::TrustPolicy {
             genesis_entry_id: ahl_core::entry_id(&entries[0].1),
-            genesis_key_ids: std::collections::BTreeSet::from([honest.key_id()]),
+            genesis_key_ids: Some(std::collections::BTreeSet::from([honest.key_id()])),
             ..ahl_core::receipt::TrustPolicy::default()
         };
         let (governance, _) = Governance::resolve(&entries, &policy).expect("anchor holds");
