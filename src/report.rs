@@ -15,9 +15,16 @@
 //!
 //! **`status` is the receipt's own result**, in the I-D §7.7 vocabulary, and nothing rewrites
 //! it: exactly the reduction of `assertions[]` — `invalid` if any required assertion is
-//! `invalid`, otherwise `unverifiable` if any is `unverifiable`, otherwise `valid` — or `error`
-//! where the run produced no receipt report at all. Two conformant verifiers reach the same
-//! `status` over the same bytes, in every year, whatever either one's local policy says.
+//! `invalid`, otherwise `unverifiable` if any is `unverifiable`, otherwise `valid`. Two
+//! conformant verifiers reach the same `status` over the same bytes, in every year, whatever
+//! either one's local policy says.
+//!
+//! It is `null` wherever there is no such result to report, and that is exactly two cases:
+//! a command that verifies no receipt (`closure`, `reconstruct`), and a run that did not
+//! complete. §7.7 scopes the second out of the model in as many words — a local execution
+//! failure "says nothing about the receipt and MUST NOT be rendered as any of the three
+//! values" — so `error` is a value of `outcome` and never of `status`. Reporting `error` as a
+//! status would be the model's fourth value, which the model does not have.
 //!
 //! **`outcome` is this run's decision**, in the same vocabulary, after the locally configured
 //! conditions in `policy_overlays[]` are applied. **The exit code follows `outcome`.** Where no
@@ -209,16 +216,19 @@ pub struct RecordOut {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     /// **The receipt's own result** (I-D §7.7): exactly the reduction of [`Self::assertions`],
-    /// or `error` where the run produced no receipt report. Never rewritten by local policy.
+    /// one of `valid`, `invalid` and `unverifiable`. Never rewritten by local policy.
     ///
-    /// One of `valid`, `invalid`, `error`, `unverifiable`. Never `invalid` for a `3`.
-    pub status: &'static str,
-    /// **This run's decision**, in the same vocabulary: [`Self::status`] after the locally
-    /// configured conditions in [`Self::policy_overlays`] are applied. The process exit code
-    /// follows this member, not `status`.
+    /// `None` where there is no such result: a command that verifies no receipt, and a run that
+    /// did not complete. `error` is never a value here — §7.7 has three values and a
+    /// non-completing run reaches none of them — it is a value of [`Self::outcome`] alone.
+    pub status: Option<&'static str>,
+    /// **This run's decision**, and always present: one of `valid`, `invalid`, `error` and
+    /// `unverifiable`. The process exit code follows this member, not [`Self::status`].
     ///
-    /// Equal to `status` wherever no overlay applied. An overlay moves it from `valid` to
-    /// `unverifiable` and nothing else.
+    /// For a receipt, it is `status` after the locally configured conditions in
+    /// [`Self::policy_overlays`] are applied — equal to it wherever no overlay applied, and
+    /// moved from `valid` to `unverifiable` by one where it did. For a command that verifies no
+    /// receipt it is that command's own result, and `status` is `None` beside it.
     pub outcome: &'static str,
     /// Stable machine string naming the class of result.
     pub reason_code: String,
@@ -290,7 +300,8 @@ pub struct Report {
 }
 
 impl Report {
-    /// A report carrying nothing but an outcome and its reason.
+    /// A report from a command that verifies **no receipt**: [`Self::status`] is `None`, and
+    /// `outcome` carries the command's own result.
     #[must_use]
     pub fn new(
         outcome: Outcome,
@@ -300,7 +311,7 @@ impl Report {
         evaluation_time_source: TimeSource,
     ) -> Self {
         Self {
-            status: outcome.as_str(),
+            status: None,
             outcome: outcome.as_str(),
             reason_code: reason_code.into(),
             reason: reason.into(),
@@ -324,6 +335,31 @@ impl Report {
         }
     }
 
+    /// A report **over a receipt**: [`Self::status`] carries its I-D §7.7 result, and
+    /// [`Self::outcome`] starts equal to it.
+    ///
+    /// `outcome` is the argument in full, so a run that did not complete still reports `error`
+    /// there; `status` takes only the three values a completed run reaches, and is `None` for
+    /// that one.
+    #[must_use]
+    pub fn over_receipt(
+        outcome: Outcome,
+        reason_code: impl Into<String>,
+        reason: impl Into<String>,
+        evaluation_time: String,
+        evaluation_time_source: TimeSource,
+    ) -> Self {
+        let mut report =
+            Self::new(outcome, reason_code, reason, evaluation_time, evaluation_time_source);
+        // The three values a completed run reaches, in this crate's spelling of them; `error`
+        // is not one of them, so it leaves `status` empty.
+        report.status = match outcome {
+            Outcome::Error => None,
+            settled => Some(settled.as_str()),
+        };
+        report
+    }
+
     /// Apply the locally configured conditions already in [`Self::policy_overlays`] to
     /// [`Self::outcome`], leaving [`Self::status`] alone.
     ///
@@ -338,7 +374,7 @@ impl Report {
     /// nowhere else — so the rule lives here, in the one place that can move `outcome`, rather
     /// than at each call site that sets a boundary.
     pub fn apply_policy_overlays(&mut self) {
-        if !self.policy_overlays.is_empty() && self.status == Outcome::Valid.as_str() {
+        if !self.policy_overlays.is_empty() && self.outcome == Outcome::Valid.as_str() {
             self.outcome = Outcome::Unverifiable.as_str();
             self.boundary = None;
         }
@@ -378,13 +414,16 @@ impl Report {
         // local policy moved it, the two answers are spelled out on their own line so no reader
         // mistakes a condition of this run for the receipt's own result.
         let _ = writeln!(out, "outcome: {}", self.outcome);
-        if self.outcome != self.status {
+        // Only where a receipt result exists AND local policy moved the decision off it: with
+        // no receipt there is nothing to distinguish, and with no overlay nothing distinguishes
+        // them.
+        if self.status.is_some_and(|status| status != self.outcome) {
             let deciding: Vec<&str> =
                 self.policy_overlays.iter().map(|overlay| overlay.overlay.as_str()).collect();
             let _ = writeln!(
                 out,
                 "receipt result: {}; policy: {} ({})",
-                self.status,
+                self.status.unwrap_or_default(),
                 self.outcome,
                 deciding.join(", ")
             );
@@ -507,8 +546,9 @@ const fn bound_str(value: ObservationBound) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A report over a receipt, as `verify` builds one.
     fn report() -> Report {
-        Report::new(
+        Report::over_receipt(
             Outcome::Valid,
             "verified",
             "every required rule verified",
@@ -581,7 +621,7 @@ mod tests {
             detail: "older than the grace period".to_owned(),
         }];
         report.apply_policy_overlays();
-        assert_eq!(report.status, "valid", "the receipt's own result is never rewritten");
+        assert_eq!(report.status, Some("valid"), "the receipt's own result is never rewritten");
         assert_eq!(report.outcome, "unverifiable", "the run's decision carries the overlay");
 
         // The text says both, so a policy decision is never read as the §7.7 result.
@@ -593,7 +633,7 @@ mod tests {
         );
 
         // An overlay never weakens a receipt result that was not `valid` to begin with.
-        let mut invalid = Report::new(
+        let mut invalid = Report::over_receipt(
             Outcome::Invalid,
             "cross-field",
             "an assurance member overstates what the receipt proves",
@@ -602,9 +642,47 @@ mod tests {
         );
         invalid.policy_overlays = report.policy_overlays.clone();
         invalid.apply_policy_overlays();
-        assert_eq!(invalid.status, "invalid");
+        assert_eq!(invalid.status, Some("invalid"));
         assert_eq!(invalid.outcome, "invalid", "an overlay only ever moves `valid`");
         assert!(!invalid.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
+    fn a_command_that_verifies_no_receipt_reports_no_receipt_result() {
+        // The result model has three values and a receipt to attach them to. A command that
+        // verifies none has no §7.7 result to report, and reporting its own decision under
+        // `status` would put a value there that no reduction produced.
+        let report = Report::new(
+            Outcome::Unverifiable,
+            "topology-mode",
+            "nothing here is authenticated",
+            "2026-08-17T00:00:00Z".to_owned(),
+            TimeSource::Override,
+        );
+        assert_eq!(report.status, None);
+        assert_eq!(report.outcome, "unverifiable", "the command's own decision stands");
+        assert!(report.assertions.is_none());
+        let json = report.to_json().expect("serializes");
+        assert!(json.contains("\"status\": null"), "{json}");
+        let text = report.to_text();
+        assert!(text.starts_with("outcome: unverifiable\n"), "{text}");
+        assert!(!text.contains("status:"), "no receipt result line: {text}");
+        assert!(!text.contains("receipt result:"), "nothing to disambiguate: {text}");
+    }
+
+    #[test]
+    fn a_run_that_did_not_complete_reports_no_receipt_result_either() {
+        // §7.7 scopes a non-completing run out of the model: it "MUST NOT be rendered as any of
+        // the three values", so `error` is a value of `outcome` and never of `status`.
+        let report = Report::over_receipt(
+            Outcome::Error,
+            "execution-failed",
+            "the run stopped",
+            "2026-08-17T00:00:00Z".to_owned(),
+            TimeSource::Override,
+        );
+        assert_eq!(report.status, None, "`error` is not one of the three values");
+        assert_eq!(report.outcome, "error");
     }
 
     #[test]
@@ -621,7 +699,7 @@ mod tests {
 
     #[test]
     fn unverifiable_is_never_rendered_as_invalid_on_either_surface() {
-        let report = Report::new(
+        let report = Report::over_receipt(
             Outcome::Unverifiable,
             "evidence-missing",
             "the mirror did not answer",

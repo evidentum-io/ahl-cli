@@ -64,7 +64,10 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
             other => panic!("unknown expectation `{other}` for {file}"),
         };
         assert_eq!(run.code, code, "{file}: {}", report["reason"]);
+        // The receipt's own result, and this run's decision beside it. No policy overlay
+        // applies here, so the two agree.
         assert_eq!(report["status"], status, "{file}");
+        assert_eq!(report["outcome"], status, "{file}");
 
         if expect == "verified" {
             assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
@@ -176,7 +179,9 @@ fn every_closure_vector_is_reproduced_through_the_binary() {
         };
 
         let report = run.json();
-        if report["status"] == "valid" {
+        // `closure` verifies no receipt, so it reports no §7.7 result: its answer is `outcome`.
+        assert!(report["status"].is_null(), "{}: {report}", path.display());
+        if report["outcome"] == "valid" {
             assert_eq!(
                 report["affected"].as_array().expect("affected"),
                 &expected,

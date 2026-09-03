@@ -13,12 +13,15 @@
 //! and a run that does not complete reaches none of them. This command maps that model onto
 //! the §6 exit-code contract and adds nothing to it:
 //!
-//! | §7.7 result | `status` | Exit, where no overlay applied |
-//! |---|---|---|
-//! | `verified` | `valid` | `0` |
-//! | `invalid` | `invalid` | `1` |
-//! | `unverifiable` | `unverifiable` | `3` |
-//! | no result — the run did not complete | `error` | `2` |
+//! | §7.7 result | `status` | `outcome`, where no overlay applied | Exit |
+//! |---|---|---|---|
+//! | `verified` | `valid` | `valid` | `0` |
+//! | `invalid` | `invalid` | `invalid` | `1` |
+//! | `unverifiable` | `unverifiable` | `unverifiable` | `3` |
+//! | no result — the run did not complete | `null` | `error` | `2` |
+//!
+//! `error` is a value of `outcome` alone. §7.7 has three values and a non-completing run
+//! reaches none of them, so reporting one as a `status` would invent the model's fourth.
 //!
 //! Which of `invalid` and `unverifiable` a rejection produces is decided by the core, from the
 //! rule that fired, and is never re-derived here: a verifier-local condition reported as
@@ -106,7 +109,7 @@ pub fn run(policy: &LoadedPolicy, evaluation: &EvaluationTime, options: &Options
     match verify(policy, evaluation, options) {
         Ok(report) => report,
         Err(error) => {
-            let mut report = Report::new(
+            let mut report = Report::over_receipt(
                 error.outcome(),
                 error.reason_code(),
                 error.to_string(),
@@ -356,7 +359,7 @@ fn unsupported_version(receipt: &Value, evaluation: &EvaluationTime) -> Option<R
     // The core's own wording, so a consumer reads the same reason whichever of the two reached
     // the version first.
     let detail = ReceiptError::UnsupportedVersion { field, expected, got }.to_string();
-    let mut report = Report::new(
+    let mut report = Report::over_receipt(
         Outcome::Unverifiable,
         Assertion::Versions.name(),
         detail.clone(),
@@ -441,8 +444,13 @@ fn rejected(
         (core.result.name().to_owned(), format!("the receipt is {}", core.result))
     });
 
-    let mut report =
-        Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
+    let mut report = Report::over_receipt(
+        outcome,
+        reason_code,
+        reason,
+        evaluation.rendered.clone(),
+        evaluation.source,
+    );
     report.claim_type = receipt
         .get("claim")
         .and_then(|claim| claim.get("type"))
@@ -512,8 +520,13 @@ fn succeeded(
         })
         .unwrap_or_else(|| ("verified".to_owned(), "every required rule verified".to_owned()));
 
-    let mut report =
-        Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
+    let mut report = Report::over_receipt(
+        outcome,
+        reason_code,
+        reason,
+        evaluation.rendered.clone(),
+        evaluation.source,
+    );
     report.claim_type = Some(verdict.claim_type.clone());
     // Only `verified` may be rendered in words that assert the property, and never more
     // strongly than the boundary `ahl_core::receipt::Verdict` carries. This arm has the
@@ -728,7 +741,7 @@ mod tests {
                 "unverifiable" => "unverifiable",
                 other => panic!("unknown expectation `{other}` for {file}"),
             };
-            assert_eq!(report.status, status, "{file}: {}", report.reason);
+            assert_eq!(report.status, Some(status), "{file}: {}", report.reason);
 
             if expect == "verified" {
                 assert_eq!(report.claim_type.as_deref(), vector["claim_type"].as_str(), "{file}");
@@ -768,7 +781,7 @@ mod tests {
         // show the anchoring and introduction findings as `verified` and the content-binding
         // finding as `unverifiable`".
         let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "content-binding");
         assert!(report.boundary.is_none(), "a boundary is rendered for `verified` alone");
 
@@ -819,19 +832,19 @@ mod tests {
         let mut old_version = source;
         old_version["spec_version"] = json!("0.3.0");
         let report = run_over("v.ahl", &old_version, true);
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "versions");
 
         // The version, on bytes that are not the JCS serialization.
         let report = run_over("v-noncanonical.ahl", &old_version, false);
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "versions");
 
         // The version, on a receipt naming no adaptor profile.
         let mut no_adaptor = old_version;
         no_adaptor["anchoring"]["adaptor"] = json!({});
         let report = run_over("v-no-adaptor.ahl", &no_adaptor, true);
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "versions");
         assert!(report.reason.contains("0.3.0"), "the carried value is named: {}", report.reason);
 
@@ -875,7 +888,8 @@ mod tests {
                 &Options { receipt: path, require_fresh: false },
             );
             assert_eq!(
-                report.status, "invalid",
+                report.status,
+                Some("invalid"),
                 "{broken:?}: the core decides the malformed first member: {}",
                 report.reason
             );
@@ -891,7 +905,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: path, require_fresh: false },
         );
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "versions");
         assert!(report.reason.contains("ahl_receipt_version"), "{}", report.reason);
     }
@@ -915,7 +929,7 @@ mod tests {
                 &at_corpus_time(),
                 &Options { receipt: path, require_fresh: false },
             );
-            assert_eq!(report.status, "invalid", "{}", report.reason);
+            assert_eq!(report.status, Some("invalid"), "{}", report.reason);
         }
     }
 
@@ -946,7 +960,7 @@ mod tests {
         std::fs::write(&path, b"{not json").expect("write");
         let report =
             run(&policy, &at_corpus_time(), &Options { receipt: path, require_fresh: false });
-        assert_eq!(report.status, "invalid");
+        assert_eq!(report.status, Some("invalid"));
         assert_eq!(sole(&report), ("structure".to_owned(), "invalid".to_owned()));
 
         // Bytes that are JSON but not the JCS serialization.
@@ -954,7 +968,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec_pretty(&source).expect("pretty")).expect("write");
         let report =
             run(&policy, &at_corpus_time(), &Options { receipt: path, require_fresh: false });
-        assert_eq!(report.status, "invalid");
+        assert_eq!(report.status, Some("invalid"));
         assert_eq!(sole(&report), ("structure".to_owned(), "invalid".to_owned()));
 
         // A profile local policy does not hold: `unverifiable`, on the profile assertion.
@@ -962,7 +976,7 @@ mod tests {
         without.profiles.clear();
         without.trust.adaptor_profiles.clear();
         let report = verify_vector("statement-anchored-valid.ahl", &without);
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.status, Some("unverifiable"));
         assert_eq!(sole(&report), ("adaptor-profile".to_owned(), "unverifiable".to_owned()));
 
         // And a run that reached no result at all reports none: it is not a receipt report.
@@ -971,7 +985,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: dir.path().join("absent.ahl"), require_fresh: false },
         );
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert!(report.assertions.is_none(), "a local failure carries no §7.7 value");
     }
 
@@ -994,7 +1008,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: dir.path().join("absent.ahl"), require_fresh: false },
         );
-        assert_eq!(absent.status, "error");
+        assert_eq!(absent.outcome, "error");
 
         let malformed_path = dir.path().join("bad.ahl");
         std::fs::write(&malformed_path, b"{not json").expect("write");
@@ -1003,7 +1017,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: malformed_path, require_fresh: false },
         );
-        assert_eq!(malformed.status, "invalid");
+        assert_eq!(malformed.status, Some("invalid"));
         assert_eq!(malformed.reason_code, "malformed");
     }
 
@@ -1022,7 +1036,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: path, require_fresh: false },
         );
-        assert_eq!(report.status, "invalid");
+        assert_eq!(report.status, Some("invalid"));
         assert!(report.reason.contains("JCS-canonical"), "{}", report.reason);
     }
 
@@ -1032,7 +1046,7 @@ mod tests {
         policy.profiles.clear();
         policy.trust.adaptor_profiles.clear();
         let report = verify_vector("statement-anchored-valid.ahl", &policy);
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.status, Some("unverifiable"));
         assert_eq!(report.reason_code, "profile-not-possessed");
     }
 
@@ -1046,7 +1060,7 @@ mod tests {
             profile.path = tampered;
         }
         let report = verify_vector("statement-anchored-valid.ahl", &policy);
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert_eq!(report.reason_code, "profile-broken");
     }
 
@@ -1055,7 +1069,7 @@ mod tests {
         // The note is informative: it is attributed to the receipt and never rendered as
         // something the run established.
         let report = verify_vector("statement-anchored-valid.ahl", &corpus_policy(true));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.status, Some("valid"), "{}", report.reason);
         let note = report.receipt_note.as_deref().expect("the corpus receipt carries a note");
         assert!(!note.is_empty());
         assert!(
@@ -1075,7 +1089,7 @@ mod tests {
 
         let finding_only =
             run(&policy, &much_later, &Options { receipt: path.clone(), require_fresh: false });
-        assert_eq!(finding_only.status, "valid", "staleness is never by itself a disproof");
+        assert_eq!(finding_only.status, Some("valid"), "staleness is never by itself a disproof");
         assert!(finding_only.findings.iter().any(|f| f.code == "witness-stale"));
 
         assert!(finding_only.boundary.is_some(), "a valid result renders the boundary");
@@ -1084,18 +1098,18 @@ mod tests {
             assertions.iter().all(|entry| entry.outcome == "verified"),
             "without the flag nothing overlays the core's set: {assertions:?}"
         );
-        assert_eq!(reduction(assertions), finding_only.status);
+        assert_eq!(Some(reduction(assertions)), finding_only.status);
         assert!(
             finding_only.policy_overlays.is_empty(),
             "without the flag freshness is a finding, not an overlay"
         );
-        assert_eq!(finding_only.outcome, finding_only.status, "no overlay, no difference");
+        assert_eq!(Some(finding_only.outcome), finding_only.status, "no overlay, no difference");
         assert!(!finding_only.to_text().contains("receipt result:"));
 
         let promoted = run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
         // The receipt's own result is untouched; the run's decision carries the overlay, and
         // the exit code follows the decision.
-        assert_eq!(promoted.status, "valid", "local policy never rewrites the §7.7 result");
+        assert_eq!(promoted.status, Some("valid"), "local policy never rewrites the §7.7 result");
         assert_eq!(promoted.outcome, "unverifiable");
         assert!(promoted.findings.iter().any(|f| f.code == "witness-stale"));
         // A boundary asserts the property in words, so it is rendered where the FINAL status is
@@ -1132,7 +1146,7 @@ mod tests {
         );
         // `status` is the reduction of the assertions and stays there; `outcome` is what the
         // overlay moved, and the text spells the difference out on its own line.
-        assert_eq!(reduction(assertions), promoted.status);
+        assert_eq!(Some(reduction(assertions)), promoted.status);
         assert_eq!(promoted.reason_code, FRESHNESS, "the headline describes `outcome`");
         let text = promoted.to_text();
         assert!(text.starts_with("outcome: unverifiable\n"), "{text}");
@@ -1170,7 +1184,7 @@ mod tests {
         let mut policy = corpus_policy(true);
         policy.trust.limits.max_work_units = 3;
         let report = verify_vector("statement-anchored-valid.ahl", &policy);
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(report.reason_code, "resource-limits");
         assert!(report.reason.contains("verification work units"), "{}", report.reason);
         assert!(report.reason.contains('3'), "the value in force: {}", report.reason);
@@ -1204,7 +1218,7 @@ mod tests {
                 require_fresh: true,
             },
         );
-        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.status, Some("unverifiable"), "{}", report.reason);
         assert_eq!(
             report.reason_code, "content-binding",
             "the core's cause leads, not the CLI overlay: {}",
@@ -1228,7 +1242,7 @@ mod tests {
                 require_fresh: true,
             },
         );
-        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.status, Some("invalid"), "{}", report.reason);
         assert_eq!(report.outcome, "invalid", "an overlay never weakens an `invalid`");
         assert_eq!(report.reason_code, "claim-material", "the core's cause still leads");
         assert!(
@@ -1264,7 +1278,7 @@ mod tests {
         let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
         let report =
             run(&corpus_policy(true), &much_later, &Options { receipt: path, require_fresh: true });
-        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.status, Some("invalid"), "{}", report.reason);
         assert_eq!(report.outcome, "invalid", "an overlay never weakens an `invalid`");
         let assertions = report.assertions.as_ref().expect("assertions");
         assert!(
@@ -1296,18 +1310,18 @@ mod tests {
             let file = vector["file"].as_str().expect("file");
             let report = verify_vector(file, &policy);
             let assertions = report.assertions.as_ref().expect("assertions are always reported");
-            assert_eq!(reduction(assertions), report.status, "{file}: {}", report.reason);
+            assert_eq!(Some(reduction(assertions)), report.status, "{file}: {}", report.reason);
         }
 
         // And with the one capability gap the corpus policy can withhold.
         let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
-        assert_eq!(reduction(report.assertions.as_ref().expect("assertions")), report.status);
+        assert_eq!(Some(reduction(report.assertions.as_ref().expect("assertions"))), report.status);
     }
 
     #[test]
     fn a_fresh_cosignature_raises_no_staleness_finding() {
         let report = verify_vector("statement-anchored-valid.ahl", &corpus_policy(true));
-        assert_eq!(report.status, "valid");
+        assert_eq!(report.status, Some("valid"));
         assert!(!report.findings.iter().any(|f| f.code == "witness-stale"));
     }
 
@@ -1318,7 +1332,7 @@ mod tests {
         // and the `log_id` spelling is required rather than aliased, which is what makes the
         // vectors below resolve at all.
         let report = verify_vector("statement-anchored-valid.ahl", &corpus_policy(true));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.status, Some("valid"), "{}", report.reason);
         assert!(
             !report.findings.iter().any(|f| f.code == "manifest-log-object-incomplete"),
             "unexpected log-object findings: {:?}",
@@ -1350,7 +1364,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: path, require_fresh: false },
         );
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.status, Some("unverifiable"));
         assert_eq!(report.reason_code, "profile-not-possessed");
     }
 
@@ -1364,7 +1378,7 @@ mod tests {
             &at_corpus_time(),
             &Options { receipt: path, require_fresh: false },
         );
-        assert_eq!(report.status, "invalid");
+        assert_eq!(report.status, Some("invalid"));
     }
 
     #[test]
@@ -1375,15 +1389,15 @@ mod tests {
         // `an_unreadable_receipt_is_an_error_and_a_malformed_one_is_invalid`.
         let policy = corpus_policy(true);
         let verified = verify_vector("statement-anchored-valid.ahl", &policy);
-        assert_eq!(verified.status, "valid");
+        assert_eq!(verified.status, Some("valid"));
         assert_eq!(Outcome::Valid.exit_code(), 0);
 
         let invalid = verify_vector("overclaim-must-fail.ahl", &policy);
-        assert_eq!(invalid.status, "invalid", "{}", invalid.reason);
+        assert_eq!(invalid.status, Some("invalid"), "{}", invalid.reason);
         assert_eq!(Outcome::Invalid.exit_code(), 1);
 
         let unverifiable = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
-        assert_eq!(unverifiable.status, "unverifiable", "{}", unverifiable.reason);
+        assert_eq!(unverifiable.status, Some("unverifiable"), "{}", unverifiable.reason);
         assert_eq!(Outcome::Unverifiable.exit_code(), 3);
         assert_ne!(unverifiable.status, invalid.status, "never rendered as the other");
     }
@@ -1391,7 +1405,7 @@ mod tests {
     fn a_receipt_carrying_a_verifying_consistency_path_is_valid() {
         let report =
             verify_vector("statement-anchored-continued-history.ahl", &corpus_policy(true));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.status, Some("valid"), "{}", report.reason);
         assert_eq!(
             report.assurance.as_ref().map(|assurance| assurance.continued_history),
             Some(true)
@@ -1400,7 +1414,7 @@ mod tests {
     #[test]
     fn an_invalid_result_prints_the_assertion_table_and_never_a_boundary() {
         let report = verify_vector("overclaim-must-fail.ahl", &corpus_policy(true));
-        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.status, Some("invalid"), "{}", report.reason);
         assert!(report.boundary.is_none());
         let text = report.to_text();
         assert!(!text.contains("boundary:"), "{text}");
@@ -1420,7 +1434,7 @@ mod tests {
             "statement-anchored-continued-history-wrong-pair-must-fail.ahl",
             &corpus_policy(true),
         );
-        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.status, Some("invalid"), "{}", report.reason);
         assert_eq!(report.reason_code, "anchoring");
         assert!(report.boundary.is_none(), "a boundary is rendered for `verified` alone");
     }

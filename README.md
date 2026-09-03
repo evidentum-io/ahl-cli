@@ -59,9 +59,13 @@ family canon still reads them correctly. `3` is a documented AHL extension and i
 rendered as INVALID in any surface — text, JSON, or exit status.
 
 **`status` is the receipt's result; `outcome` is this run's decision, and the exit code follows
-`outcome`.** `status` is exactly the result model's reduction of `assertions[]`, so two
-conformant verifiers reach the same value over the same bytes whatever either one's local policy
-says, and nothing rewrites it. `outcome` is `status` after the locally configured conditions in
+`outcome`.** `status` is exactly the result model's reduction of `assertions[]` — one of `valid`,
+`invalid` and `unverifiable` — so two conformant verifiers reach the same value over the same
+bytes whatever either one's local policy says, and nothing rewrites it. It is `null` wherever
+there is no such result to report, and that is exactly two cases: a command that verifies no
+receipt (`closure`, `reconstruct`), and a run that did not complete. `error` is therefore a value
+of `outcome` alone — the result model has three values and a non-completing run reaches none of
+them, so reporting one under `status` would invent a fourth. `outcome` is `status` after the locally configured conditions in
 `policy_overlays[]` are applied — a move from `valid` to `unverifiable` and nothing else.
 Almost always the two are equal; where they differ, the text surface says so on its own line
 (`receipt result: valid; policy: unverifiable (witness-freshness)`) so no reader mistakes a
@@ -532,8 +536,10 @@ silently:
   An overlay is evaluated on every completed run and reported whatever the receipt's result was.
   It can only ever move a `valid` one: a demonstrated defect outranks a condition of this run,
   so an overlay listed beside an `invalid` receipt is informative and changes nothing.
-- `outcome` — **this run's decision**, in the same vocabulary as `status`, after the conditions
-  in `policy_overlays[]` are applied. See below.
+- `outcome` — **this run's decision**, always present: `valid`, `invalid`, `unverifiable` or
+  `error`. For a receipt it is `status` after the conditions in `policy_overlays[]` are applied;
+  for a command that verifies no receipt it is that command's own result, with `status` `null`
+  beside it. See above.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.
