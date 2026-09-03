@@ -120,6 +120,14 @@ pub struct AssertionOut {
     pub receipt_path: Vec<String>,
     /// For an outcome other than `verified`, what produced it.
     pub detail: Option<String>,
+    /// The assertion whose gap this one inherits, where it has one.
+    ///
+    /// `null` means the finding is what its own check produced — the rule that fired, the
+    /// budget that ran out, the capability that was missing — and is therefore a **cause**. A
+    /// name means the check was not run because that other assertion was `unverifiable`. The
+    /// headline in `reason_code` is always a cause, so this is what lets a consumer reproduce
+    /// the choice from the list rather than parse it out of prose.
+    pub rests_on: Option<String>,
 }
 
 /// The checkpoint a result is grounded on, by identity.
@@ -556,12 +564,14 @@ mod tests {
                 outcome: "verified".to_owned(),
                 receipt_path: Vec::new(),
                 detail: None,
+                rests_on: None,
             },
             AssertionOut {
                 assertion: "content-binding".to_owned(),
                 outcome: "unverifiable".to_owned(),
                 receipt_path: vec!["introduction".to_owned()],
                 detail: Some("no dataset key is held".to_owned()),
+                rests_on: None,
             },
         ]);
         let text = report.to_text();

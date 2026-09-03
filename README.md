@@ -488,7 +488,7 @@ for them are gone:
 silently:
 
 - `assertions` — one entry per required assertion of the verified receipt, as
-  `{assertion, outcome, receipt_path, detail}`, with the assertion names and the three outcome
+  `{assertion, outcome, receipt_path, detail, rests_on}`, with the assertion names and the three outcome
   values `ahl-core` reports. The result model requires the findings to be reported alongside
   the scalar result, and `findings[]` is a different list: it carries this crate's own
   diagnostic codes, such as `witness-stale`. `null` for a command that verifies no receipt.
@@ -499,6 +499,14 @@ silently:
   manifest declares. Freshness is a property of the run's evaluation time rather than of the
   receipt, so it is verifier-local by construction: it yields `unverifiable` and never
   `invalid`, and without the flag it is a `findings[]` entry and not an assertion at all.
+
+  `reason_code` names the assertion that **caused** the result, not the first non-`verified`
+  entry in the list. The two differ whenever a budget runs out: every assertion the run could
+  not reach then inherits the gap and carries `rests_on: "resource-limits"`, while the fact the
+  reader needs — which budget, and the value in force — is on the cause. `rests_on` is `null` on
+  a cause and names an assertion on a derived entry, so a consumer can reproduce the choice from
+  the list rather than parse it out of prose. Where the core reached a result of its own, its
+  cause is the headline; the freshness overlay leads only where the core reached `verified`.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.

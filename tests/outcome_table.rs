@@ -15,6 +15,8 @@
 
 mod common;
 
+use std::fmt::Write as _;
+
 use common::{
     ahl_cli, corpus, exchange_body, fixtures, mutate_receipt, mutate_transcript, policy,
     set_exchange_body, PolicySpec,
@@ -842,26 +844,40 @@ fn row_keyed_binding_without_an_authorized_dataset_key_is_unverifiable() {
 
 #[test]
 fn row_receipt_limit_exhausted_is_unverifiable() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut text =
-        std::fs::read_to_string(policy(dir.path(), &PolicySpec::default())).expect("read policy");
-    text.push_str("\n[policy.limits]\nmax_decoded_bytes = 16\n");
-    let path = dir.path().join("tiny.toml");
-    std::fs::write(&path, text).expect("write");
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("mode");
-    let run = verify(
-        &path.display().to_string(),
-        &corpus().join("receipts/statement-anchored-valid.ahl").display().to_string(),
-        &[],
-    );
-    assert_eq!(run.code, 3, "rejection, never a degraded acceptance: {}", run.stderr);
-    let output = run.output();
     // §7.8: "A verifier MUST report WHICH budget was exhausted and the value that was in force,
-    // since `unverifiable` without that is not actionable."
-    assert!(output.contains("resource-limits: unverifiable"), "{output}");
-    assert!(output.contains("decoded size"), "{output}");
-    assert!(output.contains("16"), "the value in force is named: {output}");
+    // since `unverifiable` without that is not actionable." Both budgets, because an exhausted
+    // one leaves every assertion the run could not reach inheriting the gap, and a report that
+    // led with one of those would name the symptom while the actionable fact sat further down.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (budget, value, named) in [
+        ("max_decoded_bytes", "16", "decoded size"),
+        ("max_work_units", "3", "verification work units"),
+    ] {
+        let mut text = std::fs::read_to_string(policy(dir.path(), &PolicySpec::default()))
+            .expect("read policy");
+        let _ = writeln!(text, "\n[policy.limits]\n{budget} = {value}");
+        let path = dir.path().join(format!("{budget}.toml"));
+        std::fs::write(&path, text).expect("write");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        let run = verify(
+            &path.display().to_string(),
+            &corpus().join("receipts/statement-anchored-valid.ahl").display().to_string(),
+            &[],
+        );
+        assert_eq!(run.code, 3, "rejection, never a degraded acceptance: {}", run.stderr);
+        let output = run.output();
+        // The HEADLINE names the budget: the reason line is the cause, never an assertion that
+        // merely inherited the gap.
+        assert!(output.contains("reason: [resource-limits]"), "{output}");
+        assert!(!output.contains("reason: [versions]"), "{output}");
+        assert!(output.contains(named), "the budget is named: {output}");
+        assert!(output.contains(value), "the value in force is named: {output}");
+        // And the assertions the run could not reach are still reported, each naming the cause
+        // it rests on rather than being dropped or presented as a finding of its own.
+        assert!(output.contains("resource-limits: unverifiable"), "{output}");
+        assert!(output.contains("rests on `resource-limits`"), "{output}");
+    }
 }
 
 #[test]

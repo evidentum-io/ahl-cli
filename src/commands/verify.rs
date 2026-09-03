@@ -25,6 +25,12 @@
 //! `invalid` would let two verifiers make contradictory statements about one artifact, and a
 //! second classifier over the same rejections is how the two implementations come to disagree.
 //!
+//! Which finding the report LEADS with is the core's answer for the same reason
+//! ([`CoreReport::dominating`]): the cause, never an assertion that merely inherited another's
+//! gap. The distinction is load-bearing where a budget runs out — every assertion the run could
+//! not reach then rests on it, and §7.8's "MUST report WHICH budget was exhausted and the value
+//! that was in force" is satisfied only by the one that ran out.
+//!
 //! # The one CLI overlay
 //!
 //! `status` is the reduction of `assertions[]`, and `assertions[]` is the core's required
@@ -50,8 +56,8 @@
 //! artifact has been adjudicated.
 
 use ahl_core::receipt::{
-    verify_receipt_report, Assertion, Outcome as CoreOutcome, ReceiptError, Report as CoreReport,
-    Verdict, RECEIPT_VERSION, SPEC_VERSION,
+    verify_receipt_report, Assertion, Finding as CoreFinding, Outcome as CoreOutcome, ReceiptError,
+    Report as CoreReport, Verdict, RECEIPT_VERSION, SPEC_VERSION,
 };
 use serde_json::Value;
 
@@ -157,6 +163,16 @@ fn verify(
     }
 }
 
+/// The `(reason_code, reason)` a core finding leads a report with: its assertion's stable name,
+/// and the rule it rendered.
+fn headline(finding: Option<&CoreFinding>) -> Option<(String, String)> {
+    let finding = finding?;
+    Some((
+        finding.assertion.name().to_owned(),
+        finding.detail.clone().unwrap_or_else(|| finding.assertion.name().to_owned()),
+    ))
+}
+
 /// The one assertion this crate adds to the core's required set: whether the cosignature this
 /// run rests on is fresh at the evaluation time. See the module header for why it is an overlay
 /// and why it can never be `invalid`.
@@ -197,6 +213,8 @@ fn unsupported_version(receipt: &Value, evaluation: &EvaluationTime) -> Option<R
         outcome: CoreOutcome::Unverifiable.name().to_owned(),
         receipt_path: Vec::new(),
         detail: Some(detail),
+        // Its own check produced it: the version read is what stopped the run.
+        rests_on: None,
     }]);
     Some(report)
 }
@@ -210,6 +228,7 @@ fn assertions(core: &CoreReport) -> Vec<AssertionOut> {
             outcome: finding.outcome.name().to_owned(),
             receipt_path: finding.receipt_path.clone(),
             detail: finding.detail.clone(),
+            rests_on: finding.rests_on.map(|assertion| assertion.name().to_owned()),
         })
         .collect()
 }
@@ -239,19 +258,6 @@ fn carried_assurance(receipt: &Value) -> Option<AssuranceOut> {
     })
 }
 
-/// The finding that decided a non-`verified` result: the first `invalid` one, since `invalid`
-/// dominates, and otherwise the first `unverifiable` one.
-///
-/// Findings arrive ordered by receipt path and then by the order the §7.5 algorithm reaches
-/// them, so "first" is the earliest assertion that produced the result rather than an arbitrary
-/// one, and a finding is never presented as though it were the result.
-fn dominating(core: &CoreReport) -> Option<&ahl_core::receipt::Finding> {
-    core.findings
-        .iter()
-        .find(|finding| finding.outcome == CoreOutcome::Invalid)
-        .or_else(|| core.findings.iter().find(|f| f.outcome == CoreOutcome::Unverifiable))
-}
-
 /// Render a non-`verified` result: the §6 outcome, the assertion that produced it, and the
 /// assurance the receipt claimed.
 ///
@@ -266,12 +272,13 @@ fn rejected(receipt: &Value, core: &CoreReport, evaluation: &EvaluationTime) -> 
         // inventing an outcome for a state the core does not produce.
         CoreOutcome::Unverifiable | CoreOutcome::Verified => Outcome::Unverifiable,
     };
-    let deciding = dominating(core);
-    let reason_code =
-        deciding.map_or_else(|| core.result.name().to_owned(), |f| f.assertion.name().to_owned());
-    let reason = deciding
-        .and_then(|finding| finding.detail.clone())
-        .unwrap_or_else(|| format!("the receipt is {}", core.result));
+    // The CAUSE, from the core, not the first non-`verified` finding in report order: where a
+    // budget ran out, every assertion the run could not reach inherits the gap, and leading
+    // with one of those would name the symptom while the fact §7.8 requires — which budget, and
+    // the value in force — sits on a finding further down.
+    let (reason_code, reason) = headline(core.dominating()).unwrap_or_else(|| {
+        (core.result.name().to_owned(), format!("the receipt is {}", core.result))
+    });
 
     let mut report =
         Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
@@ -331,6 +338,9 @@ fn succeeded(
                                 outcome: CoreOutcome::Unverifiable.name().to_owned(),
                                 detail: Some(finding.detail.clone()),
                                 receipt_path: Vec::new(),
+                                // The freshness check itself produced it, so it is a cause and
+                                // can lead the report where no core cause outranks it.
+                                rests_on: None,
                             });
                         }
                         findings.push(finding);
@@ -344,13 +354,20 @@ fn succeeded(
         }
     }
 
-    let deciding = assertions.iter().find(|entry| entry.outcome != CoreOutcome::Verified.name());
-    let reason = deciding.map_or_else(
-        || "every required rule verified".to_owned(),
-        |entry| entry.detail.clone().unwrap_or_else(|| entry.assertion.clone()),
-    );
-    let reason_code =
-        deciding.map_or_else(|| "verified".to_owned(), |entry| entry.assertion.clone());
+    // The core's cause outranks the overlay, and the ordering is written out rather than left
+    // to fall out of the code: a receipt that also failed a required assertion failed it for a
+    // reason its holder must be told first, while freshness is a condition of this run. This
+    // arm is reached with a `verified` core report, so `dominating()` is `None` here and the
+    // overlay leads where it fired; the rule holds if that ever changes.
+    let (reason_code, reason) = headline(core.dominating())
+        .or_else(|| {
+            let overlay = assertions.iter().find(|entry| entry.assertion == FRESHNESS)?;
+            Some((
+                overlay.assertion.clone(),
+                overlay.detail.clone().unwrap_or_else(|| overlay.assertion.clone()),
+            ))
+        })
+        .unwrap_or_else(|| ("verified".to_owned(), "every required rule verified".to_owned()));
 
     let mut report =
         Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
@@ -859,6 +876,56 @@ mod tests {
         } else {
             "valid"
         }
+    }
+
+    #[test]
+    fn the_headline_is_the_cause_and_never_an_assertion_that_inherited_the_gap() {
+        // An exhausted budget leaves every assertion the run could not reach resting on it. The
+        // reader needs the budget and the value in force (§7.8), which sit on the cause; a
+        // headline taken from report order would name a derived finding instead.
+        let mut policy = corpus_policy(true);
+        policy.trust.limits.max_work_units = 3;
+        let report = verify_vector("statement-anchored-valid.ahl", &policy);
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "resource-limits");
+        assert!(report.reason.contains("verification work units"), "{}", report.reason);
+        assert!(report.reason.contains('3'), "the value in force: {}", report.reason);
+
+        // The derived findings are reported beside it, each naming what it rests on as a value
+        // rather than only in prose.
+        let assertions = report.assertions.as_ref().expect("assertions");
+        let cause = assertions
+            .iter()
+            .find(|entry| entry.assertion == "resource-limits")
+            .expect("the cause is reported");
+        assert!(cause.rests_on.is_none(), "a cause inherits nothing");
+        assert!(
+            assertions.iter().any(|entry| entry.rests_on.as_deref() == Some("resource-limits")),
+            "the derived findings name the cause: {assertions:?}"
+        );
+    }
+
+    #[test]
+    fn the_freshness_overlay_never_displaces_a_core_cause() {
+        // The overlay is a condition of this run; a receipt that also failed a required
+        // assertion failed it for a reason its holder must be told first. The corpus policy
+        // withholds the dataset key, so the core reaches `unverifiable` on its own, and
+        // `--require-fresh` is given over an evaluation time at which the cosignature is stale.
+        let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
+        let report = run(
+            &corpus_policy(false),
+            &much_later,
+            &Options {
+                receipt: corpus().join("receipts/record-ingested-valid.ahl"),
+                require_fresh: true,
+            },
+        );
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(
+            report.reason_code, "content-binding",
+            "the core's cause leads, not the CLI overlay: {}",
+            report.reason
+        );
     }
 
     #[test]
