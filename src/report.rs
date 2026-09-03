@@ -247,9 +247,24 @@ pub struct Report {
     pub continued_history_bound: Option<ObservationBound>,
     /// Findings, ordered by `(code, detail)`. Reported in full, never suppressed.
     pub findings: Vec<Finding>,
-    /// One entry per required assertion of the verified receipt, in the order the verification
-    /// algorithm reaches them, **as the core reports them and nothing else**. `null` for a
-    /// command that verifies no receipt, and for a local failure that reached no result.
+    /// One entry per required assertion of the verified receipt (I-D §7.7), in the order the
+    /// verification algorithm reaches them.
+    ///
+    /// The entries are I-D §7.7 assertion CATEGORIES, under the names `ahl-core` spells them,
+    /// and they come from two places. Wherever the core ran, they are its findings verbatim —
+    /// nothing is added to the set and nothing is filtered out of it. For the three rejections
+    /// this crate reaches *before* the core is entered, it settles the one assertion itself,
+    /// under the category the core would have filed it under: `structure` for bytes that are
+    /// not JSON, are not the JCS serialization, or name no adaptor profile; `adaptor-profile`
+    /// for a profile local policy does not hold; `versions` for the version stop of §7.5 step 1.
+    /// Those runs completed and reached a §7.7 value, so §7.7's "MUST report the findings
+    /// alongside it" applies to them as much as to a run the core carried out.
+    ///
+    /// What is never here is a verifier-local condition: §7.7 enumerates a receipt's required
+    /// assertions exactly, and [`Self::policy_overlays`] is where a locally configured one goes.
+    ///
+    /// `null` for a command that verifies no receipt, and for a local failure that reached no
+    /// result at all.
     pub assertions: Option<Vec<AssertionOut>>,
     /// Locally configured conditions this run applied on top of those. Empty where none did.
     pub policy_overlays: Vec<PolicyOverlayOut>,
