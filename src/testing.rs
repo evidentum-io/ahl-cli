@@ -48,7 +48,7 @@ pub const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
 /// `unverifiable` — the deliberate refusal of the §5.2.2 item 3 carve-out, pinned by
 /// `the_genuinely_first_published_member_is_refused_and_the_refusal_is_deliberate` so that it
 /// stays a decision rather than an artefact of which sizes this list happens to carry.
-pub const CHECKPOINT_SIZES: [u64; 7] = [4, 8, 13, 20, 28, 32, 38];
+pub const CHECKPOINT_SIZES: [u64; 8] = [4, 8, 13, 20, 28, 32, 38, 41];
 
 /// One recorded exchange, in the shape [`crate::transcript`] replays.
 #[derive(Debug, Clone)]
@@ -347,16 +347,7 @@ impl MirrorFixture {
     /// varies is the `log` object itself.
     fn with_appended_manifest(mut self, alter: impl FnOnce(&mut Value)) -> Self {
         let producer = seed(&Self::corpus_root(), "producer-1");
-        let predecessor = self
-            .entries
-            .iter()
-            .rev()
-            .find_map(|bytes| {
-                let value: Value = serde_json::from_slice(bytes).ok()?;
-                (value.get("payload")?.get("type")?.as_str()? == "manifest")
-                    .then(|| ahl_core::sha256_hex(bytes))
-            })
-            .unwrap_or_default();
+        let predecessor = self.governing_manifest_entry_id();
         let mut log = json!({
             "log_id": self.log_id(),
             "operator": "log-operator-1",
@@ -521,13 +512,43 @@ impl MirrorFixture {
         let total = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         let mut sizes: Vec<u64> =
             CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
-        if self.appended && !sizes.contains(&total) {
+        // The whole corpus is always a published size, appended entries or not. Pinning the set
+        // to a constant alone would silently stop covering the corpus's own tail every time the
+        // corpus grew, and a test grounded on the newest checkpoint would quietly ground itself
+        // somewhere older instead.
+        if !sizes.contains(&total) {
             sizes.push(total);
         }
         if let Some(from) = self.series_from {
             sizes.retain(|size| *size >= from);
         }
         sizes
+    }
+
+    /// The entry id of the manifest version that GOVERNS at the end of the corpus.
+    ///
+    /// §7.4.1 test 3 links a manifest to the version active immediately before it, not to
+    /// whatever manifest was anchored last: the corpus deliberately carries manifest entries
+    /// that do not verify, and one of those is anchored after the last governing version. A
+    /// fixture linking to the last manifest by position would anchor a version that no walk
+    /// accepts, and every checkpoint it was meant to govern would quietly keep its old key set
+    /// — a fixture that appears to test a rotation and tests nothing.
+    fn governing_manifest_entry_id(&self) -> String {
+        let entries: Vec<(u64, Value)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                Some((u64::try_from(index).ok()?, serde_json::from_slice(bytes).ok()?))
+            })
+            .collect();
+        let governing = crate::governance::Governance::resolve(&entries, &self.policy.trust)
+            .ok()
+            .and_then(|(governance, _)| governance.manifest_indexes().last().copied());
+        governing
+            .and_then(|index| self.entries.get(usize::try_from(index).ok()?))
+            .map(|bytes| ahl_core::sha256_hex(bytes))
+            .unwrap_or_default()
     }
 
     /// The tree size whose checkpoint the forged manifest would govern, if one was appended.
@@ -977,16 +998,21 @@ pub fn tree_material(root: &Path) -> Value {
     Value::Object(material)
 }
 
-/// The corpus statements a closure can be answered over, copied into a fresh directory.
+/// The longest PREFIX of the corpus statements a closure can be answered over, copied into a
+/// fresh directory.
 ///
 /// A closure collects every committed tree root the corpus references **before** traversal
 /// begins, so that missing material is named rather than discovered halfway through. The
 /// conformance corpus deliberately contains a derivation whose committed tree the corpus
 /// publishes only inside the negative receipt vectors built on it, and a walk over the whole
 /// directory is therefore `unverifiable` for want of that material — correctly, and for a
-/// reason unrelated to what a topology-mode test is exercising. This is the same corpus
-/// without the statements whose roots [`tree_material`] does not carry, selected by that rule
-/// rather than by file name so a corpus that later publishes them needs no edit here.
+/// reason unrelated to what a topology-mode test is exercising.
+///
+/// A PREFIX rather than a subset, and the difference is not cosmetic: closure traversal keys on
+/// the entry index, so a corpus with a hole in it cannot be walked without inventing one. Taking
+/// everything before the first statement whose roots [`tree_material`] does not carry keeps the
+/// sequence dense. The rule is the material, never a file name, so a corpus that later publishes
+/// those roots extends the prefix here with no edit.
 #[must_use]
 pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1014,7 +1040,7 @@ pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
         let Ok(bytes) = std::fs::read(&file) else { continue };
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { continue };
         if !published(&value) {
-            continue;
+            break;
         }
         if let Some(name) = file.file_name() {
             let _ = std::fs::write(out.join(name), &bytes);
@@ -1156,14 +1182,36 @@ mod tests {
             !names.iter().any(|name| name.contains("defective-input-sets")),
             "the statement whose committed tree the corpus does not publish is dropped: {names:?}"
         );
+        // A dense prefix, so the walk can key on the entry index: everything from the first
+        // unpublished statement on is left out too, whatever its own material.
+        let mut indexes: Vec<usize> =
+            names.iter().filter_map(|name| name.split('-').next()?.parse().ok()).collect();
+        indexes.sort_unstable();
+        assert!(
+            indexes.iter().enumerate().all(|(at, index)| at == *index),
+            "the selection is a dense prefix: {indexes:?}"
+        );
     }
 
     #[test]
     fn the_fixture_loads_the_whole_conformance_corpus() {
+        // Counted from the corpus rather than pinned to a number: what this asserts is that
+        // every published statement is loaded and that the newest checkpoint covers all of
+        // them, and a corpus that grows must not turn either into a failure.
+        let published = std::fs::read_dir(MirrorFixture::corpus_root().join("vectors/statements"))
+            .expect("statement vectors")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
         let fixture = MirrorFixture::conformance();
-        assert_eq!(fixture.entries.len(), 38, "the toy corpus is 38 entries");
+        assert!(published >= 30, "the corpus should carry 30+ statements, got {published}");
+        assert_eq!(fixture.entries.len(), published, "every published statement is loaded");
         assert!(fixture.log_id().starts_with("sha256:"));
-        assert_eq!(fixture.newest_tree_size(), 38);
+        assert_eq!(
+            fixture.newest_tree_size(),
+            u64::try_from(published).expect("small test corpus"),
+            "the newest published checkpoint covers the whole corpus"
+        );
     }
 
     #[test]
@@ -1171,7 +1219,15 @@ mod tests {
         let first = MirrorFixture::conformance().series();
         let second = MirrorFixture::conformance().series();
         assert_eq!(first, second);
-        assert_eq!(first.len(), CHECKPOINT_SIZES.len());
+        // The constant sizes that fit the corpus, plus the corpus's own size where it is not
+        // already one of them.
+        let total = u64::try_from(MirrorFixture::conformance().entries.len()).expect("small");
+        let mut expected: Vec<u64> =
+            CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
+        if !expected.contains(&total) {
+            expected.push(total);
+        }
+        assert_eq!(first.len(), expected.len());
     }
 
     #[test]
