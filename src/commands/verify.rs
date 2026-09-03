@@ -6,37 +6,39 @@
 //! true iff a cosignature **carried by the receipt** verifies: whether a witness answers right
 //! now is irrelevant and must not change the verdict.
 //!
-//! # The §6 mapping
+//! # Outcomes
 //!
-//! Every rejection `ahl-core` can produce is mapped explicitly to an outcome. A path not in
-//! that mapping is a defect, not a default, so the classifier is a total match over
-//! `ReceiptError` with no wildcard.
+//! The core returns the I-D §7.7 result model: a completed run reaches exactly one of
+//! `verified`, `invalid` and `unverifiable`, together with one finding per required assertion,
+//! and a run that does not complete reaches none of them. This command maps that model onto
+//! the §6 exit-code contract and adds nothing to it:
 //!
-//! Two mappings need their reasoning written down.
+//! | §7.7 result | Outcome | Exit |
+//! |---|---|---|
+//! | `verified` | [`Outcome::Valid`] | `0` |
+//! | `invalid` | [`Outcome::Invalid`] | `1` |
+//! | `unverifiable` | [`Outcome::Unverifiable`] | `3` |
+//! | no result — the run did not complete | [`Outcome::Error`] | `2` |
 //!
-//! [`ReceiptError::ConsistencyPathInvalid`] is the first. The pinned `ahl-core` returns it
-//! **unconditionally** whenever `anchoring.later_checkpoint` is present, so on its own it
-//! cannot distinguish "the carried consistency path does not verify" — a rule fired against
-//! the artifact, exit `1` — from "this verifier did not evaluate it" — a limitation, exit `3`.
-//! Reporting an incapability as `invalid` is precisely the confusion the four-outcome contract
-//! exists to prevent, so this crate does not guess: it verifies the carried consistency path
-//! **itself**, through the same `atl-core` primitive the rest of the crate uses, and reports
-//! what it found. A path that genuinely fails is `1`; a path that verifies here while
-//! `ahl-core` still rejects it is `3`, naming the limitation. When `ahl-core` learns to verify
-//! these paths the local check simply agrees with it, and nothing here needs to change.
+//! Which of `invalid` and `unverifiable` a rejection produces is decided by the core, from the
+//! rule that fired, and is never re-derived here: a verifier-local condition reported as
+//! `invalid` would let two verifiers make contradictory statements about one artifact, and a
+//! second classifier over the same rejections is how the two implementations come to disagree.
 //!
-//! The second is [`ReceiptError::ContentBindingMismatch`], which
-//! `ahl-core` produces both for *carried bytes that do not recompute to the commitment* (a
-//! rule fired against the artifact — `1`) and for *no authorized dataset key held* (missing
-//! evidence — `3`, `content_binding: none`, never downgraded to `plain-verified`). The two are
-//! distinguished only by a sentinel string in the `recomputed` field. That is fragile, it is
-//! `ahl-core`'s only signal, and the sentinel is pinned by a test here so a change upstream
-//! fails loudly rather than silently turning a `3` into a `1`.
+//! The rows of §6 this command still decides are the ones that fire **before** the core is
+//! entered, over material the core never sees: an unreadable receipt (`2`), bytes that are not
+//! the JCS-canonical serialization (`1`), a receipt naming no adaptor profile (`1`), a profile
+//! local policy does not hold (`3`), and a profile whose held bytes do not hash to the pinned
+//! value (`2`). The last of these is the one place this crate and the core would answer
+//! differently — the core reads a pinned digest disagreeing with the held document as
+//! `invalid` — and §6 governs because the check runs against local configuration, before any
+//! artifact has been adjudicated.
 
-use ahl_core::receipt::{verify_receipt, ReceiptError, Verdict};
+use ahl_core::receipt::{
+    verify_receipt_report, Outcome as CoreOutcome, Report as CoreReport, Verdict,
+};
 use serde_json::Value;
 
-use crate::checkpoint::{consistency_verifies, Checkpoint, SigningForm};
 use crate::error::{CliError, CliResult};
 use crate::evaluation::{parse_artifact_time, EvaluationTime};
 use crate::governance::Governance;
@@ -45,10 +47,6 @@ use crate::policy::LoadedPolicy;
 use crate::profile;
 use crate::report::{AssuranceOut, CheckpointOut, Completeness, Finding, Report};
 use crate::secure;
-
-/// The sentinel `ahl-core` puts in `ContentBindingMismatch::recomputed` when the verifier holds
-/// no dataset key for a `keyed` dataset. Pinned by `the_dataset_key_sentinel_is_still_what_ahl_core_emits`.
-const NO_DATASET_KEY: &str = "<no dataset key held>";
 
 /// Options for one `verify` run.
 #[derive(Debug, Clone)]
@@ -116,174 +114,52 @@ fn verify(
     }
     let policy = &held;
 
-    let verdict = verify_receipt(&receipt, &policy.trust).map_err(|error| match error {
-        // Never let a verifier incapability surface as a rule fired against the artifact.
-        ReceiptError::ConsistencyPathInvalid => continued_history_outcome(&receipt, policy),
-        other => classify(other),
-    })?;
-    Ok(succeeded(&receipt, &verdict, evaluation, options, policy))
-}
+    // A run that does not complete produces no result at all: it says nothing about the
+    // receipt, so it is reported as the local failure it is (`2`) and never as one of the
+    // three values.
+    let core = verify_receipt_report(&receipt, &policy.trust)
+        .map_err(|failure| CliError::ExecutionFailed(failure.detail))?;
 
-/// Map an `ahl-core` rejection onto the §6 outcome table. Total, deliberately.
-fn classify(error: ReceiptError) -> CliError {
-    match error {
-        // Unsupported version, or a capability the pinned profile does not define: the
-        // profile's limitation is named (3).
-        ReceiptError::UnsupportedVersion { .. }
-        | ReceiptError::AdaptorCapabilityUnsupported { .. } => {
-            CliError::ProfileLimitation(error.to_string())
+    match (core.result, core.verdict.as_ref()) {
+        (CoreOutcome::Verified, Some(verdict)) => {
+            Ok(succeeded(&receipt, verdict, evaluation, options, policy))
         }
-        // Not locally possessed at the pinned hash (3).
-        ReceiptError::AdaptorUnknown { id } => CliError::ProfileNotPossessed { id },
-        // Rejection, never a degraded acceptance (3).
-        ReceiptError::LimitExceeded(what) => CliError::LimitExhausted(what.to_owned()),
-        // A combination the frozen container format leaves no material to evidence (3). The
-        // receipt is well-formed and nothing about it has been disproved; what is missing is
-        // evidence the format defines no way to carry, which is the same shape as the other
-        // `3` rows where a limitation of the format or profile is named. Spelled out as its
-        // own arm so the outcome is a decision recorded here, not the fall-through below.
-        ReceiptError::FormatConflict { combination, conflict } => CliError::FormatConflict {
-            combination: combination.to_owned(),
-            conflict: conflict.to_owned(),
-        },
-        // Keyed binding with no authorized dataset key held (3) versus carried bytes that do
-        // not recompute (1) — see the module docs on the sentinel.
-        ReceiptError::ContentBindingMismatch { mode, recomputed, claimed } => {
-            if recomputed == NO_DATASET_KEY {
-                CliError::DatasetKeyNotHeld { dataset: claimed }
-            } else {
-                CliError::RuleFired(
-                    ReceiptError::ContentBindingMismatch { mode, recomputed, claimed }.to_string(),
-                )
-            }
-        }
-        // Everything else fired against the user's own artifact (1). `verify` is offline, so
-        // every checkpoint, proof and signature it examines is artifact-carried: there is no
-        // remote candidate here whose failure could mean "evidence not obtained".
-        ReceiptError::Malformed(detail) => CliError::Malformed { what: "receipt", detail },
-        ReceiptError::IdentifierMismatch { .. }
-        | ReceiptError::CheckpointNotBound { .. }
-        | ReceiptError::GovernanceRangeNotComplete { .. }
-        | ReceiptError::TriggerNotAuthorized { .. }
-        | ReceiptError::GovernanceSubjectNotManifest { .. }
-        | ReceiptError::CheckpointSignatureInvalid
-        | ReceiptError::KeyNotBound { .. }
-        | ReceiptError::WitnessCosignatureInvalid { .. }
-        | ReceiptError::EntryIndexBeyondCheckpoint { .. }
-        | ReceiptError::InclusionPathInvalid { .. }
-        | ReceiptError::GenesisAnchorMismatch
-        | ReceiptError::GovernanceChainInvalid(_)
-        | ReceiptError::EnvelopeSignatureInvalid { .. }
-        | ReceiptError::AssuranceMismatch { .. }
-        | ReceiptError::RecordSubjectMismatch { .. }
-        | ReceiptError::SubjectManifestPresence { .. }
-        | ReceiptError::EmbeddedOrderingViolation { .. }
-        | ReceiptError::EmbeddedSubjectMismatch { .. }
-        | ReceiptError::EmbeddedClaimTypeMismatch { .. }
-        | ReceiptError::ClaimMaterialMissing { .. }
-        | ReceiptError::ClaimMaterialPathInvalid { .. }
-        | ReceiptError::CompetingRangeInsufficient { .. }
-        | ReceiptError::RangeProofInvalid { .. }
-        | ReceiptError::TreeMaterialInvalid { .. }
-        | ReceiptError::ClosureMismatch(_)
-        | ReceiptError::GovernanceStateNotCurrent { .. }
-        | ReceiptError::Ahl(_) => CliError::RuleFired(error.to_string()),
-        // `ReceiptError` is `#[non_exhaustive]`: a variant added upstream must not silently
-        // become an accept or an arbitrary outcome. Unverifiable is the honest answer — this
-        // build does not know what the new rule means.
-        other => CliError::ProfileLimitation(format!(
-            "this build does not know how to classify the rejection `{other}`; treating it as \
-             evidence not established rather than guessing an outcome"
-        )),
+        // A boundary is rendered for `verified` and for nothing else, so a result carrying
+        // none is a rejection whatever else it carries.
+        _ => Ok(rejected(&core, evaluation)),
     }
 }
 
-/// Decide what `ahl-core`'s `ConsistencyPathInvalid` actually means for this receipt.
+/// The finding that decided a non-`verified` result: the first `invalid` one, since `invalid`
+/// dominates, and otherwise the first `unverifiable` one.
 ///
-/// Adaptor §8.3 fixes the serialization — an RFC 9162 proof as a JSON array of `sha256:<hex>`
-/// family strings between two tree sizes of the same log — and §13 lists the capability as
-/// defined, so a verifier *can* check it. This does, using `atl-core`'s own
-/// `verify_consistency`, and reports:
-///
-/// * the path does not verify, or the later checkpoint does not authenticate → the artifact is
-///   disproved (`1`);
-/// * the path verifies here → `ahl-core` did not evaluate it, which is a limitation of this
-///   build's verifier and never a statement about the artifact (`3`).
-fn continued_history_outcome(receipt: &Value, policy: &LoadedPolicy) -> CliError {
-    let limitation = || {
-        CliError::ProfileLimitation(
-            "this build's receipt verifier does not evaluate `anchoring.consistency_path`; the \
-             carried path verifies under an independent check here, so nothing about the \
-             artifact has been disproved and the claim is simply not established"
-                .to_owned(),
-        )
-    };
+/// Findings arrive ordered by receipt path and then by the order the §7.5 algorithm reaches
+/// them, so "first" is the earliest assertion that produced the result rather than an arbitrary
+/// one, and a finding is never presented as though it were the result.
+fn dominating(core: &CoreReport) -> Option<&ahl_core::receipt::Finding> {
+    core.findings
+        .iter()
+        .find(|finding| finding.outcome == CoreOutcome::Invalid)
+        .or_else(|| core.findings.iter().find(|f| f.outcome == CoreOutcome::Unverifiable))
+}
 
-    let Some(anchoring) = receipt.get("anchoring") else { return limitation() };
-    let (Some(from), Some(to)) = (anchoring.get("checkpoint"), anchoring.get("later_checkpoint"))
-    else {
-        return limitation();
+/// Render a non-`verified` result: the §6 outcome, and the assertion that produced it.
+fn rejected(core: &CoreReport, evaluation: &EvaluationTime) -> Report {
+    let outcome = match core.result {
+        CoreOutcome::Invalid => Outcome::Invalid,
+        // `Verified` cannot reach here: it is handled above, and a report carrying no verdict
+        // is not one. Mapping it alongside `Unverifiable` keeps the match total without
+        // inventing an outcome for a state the core does not produce.
+        CoreOutcome::Unverifiable | CoreOutcome::Verified => Outcome::Unverifiable,
     };
-    let (Ok(from), Ok(to)) = (Checkpoint::from_value(from), Checkpoint::from_value(to)) else {
-        return CliError::RuleFired(
-            "the receipt carries a `later_checkpoint` that is not a complete checkpoint object"
-                .to_owned(),
-        );
-    };
-    let Some(path) = anchoring.get("consistency_path").and_then(Value::as_array) else {
-        return CliError::RuleFired(
-            "the receipt claims continued history but carries no `consistency_path`; receipt \
-             format §2.1 makes the claim true only when both are present and verify"
-                .to_owned(),
-        );
-    };
-    let path: Vec<String> =
-        path.iter().filter_map(|hash| hash.as_str().map(str::to_owned)).collect();
+    let deciding = dominating(core);
+    let reason_code =
+        deciding.map_or_else(|| core.result.name().to_owned(), |f| f.assertion.name().to_owned());
+    let reason = deciding
+        .and_then(|finding| finding.detail.clone())
+        .unwrap_or_else(|| format!("the receipt is {}", core.result));
 
-    // The later checkpoint's log key resolves through the manifest version active for **its**
-    // tree size (receipt format §2.2), so it needs the receipt's own governance chain.
-    let Ok(entries) = chain_entries(receipt) else { return limitation() };
-    let Ok((governance, _)) = Governance::resolve(&entries, &policy.trust) else {
-        return limitation();
-    };
-    let Ok(profile_id) = adaptor_id(receipt) else { return limitation() };
-    let Ok(form) = SigningForm::for_profile(&profile_id) else { return limitation() };
-    let Ok(keys) = governance.log_keys_for(to.tree_size) else {
-        return CliError::RuleFired(format!(
-            "no manifest version is active for the later checkpoint at tree_size {}",
-            to.tree_size
-        ));
-    };
-    match to.signature_verifies(form, &keys) {
-        Ok(true) => {}
-        Ok(false) => {
-            return CliError::RuleFired(
-                "the later checkpoint's log signature does not verify under the key set the \
-                 manifest version active for its tree size declares"
-                    .to_owned(),
-            )
-        }
-        Err(_) => return limitation(),
-    }
-
-    match consistency_verifies(&from, &to, &path) {
-        // The independent check agrees the path is sound, so `ahl-core` did not evaluate it.
-        Ok(true) => limitation(),
-        // Both implementations agree the artifact is disproved. `ahl-core`'s own wording is
-        // kept, so a consumer written against the family canon reads the same reason it always
-        // did; the independent check only ever *adds* the ability to tell this apart from an
-        // incapability.
-        Ok(false) => CliError::RuleFired(format!(
-            "{}: the carried path from tree_size {} to {} is not an append-only extension",
-            ReceiptError::ConsistencyPathInvalid,
-            from.tree_size,
-            to.tree_size
-        )),
-        Err(_) => CliError::RuleFired(format!(
-            "{}: the carried path is not a readable RFC 9162 proof",
-            ReceiptError::ConsistencyPathInvalid
-        )),
-    }
+    Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source)
 }
 
 fn adaptor_id(receipt: &Value) -> Result<String, ()> {
@@ -588,28 +464,23 @@ mod tests {
 
     #[test]
     fn a_keyed_binding_with_no_dataset_key_held_is_unverifiable_never_invalid() {
-        // §6: "Keyed binding, no authorized dataset key held | 3, content_binding: none —
-        // never downgraded to plain-verified".
+        // §7.7's own worked example: the content binding is a required assertion, the verifier
+        // is not authorized to hold the key, and the result is `unverifiable` — a capability
+        // gap the verifier has, never a defect it has shown in the artifact.
         let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
-        assert_eq!(report.status, "unverifiable");
-        assert_eq!(report.reason_code, "dataset-key-not-held");
-        assert!(report.assurance.is_none(), "no assurance is claimed without the key");
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "content-binding");
+        assert!(report.boundary.is_none(), "a boundary is rendered for `verified` alone");
     }
-
     #[test]
-    fn the_dataset_key_sentinel_is_still_what_ahl_core_emits() {
-        // Pins the fragile coupling described in the module docs: if `ahl-core` changes this
-        // string, this test fails rather than a `3` silently becoming a `1`.
-        let error = ReceiptError::ContentBindingMismatch {
-            mode: "keyed-authorized".to_owned(),
-            recomputed: NO_DATASET_KEY.to_owned(),
-            claimed: "customers".to_owned(),
-        };
-        assert!(matches!(classify(error), CliError::DatasetKeyNotHeld { .. }));
-        let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
-        assert_eq!(report.status, "unverifiable", "sentinel drift: {}", report.reason);
+    fn a_run_that_reaches_no_result_is_a_local_failure_and_never_one_of_the_three_values() {
+        // §7.7: a run that does not complete "says nothing about the receipt and MUST NOT be
+        // rendered as any of the three values".
+        let error = CliError::ExecutionFailed("the run stopped".to_owned());
+        assert_eq!(error.outcome(), Outcome::Error);
+        assert_eq!(error.outcome().exit_code(), 2);
+        assert_eq!(error.reason_code(), "execution-failed");
     }
-
     #[test]
     fn an_unreadable_receipt_is_an_error_and_a_malformed_one_is_invalid() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -788,60 +659,27 @@ mod tests {
     }
 
     #[test]
-    fn every_receipt_error_variant_maps_to_a_named_outcome() {
-        // Spot-checks across the three outcome classes; the compiler enforces totality of the
-        // match itself, so this asserts the classification rather than the coverage.
-        assert_eq!(
-            classify(ReceiptError::LimitExceeded("decoded size budget")).outcome(),
-            Outcome::Unverifiable
-        );
-        assert_eq!(
-            classify(ReceiptError::UnsupportedVersion {
-                field: "spec_version",
-                expected: "0.3.0",
-                got: "0.4.0".to_owned(),
-            })
-            .outcome(),
-            Outcome::Unverifiable
-        );
-        assert_eq!(
-            classify(ReceiptError::AdaptorCapabilityUnsupported {
-                id: "ahl-test-log-v1".to_owned(),
-                capability: "a binary checkpoint framing",
-            })
-            .outcome(),
-            Outcome::Unverifiable
-        );
-        assert_eq!(classify(ReceiptError::CheckpointSignatureInvalid).outcome(), Outcome::Invalid);
-        assert_eq!(classify(ReceiptError::GenesisAnchorMismatch).outcome(), Outcome::Invalid);
-        assert_eq!(classify(ReceiptError::Malformed("x".to_owned())).outcome(), Outcome::Invalid);
+    fn each_of_the_three_results_maps_to_its_exit_code_and_never_to_another() {
+        // §7.7's three values, exercised end to end so the mapping is asserted over what the
+        // core actually returns rather than over a table restated here. A local failure that
+        // reaches no result at all is the fourth outcome and is covered by
+        // `an_unreadable_receipt_is_an_error_and_a_malformed_one_is_invalid`.
+        let policy = corpus_policy(true);
+        let verified = verify_vector("statement-anchored-valid.ahl", &policy);
+        assert_eq!(verified.status, "valid");
+        assert_eq!(Outcome::Valid.exit_code(), 0);
+
+        let invalid = verify_vector("overclaim-must-fail.ahl", &policy);
+        assert_eq!(invalid.status, "invalid", "{}", invalid.reason);
+        assert_eq!(Outcome::Invalid.exit_code(), 1);
+
+        let unverifiable = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
+        assert_eq!(unverifiable.status, "unverifiable", "{}", unverifiable.reason);
+        assert_eq!(Outcome::Unverifiable.exit_code(), 3);
+        assert_ne!(unverifiable.status, invalid.status, "never rendered as the other");
     }
-
     #[test]
-    fn a_verifier_incapability_can_never_surface_as_invalid() {
-        // The pinned `ahl-core` now verifies consistency paths for real, so
-        // `ConsistencyPathInvalid` means "evaluated and failed". The mapping still refuses to
-        // report an *unevaluated* claim as `invalid`, and this pins that: a receipt whose
-        // carried path genuinely verifies must come back as a limitation, never a verdict.
-        let receipt: Value = serde_json::from_slice(
-            &std::fs::read(corpus().join("receipts/statement-anchored-continued-history.ahl"))
-                .expect("read"),
-        )
-        .expect("parse");
-        assert!(
-            receipt["anchoring"].get("later_checkpoint").is_some(),
-            "this vector is the continued-history one"
-        );
-
-        let error = continued_history_outcome(&receipt, &corpus_policy(true));
-        assert_eq!(
-            error.outcome(),
-            Outcome::Unverifiable,
-            "a path that verifies independently is a limitation, not a verdict: {error}"
-        );
-        assert_eq!(error.reason_code(), "profile-limitation");
-
-        // And end to end, that vector verifies outright under the current upstream.
+    fn a_receipt_carrying_a_verifying_consistency_path_is_valid() {
         let report =
             verify_vector("statement-anchored-continued-history.ahl", &corpus_policy(true));
         assert_eq!(report.status, "valid", "{}", report.reason);
@@ -850,34 +688,19 @@ mod tests {
             Some(true)
         );
     }
-
     #[test]
-    fn a_carried_consistency_path_that_does_not_verify_is_a_rule_against_the_artifact() {
-        // The other direction, on the helper directly so it does not depend on which rule
-        // `ahl-core` happens to fire first — and asserting that upstream's own wording is the
-        // one reported, so a consumer written against the family canon still reads it.
-        let receipt: Value = serde_json::from_slice(
-            &std::fs::read(corpus().join("receipts/statement-anchored-continued-history.ahl"))
-                .expect("read"),
-        )
-        .expect("parse");
-        let mut broken = receipt.clone();
-        broken["anchoring"]["consistency_path"] = json!([format!("sha256:{}", "cd".repeat(32))]);
-        let error = continued_history_outcome(&broken, &corpus_policy(true));
-        assert_eq!(error.outcome(), Outcome::Invalid, "{error}");
-        assert!(
-            error.to_string().contains("consistency path did not verify"),
-            "upstream's wording must survive: {error}"
+    fn a_consistency_path_that_does_not_verify_is_invalid_on_the_anchoring_assertion() {
+        // The core evaluates the carried consistency path, so which of `invalid` and
+        // `unverifiable` its failure produces is its answer and not one re-derived here. The
+        // corpus vector pairs the two checkpoints the path does not open.
+        let report = verify_vector(
+            "statement-anchored-continued-history-wrong-pair-must-fail.ahl",
+            &corpus_policy(true),
         );
-
-        // A `later_checkpoint` whose own log signature does not verify is likewise `1`.
-        let mut forged = receipt;
-        forged["anchoring"]["later_checkpoint"]["signature"] =
-            json!(format!("base64:{}", "A".repeat(86) + "=="));
-        let error = continued_history_outcome(&forged, &corpus_policy(true));
-        assert_eq!(error.outcome(), Outcome::Invalid, "{error}");
+        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.reason_code, "anchoring");
+        assert!(report.boundary.is_none(), "a boundary is rendered for `verified` alone");
     }
-
     #[test]
     fn freshness_is_reported_as_unavailable_rather_than_guessed() {
         let entries: Vec<(u64, Value)> = Vec::new();
