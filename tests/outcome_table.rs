@@ -1397,17 +1397,38 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
         .filter_map(|finding| finding["code"].as_str())
         .collect();
     assert!(codes.contains(&"witness-stale"), "{codes:?}");
+    assert!(document["boundary"].is_string(), "a valid result renders the boundary");
 
     let run = ahl_cli(&[
         "--policy",
         &policy_path.display().to_string(),
         AT,
         much_later,
+        "--json",
         "verify",
         &receipt.display().to_string(),
         "--require-fresh",
     ]);
     assert_eq!(run.code, 3, "--require-fresh promotes it to unverifiable, never to invalid");
+    let document = run.json();
+    // A boundary asserts the property in words, so it is rendered where the FINAL status is
+    // `valid` and nowhere else — the core's boundary is never carried under a status the
+    // freshness overlay moved.
+    assert!(document["boundary"].is_null(), "{document}");
+    // And the status is the reduction of the assertions reported beside it: the overlay is one
+    // of them, `unverifiable` and never `invalid`.
+    let assertions = document["assertions"].as_array().expect("assertions");
+    let freshness = assertions
+        .iter()
+        .find(|entry| entry["assertion"] == "witness-freshness")
+        .expect("the overlay is reported as an assertion");
+    assert_eq!(freshness["outcome"], "unverifiable");
+    assert!(
+        assertions.iter().all(
+            |entry| entry["outcome"] == "verified" || entry["assertion"] == "witness-freshness"
+        ),
+        "nothing else moved: {document}"
+    );
 }
 
 // --- exit 0 -----------------------------------------------------------------------------

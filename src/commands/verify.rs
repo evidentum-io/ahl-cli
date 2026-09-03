@@ -25,6 +25,21 @@
 //! `invalid` would let two verifiers make contradictory statements about one artifact, and a
 //! second classifier over the same rejections is how the two implementations come to disagree.
 //!
+//! # The one CLI overlay
+//!
+//! `status` is the reduction of `assertions[]`, and `assertions[]` is the core's required
+//! assertions plus exactly one entry this crate adds: `witness-freshness`, and only where
+//! `--require-fresh` is given and a carried cosignature is older than the cadence plus the
+//! grace period the governing manifest declares. Freshness is a property of the run's
+//! evaluation time, not of the receipt, so the core neither has it nor could: it is a
+//! verifier-local condition of exactly the shape §7.7's second bullet describes. It therefore
+//! produces `unverifiable` and **never** `invalid` — a stale cosignature disproves nothing —
+//! and without the flag it is not an assertion at all, only a `findings[]` entry.
+//!
+//! A boundary is rendered where the FINAL status is `valid` and nowhere else. Carrying the
+//! core's boundary under a status the overlay moved would present words that assert the
+//! property beside a result that does not, which is what §7.7 forbids for the other two values.
+//!
 //! The rows of §6 this command still decides are the ones that fire **before** the core is
 //! entered, over material the core never sees: an unreadable receipt (`2`), bytes that are not
 //! the JCS-canonical serialization (`1`), a receipt naming no adaptor profile (`1`), a profile
@@ -141,6 +156,11 @@ fn verify(
         _ => Ok(rejected(&receipt, &core, evaluation)),
     }
 }
+
+/// The one assertion this crate adds to the core's required set: whether the cosignature this
+/// run rests on is fresh at the evaluation time. See the module header for why it is an overlay
+/// and why it can never be `invalid`.
+const FRESHNESS: &str = "witness-freshness";
 
 /// The version result of I-D §7.5 step 1, where either container version is one this build does
 /// not implement.
@@ -285,6 +305,7 @@ fn succeeded(
 ) -> Report {
     let checkpoint = receipt.get("anchoring").and_then(|anchoring| anchoring.get("checkpoint"));
     let mut findings = Vec::new();
+    let mut assertions = assertions(core);
     let mut outcome = Outcome::Valid;
 
     // Governance findings and freshness both come from the receipt's own chain, which
@@ -300,9 +321,17 @@ fn succeeded(
                 match freshness(&governance, checkpoint, evaluation) {
                     Ok(Some(finding)) => {
                         // Staleness is a finding, never by itself a disproof. `--require-fresh`
-                        // promotes it to `unverifiable` — never to `invalid`.
+                        // makes it an assertion of this run — `unverifiable`, never `invalid` —
+                        // and the status is then the reduction over the whole set, so no
+                        // consumer sees a status its assertions do not account for.
                         if options.require_fresh {
                             outcome = Outcome::Unverifiable;
+                            assertions.push(AssertionOut {
+                                assertion: FRESHNESS.to_owned(),
+                                outcome: CoreOutcome::Unverifiable.name().to_owned(),
+                                detail: Some(finding.detail.clone()),
+                                receipt_path: Vec::new(),
+                            });
                         }
                         findings.push(finding);
                     }
@@ -315,18 +344,24 @@ fn succeeded(
         }
     }
 
-    let reason = if outcome == Outcome::Valid {
-        "every required rule verified".to_owned()
-    } else {
-        "a witness cosignature is stale and --require-fresh was given".to_owned()
-    };
-    let reason_code = if outcome == Outcome::Valid { "verified" } else { "witness-stale" };
+    let deciding = assertions.iter().find(|entry| entry.outcome != CoreOutcome::Verified.name());
+    let reason = deciding.map_or_else(
+        || "every required rule verified".to_owned(),
+        |entry| entry.detail.clone().unwrap_or_else(|| entry.assertion.clone()),
+    );
+    let reason_code =
+        deciding.map_or_else(|| "verified".to_owned(), |entry| entry.assertion.clone());
 
     let mut report =
         Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
     report.claim_type = Some(verdict.claim_type.clone());
-    // Never stronger than the boundary `ahl_core::receipt::Verdict` carries.
-    report.boundary = Some(verdict.boundary.clone());
+    // Rendered where the FINAL status is `valid` and nowhere else: only `verified` may be
+    // rendered in words that assert the property, and the overlay above can move the status
+    // after the core has rendered its boundary. Never stronger than the boundary
+    // `ahl_core::receipt::Verdict` carries, either.
+    if outcome == Outcome::Valid {
+        report.boundary = Some(verdict.boundary.clone());
+    }
     report.assurance = Some(AssuranceOut {
         governance: verdict.assurance.governance.clone(),
         competing_triggers: verdict.assurance.competing_triggers.clone(),
@@ -355,7 +390,7 @@ fn succeeded(
         .and_then(|claim| claim.get("note"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    report.assertions = Some(assertions(core));
+    report.assertions = Some(assertions);
     report.with_findings(findings)
 }
 
@@ -776,9 +811,72 @@ mod tests {
         assert_eq!(finding_only.status, "valid", "staleness is never by itself a disproof");
         assert!(finding_only.findings.iter().any(|f| f.code == "witness-stale"));
 
+        assert!(finding_only.boundary.is_some(), "a valid result renders the boundary");
+        let assertions = finding_only.assertions.as_ref().expect("assertions");
+        assert!(
+            assertions.iter().all(|entry| entry.outcome == "verified"),
+            "without the flag nothing overlays the core's set: {assertions:?}"
+        );
+        assert_eq!(reduction(assertions), finding_only.status);
+
         let promoted = run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
         assert_eq!(promoted.status, "unverifiable");
         assert!(promoted.findings.iter().any(|f| f.code == "witness-stale"));
+        // A boundary asserts the property in words, so it is rendered where the FINAL status is
+        // `valid` and nowhere else — never carried over from a core result the overlay moved.
+        assert!(promoted.boundary.is_none(), "no boundary under a non-valid status");
+        assert!(!promoted.to_text().contains("boundary:"), "{}", promoted.to_text());
+
+        // The status is the reduction of the assertions, overlay included.
+        let assertions = promoted.assertions.as_ref().expect("assertions");
+        let freshness = assertions
+            .iter()
+            .find(|entry| entry.assertion == FRESHNESS)
+            .expect("the overlay is reported as an assertion");
+        assert_eq!(freshness.outcome, "unverifiable", "the overlay never yields `invalid`");
+        assert!(freshness.receipt_path.is_empty(), "it is an assertion of this run");
+        let detail = freshness.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("ns old at the evaluation time"), "the age is named: {detail}");
+        assert!(detail.contains("grace period"), "the grace period is named: {detail}");
+        assert_eq!(reduction(assertions), promoted.status);
+        assert_eq!(promoted.reason_code, FRESHNESS);
+    }
+
+    /// The §7.7 reduction over a reported assertion set, in the CLI's own status vocabulary.
+    ///
+    /// An embedded receipt's content binding is never a required assertion of the receipt that
+    /// embeds it, so it is outside the reduction at every non-empty path.
+    fn reduction(assertions: &[AssertionOut]) -> &'static str {
+        let counts = |entry: &&AssertionOut| {
+            entry.assertion != "content-binding" || entry.receipt_path.is_empty()
+        };
+        let has =
+            |outcome: &str| assertions.iter().filter(counts).any(|entry| entry.outcome == outcome);
+        if has("invalid") {
+            "invalid"
+        } else if has("unverifiable") {
+            "unverifiable"
+        } else {
+            "valid"
+        }
+    }
+
+    #[test]
+    fn the_status_is_the_reduction_of_the_reported_assertions_over_the_whole_corpus() {
+        // Design note §6: `status` is the reduction of the assertions reported beside it. A
+        // status a consumer cannot derive from the set it is shown is a status it cannot act on.
+        let policy = corpus_policy(true);
+        let index = corpus_index();
+        for vector in index["vectors"].as_array().expect("vectors") {
+            let file = vector["file"].as_str().expect("file");
+            let report = verify_vector(file, &policy);
+            let assertions = report.assertions.as_ref().expect("assertions are always reported");
+            assert_eq!(reduction(assertions), report.status, "{file}: {}", report.reason);
+        }
+
+        // And with the one capability gap the corpus policy can withhold.
+        let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
+        assert_eq!(reduction(report.assertions.as_ref().expect("assertions")), report.status);
     }
 
     #[test]

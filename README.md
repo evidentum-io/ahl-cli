@@ -70,7 +70,8 @@ reports one entry per required assertion of the receipt, in `assertions[]`, beca
 alone does not say which assertion produced it and a reader cannot act on `unverifiable`
 without knowing what was missing. A receipt whose content binding cannot be computed reports
 `unverifiable` as its result and `verified` on the assertions that did hold. A boundary is
-rendered for `verified` and for nothing else, and no result is ever expressed by rewriting the
+rendered where the final status is `valid` and nowhere else — including where a CLI-level
+assertion, and not the core, moved the status — and no result is ever expressed by rewriting the
 receipt's own assurance fields: the assurance block is reproduced as carried on every outcome,
 so a content binding the verifier could not compute is never re-rendered as
 `content_binding: "none"`.
@@ -491,6 +492,13 @@ silently:
   values `ahl-core` reports. The result model requires the findings to be reported alongside
   the scalar result, and `findings[]` is a different list: it carries this crate's own
   diagnostic codes, such as `witness-stale`. `null` for a command that verifies no receipt.
+
+  `status` is the reduction of this list, and the list is the core's required assertions plus
+  exactly one entry this crate adds: `witness-freshness`, present only where `--require-fresh`
+  is given and a carried cosignature is older than the cadence plus grace period the governing
+  manifest declares. Freshness is a property of the run's evaluation time rather than of the
+  receipt, so it is verifier-local by construction: it yields `unverifiable` and never
+  `invalid`, and without the flag it is a `findings[]` entry and not an assertion at all.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.
