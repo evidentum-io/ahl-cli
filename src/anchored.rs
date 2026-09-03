@@ -155,7 +155,12 @@ impl Statements {
         let mut seen: BTreeMap<String, u64> = BTreeMap::new();
 
         for (index, envelope) in entries {
-            // Rule 1.
+            // Rule 1, which is I-D §7.5.1 4d's VOID: the entry is excluded before any
+            // authority comparison, is never effective, is never traversed, and the result is
+            // unaffected. It is reported rather than adjudicated, because a log anchors opaque
+            // bytes and validates none of them — were a void entry a defect of every closure
+            // over that log, any party able to anchor one envelope could disable all of them
+            // from its index on.
             if !governance.envelope_verifies_at(envelope, *index).unwrap_or(false) {
                 findings.push(Finding::new(
                     "entry-is-not-a-statement",

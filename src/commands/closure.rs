@@ -675,6 +675,42 @@ mod tests {
     }
 
     #[test]
+    fn a_non_verifying_anchored_statement_is_void_for_a_closure_and_never_a_defect() {
+        // I-D §7.5.1 4d: a non-verifying envelope no claim rests on is VOID — excluded before
+        // any authority comparison, never effective, never traversed, and it does not affect
+        // the result. An authenticated closure over a checkpoint that commits one therefore
+        // still answers, with the void entry reported beside the answer rather than in place of
+        // it. Anything else would let one anchored envelope disable every closure over that log
+        // from its index on.
+        let fixture = MirrorFixture::conformance();
+        // Entry 18 is the retraction that governs its record at tree_size 32, which is where
+        // the corpus's first non-verifying entry is already committed.
+        let report =
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(18), 32));
+        assert_eq!(
+            report.outcome, "valid",
+            "a void entry never moves the outcome: {}",
+            report.reason
+        );
+        assert!(report.affected.is_some(), "the closure is still answered: {}", report.reason);
+        assert_eq!(report.completeness, Completeness::Complete);
+
+        let void: Vec<&crate::report::Finding> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.code == "entry-is-not-a-statement")
+            .collect();
+        assert!(!void.is_empty(), "the corpus commits at least one below tree_size 32");
+        for finding in &void {
+            assert!(
+                finding.detail.contains("excluded from every decision"),
+                "the void entry is named and its exclusion stated: {}",
+                finding.detail
+            );
+        }
+    }
+
+    #[test]
     fn an_entry_that_is_not_a_trigger_is_refused_by_name() {
         let fixture = MirrorFixture::conformance();
         let report =
