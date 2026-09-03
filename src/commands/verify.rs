@@ -45,7 +45,7 @@ use crate::governance::Governance;
 use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
 use crate::profile;
-use crate::report::{AssuranceOut, CheckpointOut, Completeness, Finding, Report};
+use crate::report::{AssertionOut, AssuranceOut, CheckpointOut, Completeness, Finding, Report};
 use crate::secure;
 
 /// Options for one `verify` run.
@@ -122,12 +122,50 @@ fn verify(
 
     match (core.result, core.verdict.as_ref()) {
         (CoreOutcome::Verified, Some(verdict)) => {
-            Ok(succeeded(&receipt, verdict, evaluation, options, policy))
+            Ok(succeeded(&receipt, &core, verdict, evaluation, options, policy))
         }
         // A boundary is rendered for `verified` and for nothing else, so a result carrying
         // none is a rejection whatever else it carries.
-        _ => Ok(rejected(&core, evaluation)),
+        _ => Ok(rejected(&receipt, &core, evaluation)),
     }
+}
+
+/// The §7.7 findings, in the order the verification algorithm reaches them.
+fn assertions(core: &CoreReport) -> Vec<AssertionOut> {
+    core.findings
+        .iter()
+        .map(|finding| AssertionOut {
+            assertion: finding.assertion.name().to_owned(),
+            outcome: finding.outcome.name().to_owned(),
+            receipt_path: finding.receipt_path.clone(),
+            detail: finding.detail.clone(),
+        })
+        .collect()
+}
+
+/// The assurance block the receipt carries, read without interpretation.
+///
+/// I-D §7.7 forbids expressing a result by rewriting these members, so they are copied across
+/// on every outcome and what the run established about each of them is reported separately, in
+/// the assertions.
+fn carried_assurance(receipt: &Value) -> Option<AssuranceOut> {
+    let assurance = receipt.get("claim")?.get("assurance")?;
+    let string =
+        |member: &str| assurance.get(member).and_then(Value::as_str).unwrap_or_default().to_owned();
+    Some(AssuranceOut {
+        governance: string("governance"),
+        competing_triggers: string("competing_triggers"),
+        witnessed: assurance.get("witnessed").and_then(Value::as_bool).unwrap_or(false),
+        continued_history: assurance
+            .get("continued_history")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        content_binding: string("content_binding"),
+        canonicalization_namespace: assurance
+            .get("canonicalization_namespace")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 /// The finding that decided a non-`verified` result: the first `invalid` one, since `invalid`
@@ -143,8 +181,13 @@ fn dominating(core: &CoreReport) -> Option<&ahl_core::receipt::Finding> {
         .or_else(|| core.findings.iter().find(|f| f.outcome == CoreOutcome::Unverifiable))
 }
 
-/// Render a non-`verified` result: the §6 outcome, and the assertion that produced it.
-fn rejected(core: &CoreReport, evaluation: &EvaluationTime) -> Report {
+/// Render a non-`verified` result: the §6 outcome, the assertion that produced it, and the
+/// assurance the receipt claimed.
+///
+/// No boundary is rendered — §7.7 permits only `verified` to be "rendered in words that assert
+/// the property" — and the assurance block is reproduced as carried rather than rewritten to
+/// express the result.
+fn rejected(receipt: &Value, core: &CoreReport, evaluation: &EvaluationTime) -> Report {
     let outcome = match core.result {
         CoreOutcome::Invalid => Outcome::Invalid,
         // `Verified` cannot reach here: it is handled above, and a report carrying no verdict
@@ -159,7 +202,16 @@ fn rejected(core: &CoreReport, evaluation: &EvaluationTime) -> Report {
         .and_then(|finding| finding.detail.clone())
         .unwrap_or_else(|| format!("the receipt is {}", core.result));
 
-    Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source)
+    let mut report =
+        Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
+    report.claim_type = receipt
+        .get("claim")
+        .and_then(|claim| claim.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    report.assurance = carried_assurance(receipt);
+    report.assertions = Some(assertions(core));
+    report
 }
 
 fn adaptor_id(receipt: &Value) -> Result<String, ()> {
@@ -174,6 +226,7 @@ fn adaptor_id(receipt: &Value) -> Result<String, ()> {
 
 fn succeeded(
     receipt: &Value,
+    core: &CoreReport,
     verdict: &Verdict,
     evaluation: &EvaluationTime,
     options: &Options,
@@ -229,6 +282,7 @@ fn succeeded(
         witnessed: verdict.assurance.witnessed,
         continued_history: verdict.assurance.continued_history,
         content_binding: verdict.assurance.content_binding.clone(),
+        canonicalization_namespace: verdict.assurance.canonicalization_namespace.clone(),
     });
     report.checkpoint = checkpoint.and_then(|checkpoint| {
         Some(CheckpointOut {
@@ -250,6 +304,7 @@ fn succeeded(
         .and_then(|claim| claim.get("note"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    report.assertions = Some(assertions(core));
     report.with_findings(findings)
 }
 
@@ -466,11 +521,33 @@ mod tests {
     fn a_keyed_binding_with_no_dataset_key_held_is_unverifiable_never_invalid() {
         // §7.7's own worked example: the content binding is a required assertion, the verifier
         // is not authorized to hold the key, and the result is `unverifiable` — a capability
-        // gap the verifier has, never a defect it has shown in the artifact.
+        // gap the verifier has, never a defect it has shown in the artifact. Its report "MUST
+        // show the anchoring and introduction findings as `verified` and the content-binding
+        // finding as `unverifiable`".
         let report = verify_vector("record-ingested-valid.ahl", &corpus_policy(false));
         assert_eq!(report.status, "unverifiable", "{}", report.reason);
         assert_eq!(report.reason_code, "content-binding");
         assert!(report.boundary.is_none(), "a boundary is rendered for `verified` alone");
+
+        let assertions = report.assertions.as_ref().expect("the findings are reported");
+        let outcome_of = |name: &str| {
+            assertions
+                .iter()
+                .find(|entry| entry.assertion == name && entry.receipt_path.is_empty())
+                .map(|entry| entry.outcome.clone())
+        };
+        assert_eq!(outcome_of("content-binding").as_deref(), Some("unverifiable"));
+        assert_eq!(outcome_of("anchoring").as_deref(), Some("verified"));
+        assert_eq!(outcome_of("claim-material").as_deref(), Some("verified"));
+
+        // The assurance block is reproduced AS CARRIED. §7.7: "a content binding the verifier
+        // cannot compute MUST NOT be re-rendered as `content_binding: \"none\"`, which would
+        // convert an unevaluated claim into a weaker verified one."
+        let assurance = report.assurance.as_ref().expect("the carried block is reproduced");
+        assert_eq!(assurance.content_binding, "keyed-authorized");
+        assert_ne!(assurance.content_binding, "none");
+        assert_eq!(assurance.canonicalization_namespace.as_deref(), Some("public"));
+        assert!(report.to_text().contains("content_binding: keyed-authorized"));
     }
     #[test]
     fn a_run_that_reaches_no_result_is_a_local_failure_and_never_one_of_the_three_values() {
@@ -549,32 +626,17 @@ mod tests {
 
     #[test]
     fn the_receipt_note_is_carried_as_a_quotation_and_never_as_a_finding() {
-        // The corpus receipts carry no `note`; construct the surrounding logic directly.
-        let receipt = json!({ "claim": { "note": "issued for the 2026 audit" } });
-        let verdict = Verdict {
-            claim_type: "statement-anchored".to_owned(),
-            subject_entry_index: 1,
-            subject_statement_id: "sha256:aa".to_owned(),
-            assurance: ahl_core::receipt::Assurance {
-                governance: "declared".to_owned(),
-                competing_triggers: "not-checked".to_owned(),
-                witnessed: false,
-                continued_history: false,
-                content_binding: "none".to_owned(),
-                canonicalization_namespace: None,
-            },
-            boundary: "anchored".to_owned(),
-            embedded_receipts: 0,
-        };
-        let report = succeeded(
-            &receipt,
-            &verdict,
-            &at_corpus_time(),
-            &Options { receipt: std::path::PathBuf::new(), require_fresh: false },
-            &corpus_policy(true),
+        // The note is informative: it is attributed to the receipt and never rendered as
+        // something the run established.
+        let report = verify_vector("statement-anchored-valid.ahl", &corpus_policy(true));
+        assert_eq!(report.status, "valid", "{}", report.reason);
+        let note = report.receipt_note.as_deref().expect("the corpus receipt carries a note");
+        assert!(!note.is_empty());
+        assert!(
+            !report.findings.iter().any(|finding| finding.detail == note),
+            "a note is never a finding"
         );
-        assert_eq!(report.receipt_note.as_deref(), Some("issued for the 2026 audit"));
-        assert!(report.findings.is_empty(), "a note is never a finding");
+        assert!(report.to_text().contains("the receipt says (informative, not a finding)"));
     }
 
     #[test]
@@ -688,6 +750,20 @@ mod tests {
             Some(true)
         );
     }
+    #[test]
+    fn an_invalid_result_prints_the_assertion_table_and_never_a_boundary() {
+        let report = verify_vector("overclaim-must-fail.ahl", &corpus_policy(true));
+        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert!(report.boundary.is_none());
+        let text = report.to_text();
+        assert!(!text.contains("boundary:"), "{text}");
+        assert!(text.contains("assertions:"), "{text}");
+        assert!(text.contains("cross-field: invalid"), "{text}");
+        // The assurance the receipt claimed is still shown, so a reader can see what was
+        // asserted beside what the run established about it.
+        assert!(text.contains("assurance:"), "{text}");
+    }
+
     #[test]
     fn a_consistency_path_that_does_not_verify_is_invalid_on_the_anchoring_assertion() {
         // The core evaluates the carried consistency path, so which of `invalid` and

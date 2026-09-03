@@ -77,7 +77,13 @@ impl Finding {
     }
 }
 
-/// The verified assurance block (receipt format §2.1).
+/// The assurance block, AS THE RECEIPT CARRIES IT (I-D §7.3).
+///
+/// Never rewritten to express a result. I-D §7.7: "No result may be represented by rewriting
+/// the receipt's assurance fields: in particular a content binding the verifier cannot compute
+/// MUST NOT be re-rendered as `content_binding: \"none\"`, which would convert an unevaluated
+/// claim into a weaker verified one." What the run established about each of these is in
+/// [`Report::assertions`]; the block itself says what was claimed, on every outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AssuranceOut {
     /// `declared` or `enumerated`. These are different results and never collapse to one glyph.
@@ -90,6 +96,30 @@ pub struct AssuranceOut {
     pub continued_history: bool,
     /// `none`, `plain-verified` or `keyed-authorized`.
     pub content_binding: String,
+    /// `public` or `private-use`, present exactly where `content_binding` is not `none`
+    /// (I-D §7.3): the namespace the dataset's canonicalization identifier is drawn from.
+    pub canonicalization_namespace: Option<String>,
+}
+
+/// One required assertion of the receipt, with the outcome the run reached for it (I-D §7.7).
+///
+/// §7.7 requires the findings to be reported alongside the scalar result, "because the result
+/// alone does not say which assertion produced it, and a reader cannot act on `unverifiable`
+/// without knowing what was missing". A finding is never a result: the receipt still has
+/// exactly one, in [`Report::status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssertionOut {
+    /// The assertion's stable name, as `ahl-core` spells it: `anchoring`, `governance`,
+    /// `content-binding`, and the rest.
+    pub assertion: String,
+    /// `verified`, `invalid` or `unverifiable` — the same three values as the result, with the
+    /// same meanings.
+    pub outcome: String,
+    /// Where the assertion lives: empty for the receipt itself, otherwise the claim-material
+    /// member names of the embedded receipts leading to it, outermost first.
+    pub receipt_path: Vec<String>,
+    /// For an outcome other than `verified`, what produced it.
+    pub detail: Option<String>,
 }
 
 /// The checkpoint a result is grounded on, by identity.
@@ -137,7 +167,7 @@ pub struct Report {
     pub claim_type: Option<String>,
     /// The rendered boundary. Never stronger than the boundary `ahl-core` carries.
     pub boundary: Option<String>,
-    /// The verified assurance block.
+    /// The assurance block as the receipt carries it, on every outcome.
     pub assurance: Option<AssuranceOut>,
     /// The checkpoint this result is grounded on.
     pub checkpoint: Option<CheckpointOut>,
@@ -155,6 +185,9 @@ pub struct Report {
     pub continued_history_bound: Option<ObservationBound>,
     /// Findings, ordered by `(code, detail)`. Reported in full, never suppressed.
     pub findings: Vec<Finding>,
+    /// One entry per required assertion of the verified receipt, in the order the verification
+    /// algorithm reaches them. `null` for a command that verifies no receipt.
+    pub assertions: Option<Vec<AssertionOut>>,
     /// The receipt's informative `note`, quoted. Never a finding, never normative.
     pub receipt_note: Option<String>,
     /// The authenticated affected set. Present only on an authenticated `closure`.
@@ -201,6 +234,7 @@ impl Report {
             series_usable_bound: None,
             continued_history_bound: None,
             findings: Vec::new(),
+            assertions: None,
             receipt_note: None,
             affected: None,
             topology_affected: None,
@@ -255,6 +289,9 @@ impl Report {
             let _ = writeln!(out, "  witnessed: {}", assurance.witnessed);
             let _ = writeln!(out, "  continued_history: {}", assurance.continued_history);
             let _ = writeln!(out, "  content_binding: {}", assurance.content_binding);
+            if let Some(namespace) = &assurance.canonicalization_namespace {
+                let _ = writeln!(out, "  canonicalization_namespace: {namespace}");
+            }
         }
         if let Some(checkpoint) = &self.checkpoint {
             let _ = writeln!(
@@ -288,6 +325,26 @@ impl Report {
             out.push_str("findings:\n");
             for finding in &self.findings {
                 let _ = writeln!(out, "  [{}] {}", finding.code, finding.detail);
+            }
+        }
+        if let Some(assertions) = &self.assertions {
+            if !assertions.is_empty() {
+                out.push_str("assertions:\n");
+                for assertion in assertions {
+                    let mut name = assertion.receipt_path.join("/");
+                    if !name.is_empty() {
+                        name.push('/');
+                    }
+                    name.push_str(&assertion.assertion);
+                    match &assertion.detail {
+                        Some(detail) => {
+                            let _ = writeln!(out, "  {name}: {} — {detail}", assertion.outcome);
+                        }
+                        None => {
+                            let _ = writeln!(out, "  {name}: {}", assertion.outcome);
+                        }
+                    }
+                }
             }
         }
         if let Some(affected) = &self.affected {
@@ -352,6 +409,7 @@ mod tests {
             "\"series_usable_bound\"",
             "\"continued_history_bound\"",
             "\"findings\"",
+            "\"assertions\"",
             "\"receipt_note\"",
         ]
         .into_iter()
@@ -423,6 +481,7 @@ mod tests {
             witnessed: true,
             continued_history: false,
             content_binding: "keyed-authorized".to_owned(),
+            canonicalization_namespace: Some("public".to_owned()),
         });
         let text = report.to_text();
         for expected in [
@@ -431,6 +490,7 @@ mod tests {
             "witnessed: true",
             "continued_history: false",
             "content_binding: keyed-authorized",
+            "canonicalization_namespace: public",
         ] {
             assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
         }
@@ -485,6 +545,40 @@ mod tests {
         assert!(text.contains("completeness: complete"));
         assert!(text.contains("affected (1)"));
         assert!(text.contains("scores sha256:cc"));
+    }
+
+    #[test]
+    fn the_assertion_table_renders_every_entry_under_its_receipt_path() {
+        let mut report = report();
+        report.assertions = Some(vec![
+            AssertionOut {
+                assertion: "anchoring".to_owned(),
+                outcome: "verified".to_owned(),
+                receipt_path: Vec::new(),
+                detail: None,
+            },
+            AssertionOut {
+                assertion: "content-binding".to_owned(),
+                outcome: "unverifiable".to_owned(),
+                receipt_path: vec!["introduction".to_owned()],
+                detail: Some("no dataset key is held".to_owned()),
+            },
+        ]);
+        let text = report.to_text();
+        assert!(text.contains("anchoring: verified"), "{text}");
+        assert!(
+            text.contains("introduction/content-binding: unverifiable — no dataset key is held"),
+            "{text}"
+        );
+        let json = report.to_json().expect("serializes");
+        assert!(json.contains("\"receipt_path\""), "{json}");
+    }
+
+    #[test]
+    fn a_command_that_verifies_no_receipt_reports_no_assertions_rather_than_an_empty_set() {
+        let json = report().to_json().expect("serializes");
+        assert!(json.contains("\"assertions\": null"), "{json}");
+        assert!(!report().to_text().contains("assertions:"));
     }
 
     #[test]
