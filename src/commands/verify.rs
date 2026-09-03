@@ -462,19 +462,11 @@ mod tests {
         )
     }
 
-    /// Corpus vectors marked `reject` whose §6 outcome is `3` rather than `1`.
-    ///
-    /// The corpus index records *that* a receipt must be refused; it does not record which of
-    /// the four outcomes the refusal carries, because that mapping is the design note's §6
-    /// table and lives in this crate. A `FormatConflict` names a combination the frozen
-    /// container format defines no material to evidence: the receipt is well-formed and
-    /// nothing about it has been disproved, so the honest answer is "required evidence could
-    /// not be established", not "a rule fired against the artifact".
-    const REFUSED_AS_UNVERIFIABLE: [&str; 1] =
-        ["trigger-effective-enumerated-with-later-checkpoint-must-fail.ahl"];
-
     #[test]
-    fn every_positive_corpus_receipt_is_valid_and_every_negative_one_is_invalid() {
+    fn every_corpus_receipt_reaches_the_result_and_the_finding_the_corpus_declares() {
+        // The corpus index states the §7.7 result a conformant verifier must reach and, for a
+        // non-`verified` vector, the required assertion whose finding produced it. Both are
+        // asserted, so neither the result nor the assertion it came from can drift.
         let policy = corpus_policy(true);
         let index = corpus_index();
         let vectors = index["vectors"].as_array().expect("vectors");
@@ -484,36 +476,41 @@ mod tests {
             let file = vector["file"].as_str().expect("file");
             let expect = vector["expect"].as_str().expect("expect");
             let report = verify_vector(file, &policy);
-            match expect {
-                "accept" => {
-                    assert_eq!(report.status, "valid", "{file}: {}", report.reason);
-                    assert_eq!(
-                        report.claim_type.as_deref(),
-                        vector["claim_type"].as_str(),
-                        "{file}"
-                    );
-                    assert_eq!(
-                        words(report.boundary.as_deref().unwrap_or_default()),
-                        words(vector["boundary"].as_str().unwrap_or_default()),
-                        "{file}: the rendered boundary must be the one ahl-core carries"
-                    );
-                }
-                "reject" => {
-                    let expected_status = if REFUSED_AS_UNVERIFIABLE.contains(&file) {
-                        "unverifiable"
-                    } else {
-                        "invalid"
-                    };
-                    assert_eq!(report.status, expected_status, "{file}: {}", report.reason);
-                    let expected = vector["reason"].as_str().expect("reason");
-                    assert!(
-                        report.reason.contains(expected),
-                        "{file}: expected the rule `{expected}` to fire, got `{}`",
-                        report.reason
-                    );
-                }
+            let status = match expect {
+                "verified" => "valid",
+                "invalid" => "invalid",
+                "unverifiable" => "unverifiable",
                 other => panic!("unknown expectation `{other}` for {file}"),
+            };
+            assert_eq!(report.status, status, "{file}: {}", report.reason);
+
+            if expect == "verified" {
+                assert_eq!(report.claim_type.as_deref(), vector["claim_type"].as_str(), "{file}");
+                // The verdict is rendered from `ahl_core::receipt::Verdict` and is never
+                // stronger than the boundary that struct carries.
+                assert_eq!(
+                    words(report.boundary.as_deref().unwrap_or_default()),
+                    words(vector["boundary"].as_str().unwrap_or_default()),
+                    "{file}: the rendered boundary must be the one ahl-core carries"
+                );
+                continue;
             }
+
+            assert!(report.boundary.is_none(), "{file}: only `verified` renders a boundary");
+            let expected = vector["reason"].as_str().expect("reason");
+            assert!(
+                report.reason.contains(expected),
+                "{file}: expected the rule `{expected}` to fire, got `{}`",
+                report.reason
+            );
+            let assertion = vector["finding"].as_str().expect("finding");
+            let assertions = report.assertions.as_ref().expect("the findings are reported");
+            assert!(
+                assertions
+                    .iter()
+                    .any(|entry| entry.assertion == assertion && entry.outcome == expect),
+                "{file}: `{assertion}` is not reported as `{expect}`: {assertions:?}"
+            );
         }
     }
 

@@ -34,10 +34,6 @@ fn index() -> serde_json::Value {
         .expect("index parses")
 }
 
-/// Corpus vectors marked `reject` whose §6 outcome is `3` rather than `1`.
-const REFUSED_AS_UNVERIFIABLE: [&str; 1] =
-    ["trigger-effective-enumerated-with-later-checkpoint-must-fail.ahl"];
-
 #[test]
 fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -59,44 +55,48 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
             &path.display().to_string(),
         ]);
         let report = run.json();
-        match vector["expect"].as_str().expect("expect") {
-            "accept" => {
-                assert_eq!(run.code, 0, "{file}: {}", report["reason"]);
-                assert_eq!(report["status"], "valid", "{file}");
-                assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
-                // The verdict is rendered from `ahl_core::receipt::Verdict` and is never
-                // stronger than the boundary that struct carries. Compared on the words: the
-                // corpus index records one boundary with a run of spaces where its generator
-                // wrapped the line, and the rule under test is the strength of the claim, not
-                // its layout.
-                assert_eq!(
-                    words(report["boundary"].as_str().unwrap_or_default()),
-                    words(vector["boundary"].as_str().unwrap_or_default()),
-                    "{file}"
-                );
-            }
-            "reject" => {
-                // The corpus index records *that* a receipt must be refused, never which of
-                // the four outcomes the refusal carries: that mapping is the design note's §6
-                // table and lives in this crate. A `FormatConflict` names a combination the
-                // frozen container format defines no material to evidence, so the receipt is
-                // well-formed with nothing disproved — `3`, not `1`.
-                let (code, status) = if REFUSED_AS_UNVERIFIABLE.contains(&file) {
-                    (3, "unverifiable")
-                } else {
-                    (1, "invalid")
-                };
-                assert_eq!(run.code, code, "{file}: {}", report["reason"]);
-                assert_eq!(report["status"], status, "{file}");
-                let expected = vector["reason"].as_str().expect("reason");
-                assert!(
-                    report["reason"].as_str().unwrap_or_default().contains(expected),
-                    "{file}: expected the rule `{expected}` to fire, got {}",
-                    report["reason"]
-                );
-            }
+        let expect = vector["expect"].as_str().expect("expect");
+        // The corpus index states the §7.7 result; §6 fixes the exit code each one carries.
+        let (code, status) = match expect {
+            "verified" => (0, "valid"),
+            "invalid" => (1, "invalid"),
+            "unverifiable" => (3, "unverifiable"),
             other => panic!("unknown expectation `{other}` for {file}"),
+        };
+        assert_eq!(run.code, code, "{file}: {}", report["reason"]);
+        assert_eq!(report["status"], status, "{file}");
+
+        if expect == "verified" {
+            assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
+            // The verdict is rendered from `ahl_core::receipt::Verdict` and is never stronger
+            // than the boundary that struct carries. Compared on the words: the corpus index
+            // records one boundary with a run of spaces where its generator wrapped the line,
+            // and the rule under test is the strength of the claim, not its layout.
+            assert_eq!(
+                words(report["boundary"].as_str().unwrap_or_default()),
+                words(vector["boundary"].as_str().unwrap_or_default()),
+                "{file}"
+            );
+            continue;
         }
+
+        assert!(report["boundary"].is_null(), "{file}: only `verified` renders a boundary");
+        let expected = vector["reason"].as_str().expect("reason");
+        assert!(
+            report["reason"].as_str().unwrap_or_default().contains(expected),
+            "{file}: expected the rule `{expected}` to fire, got {}",
+            report["reason"]
+        );
+        // §7.7 requires the findings to be reported alongside the result, since "the result
+        // alone does not say which assertion produced it".
+        let assertion = vector["finding"].as_str().expect("finding");
+        let assertions = report["assertions"].as_array().expect("assertions");
+        assert!(
+            assertions
+                .iter()
+                .any(|entry| entry["assertion"] == assertion && entry["outcome"] == expect),
+            "{file}: `{assertion}` is not reported as `{expect}`: {report}"
+        );
     }
 }
 
@@ -212,7 +212,9 @@ fn the_toy_corpus_walks_in_topology_mode_through_the_binary() {
         "closure",
         "--unauthenticated",
         "--corpus",
-        &corpus().join("vectors/statements").display().to_string(),
+        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+            .display()
+            .to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
         "--trigger-index",

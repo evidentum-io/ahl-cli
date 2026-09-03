@@ -52,11 +52,28 @@ makes a verifier useless in CI.
 | `0` | `valid` | every required rule verified |
 | `1` | `invalid` | a normative rule fired against the artifact: structure, signature, proof, cross-field rule, equivocation between authenticated checkpoints, unknown claim or statement type |
 | `2` | `error` | the CLI could not begin: usage, unreadable or unparseable policy, output-path I/O, internal invariant |
-| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established — including a combination the frozen container format defines no material to evidence (`format-conflict`) |
+| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established: a capability the verifier lacks, a local configuration it has not been given, or a local budget it has set |
 
 `0`, `1` and `2` carry exactly their `atl-cli` meanings, so a consumer written against the
 family canon still reads them correctly. `3` is a documented AHL extension and is **never**
 rendered as INVALID in any surface — text, JSON, or exit status.
+
+For `verify`, the first three are the three values of the AHL result model: a completed run
+reaches exactly one of `verified`, `invalid` and `unverifiable`, and which one a rejection
+produces is decided by `ahl-core` from the rule that fired, never re-derived here — a
+verifier-local condition reported as `invalid` would let two verifiers make contradictory
+statements about one artifact. A run that does not complete reaches no result at all and is
+reported as the local failure it is, which is exit `2`.
+
+The result is scalar — one receipt, one value — but it is not the whole report. `verify` also
+reports one entry per required assertion of the receipt, in `assertions[]`, because the result
+alone does not say which assertion produced it and a reader cannot act on `unverifiable`
+without knowing what was missing. A receipt whose content binding cannot be computed reports
+`unverifiable` as its result and `verified` on the assertions that did hold. A boundary is
+rendered for `verified` and for nothing else, and no result is ever expressed by rewriting the
+receipt's own assurance fields: the assurance block is reproduced as carried on every outcome,
+so a content binding the verifier could not compute is never re-rendered as
+`content_binding: "none"`.
 
 Where more than one thing goes wrong: a rule fired against the artifact (`1`) outranks missing
 external evidence (`3`), which outranks a local-environment failure (`2`) — except that a local
@@ -97,11 +114,12 @@ the output carries no verdict field for a consumer to misread.
 [policy]
 genesis_entry_id = "sha256:be129d…"
 genesis_key_ids  = ["sha256:34750f…"]
-trusted_witness_key_ids = []          # optional
 
-[policy.limits]                        # optional; receipt-format §3.1 budgets
-max_depth = 4
-max_embedded = 64
+[policy.trusted_witness_keys."sha256:c5b940…"]   # optional; whole entries, never bare ids
+pubkey     = "base64:ypOsFw…"
+witness_id = "witness-1"
+
+[policy.limits]                        # optional; the two verifier-local budgets
 max_decoded_bytes = 8388608
 max_work_units = 100000
 
@@ -138,6 +156,17 @@ is the attack this closes.
 
 Endpoints live outside `[policy]` deliberately: reading a URL must never look like reading a
 trust anchor.
+
+A trusted witness key is configured as a whole entry — `pubkey` and `witness_id` beside the key
+id — because the witness identity is inside the cosignature preimage: a key trusted to cosign
+for one witness is not thereby trusted to cosign as another.
+
+`[policy.limits]` carries the two verifier-local budgets and nothing else. The embedded nesting
+depth (4) and embedded-receipt count (64) are fixed properties of the artifact, decided
+identically by every verifier, so there is no key for them: a verifier able to lower either
+would refuse a receipt another verifier accepts. Unknown keys are refused rather than ignored,
+so a policy still carrying `max_depth` or `max_embedded` is reported as an unusable policy
+(exit `2`) rather than silently read with the member dropped.
 
 ## Keys
 
@@ -452,11 +481,16 @@ for them are gone:
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
 
-## Two additions to the §6 field list
+## Three additions to the §6 field list
 
-`--json` carries two members §6's fixed list does not name, both added visibly rather than
+`--json` carries three members §6's fixed list does not name, each added visibly rather than
 silently:
 
+- `assertions` — one entry per required assertion of the verified receipt, as
+  `{assertion, outcome, receipt_path, detail}`, with the assertion names and the three outcome
+  values `ahl-core` reports. The result model requires the findings to be reported alongside
+  the scalar result, and `findings[]` is a different list: it carries this crate's own
+  diagnostic codes, such as `witness-stale`. `null` for a command that verifies no receipt.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.

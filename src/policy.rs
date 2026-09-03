@@ -650,6 +650,71 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_carrying_a_fixed_limit_is_refused_rather_than_read_with_it_dropped() {
+        // The fixed limits of the resource-limit rules are properties of the artifact, decided
+        // identically by every verifier, so there is no key for them. An unknown key is refused
+        // like any other, which is exit 2 — reading the file with the member silently dropped
+        // would leave an operator believing a bound is in force that is not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for member in ["max_depth = 4", "max_embedded = 64"] {
+            let text = format!("{}\n[policy.limits]\n{member}\n", minimal());
+            let error = load(&write_policy(dir.path(), &text)).expect_err("unknown key");
+            assert!(matches!(error, CliError::Policy(_)), "{error}");
+            assert_eq!(error.outcome(), crate::outcome::Outcome::Error);
+        }
+    }
+
+    #[test]
+    fn a_trusted_witness_key_is_configured_as_a_whole_entry_never_as_a_bare_id() {
+        // The witness identity is inside the cosignature preimage, so a key trusted to cosign
+        // for one witness is not thereby trusted to cosign as another. Configuring the id alone
+        // would let the artifact choose both the verification key and the identity.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = format!(
+            "{}\n[policy.trusted_witness_keys.\"{KEY_ID}\"]\n\
+             pubkey = \"base64:AAAA\"\nwitness_id = \"witness-1\"\n",
+            minimal()
+        );
+        let loaded = load(&write_policy(dir.path(), &entry)).expect("valid policy");
+        let held = loaded.trust.trusted_witness_keys.get(KEY_ID).expect("held");
+        assert_eq!(held.pubkey, "base64:AAAA");
+        assert_eq!(held.witness_id, "witness-1");
+
+        // The old spelling is an unknown key, and every member of the entry is required.
+        for text in [
+            format!("{}\ntrusted_witness_key_ids = [\"{KEY_ID}\"]\n", minimal()),
+            format!(
+                "{}\n[policy.trusted_witness_keys.\"{KEY_ID}\"]\nwitness_id = \"witness-1\"\n",
+                minimal()
+            ),
+            format!(
+                "{}\n[policy.trusted_witness_keys.\"{KEY_ID}\"]\n\
+                 pubkey = \"AAAA\"\nwitness_id = \"witness-1\"\n",
+                minimal()
+            ),
+            format!(
+                "{}\n[policy.trusted_witness_keys.\"{KEY_ID}\"]\n\
+                 pubkey = \"base64:AAAA\"\nwitness_id = \"\"\n",
+                minimal()
+            ),
+        ] {
+            assert!(load(&write_policy(dir.path(), &text)).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_genesis_key_fingerprints_are_held_and_therefore_compared() {
+        // `None` is the core's "policy holds none, so the comparison does not arise". This CLI
+        // refuses an empty list rather than reading one as the absence of a trust anchor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = load(&write_policy(dir.path(), &minimal())).expect("valid policy");
+        assert_eq!(loaded.trust.genesis_key_ids.as_ref().map(BTreeSet::len), Some(1));
+
+        let text = format!("[policy]\ngenesis_entry_id = \"{GENESIS}\"\ngenesis_key_ids = []\n");
+        assert!(load(&write_policy(dir.path(), &text)).is_err());
+    }
+
+    #[test]
     fn limits_override_only_what_they_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let text = format!(
