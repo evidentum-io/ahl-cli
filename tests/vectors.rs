@@ -68,6 +68,11 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
         // applies here, so the two agree.
         assert_eq!(report["status"], status, "{file}");
         assert_eq!(report["outcome"], status, "{file}");
+        // The void entries the corpus says the vector carries, counted through the binary. A
+        // vector carrying them still reaches the result its `expect` names.
+        let void = vector["informative"].as_u64().unwrap_or(0);
+        let reported = report["informative"].as_array().expect("void entries are reported");
+        assert_eq!(reported.len() as u64, void, "{file}: {report}");
 
         if expect == "verified" {
             assert_eq!(report["claim_type"], vector["claim_type"], "{file}");

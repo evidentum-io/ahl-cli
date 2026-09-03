@@ -782,6 +782,24 @@ mod tests {
             };
             assert_eq!(report.status, Some(status), "{file}: {}", report.reason);
 
+            // Void entries are counted, never adjudicated: the corpus states how many each
+            // vector carries, and a vector that carries some still reaches the result its
+            // `expect` names — a void entry is not a defect of the receipt that revealed it.
+            let void = vector["informative"].as_u64().unwrap_or(0);
+            let reported = report.informative.as_ref().expect("void entries are reported");
+            assert_eq!(
+                u64::try_from(reported.len()).expect("small count"),
+                void,
+                "{file}: {reported:?}"
+            );
+            for item in reported {
+                assert!(
+                    ["signature-invalid", "key-not-active"].contains(&item.reason.as_str()),
+                    "{file}: unknown void reason `{}`",
+                    item.reason
+                );
+            }
+
             if expect == "verified" {
                 assert_eq!(report.claim_type.as_deref(), vector["claim_type"].as_str(), "{file}");
                 // The verdict is rendered from `ahl_core::receipt::Verdict` and is never
@@ -1290,6 +1308,61 @@ mod tests {
             report.policy_overlays
         );
         assert!(!report.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
+    fn a_void_entry_is_counted_and_never_moves_the_result() {
+        // I-D §7.5.1 4d: a non-verifying envelope the receipt does not rest on is VOID —
+        // excluded, never effective, never traversed, and it does not affect the result. The
+        // corpus carries vectors that verify WITH void entries in them, which is the whole
+        // point: a log anchors opaque bytes and validates none, so were a void entry a defect
+        // of every later receipt, any party able to anchor one envelope could disable every
+        // enumerated claim of that log from that index on.
+        let policy = corpus_policy(true);
+        let index = corpus_index();
+        let mut checked = 0;
+        for vector in index["vectors"].as_array().expect("vectors") {
+            let Some(void) = vector["informative"].as_u64() else { continue };
+            assert!(void > 0, "the corpus only records the member where there are void entries");
+            let file = vector["file"].as_str().expect("file");
+            let report = verify_vector(file, &policy);
+            let reported = report.informative.as_ref().expect("void entries are reported");
+            assert_eq!(u64::try_from(reported.len()).expect("small"), void, "{file}");
+
+            if vector["expect"] == "verified" {
+                assert_eq!(report.status, Some("valid"), "{file}: {}", report.reason);
+                assert_eq!(report.outcome, "valid", "{file}");
+                assert_eq!(report.reason_code, "verified", "{file}: a void entry never leads");
+                assert!(report.boundary.is_some(), "{file}: a verified receipt keeps its boundary");
+            }
+            // Never a finding, whatever the result: the two lists do not overlap.
+            let assertions = report.assertions.as_ref().expect("assertions");
+            assert!(
+                assertions.iter().all(|entry| entry.assertion != "void-entry"),
+                "{file}: a void entry is not an assertion: {assertions:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "the corpus should carry vectors with void entries, got {checked}");
+    }
+
+    #[test]
+    fn the_text_surface_lists_void_entries_under_their_own_heading() {
+        let policy = corpus_policy(true);
+        let index = corpus_index();
+        let file = index["vectors"]
+            .as_array()
+            .expect("vectors")
+            .iter()
+            .find(|vector| vector["expect"] == "verified" && vector["informative"].is_number())
+            .and_then(|vector| vector["file"].as_str())
+            .expect("a verified vector carrying void entries");
+        let report = verify_vector(file, &policy);
+        let text = report.to_text();
+        assert!(text.starts_with("outcome: valid\n"), "{file}: {text}");
+        assert!(text.contains("void entries:\n"), "{file}: {text}");
+        assert!(text.contains("entry index "), "{file}: {text}");
+        assert!(!text.contains("findings:"), "{file}: a void entry is not a finding: {text}");
     }
 
     #[test]
