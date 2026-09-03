@@ -31,16 +31,24 @@
 //! not reach then rests on it, and §7.8's "MUST report WHICH budget was exhausted and the value
 //! that was in force" is satisfied only by the one that ran out.
 //!
-//! # The one CLI overlay
+//! # The one CLI policy overlay
 //!
-//! `status` is the reduction of `assertions[]`, and `assertions[]` is the core's required
-//! assertions plus exactly one entry this crate adds: `witness-freshness`, and only where
-//! `--require-fresh` is given and a carried cosignature is older than the cadence plus the
-//! grace period the governing manifest declares. Freshness is a property of the run's
-//! evaluation time, not of the receipt, so the core neither has it nor could: it is a
-//! verifier-local condition of exactly the shape §7.7's second bullet describes. It therefore
-//! produces `unverifiable` and **never** `invalid` — a stale cosignature disproves nothing —
-//! and without the flag it is not an assertion at all, only a `findings[]` entry.
+//! `assertions[]` carries the core's required assertions and nothing else: §7.7 enumerates
+//! them "exactly", and a verifier-local condition among them would be this crate asserting
+//! something about the receipt that another conformant verifier would not.
+//!
+//! `policy_overlays[]` is where a locally configured condition goes, and this build has one:
+//! `witness-freshness`, present only where `--require-fresh` is given and a carried cosignature
+//! is older than the cadence plus the grace period the governing manifest declares. Freshness
+//! is a property of the run's evaluation time, not of the receipt, so the core neither has it
+//! nor could. It produces `unverifiable` and **never** `invalid` — a stale cosignature
+//! disproves nothing — and without the flag it is not an overlay at all, only a `findings[]`
+//! entry (`witness-stale`).
+//!
+//! **`status` in two steps.** It is the §7.7 reduction of `assertions[]`, and then promoted to
+//! `unverifiable` by any overlay. An overlay can only ever promote, never weaken an `invalid`,
+//! and the headline follows the same precedence: the core's `dominating()` finding wherever the
+//! core result is not `verified`, and otherwise the first overlay.
 //!
 //! A boundary is rendered where the FINAL status is `valid` and nowhere else. Carrying the
 //! core's boundary under a status the overlay moved would present words that assert the
@@ -67,7 +75,9 @@ use crate::governance::Governance;
 use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
 use crate::profile;
-use crate::report::{AssertionOut, AssuranceOut, CheckpointOut, Completeness, Finding, Report};
+use crate::report::{
+    AssertionOut, AssuranceOut, CheckpointOut, Completeness, Finding, PolicyOverlayOut, Report,
+};
 use crate::secure;
 
 /// Options for one `verify` run.
@@ -173,8 +183,8 @@ fn headline(finding: Option<&CoreFinding>) -> Option<(String, String)> {
     ))
 }
 
-/// The one assertion this crate adds to the core's required set: whether the cosignature this
-/// run rests on is fresh at the evaluation time. See the module header for why it is an overlay
+/// The one policy overlay this build applies: whether the cosignature the result rests on is
+/// fresh at the run's evaluation time. See the module header for why it is not a §7.7 assertion
 /// and why it can never be `invalid`.
 const FRESHNESS: &str = "witness-freshness";
 
@@ -324,8 +334,8 @@ fn succeeded(
 ) -> Report {
     let checkpoint = receipt.get("anchoring").and_then(|anchoring| anchoring.get("checkpoint"));
     let mut findings = Vec::new();
-    let mut assertions = assertions(core);
-    let mut outcome = Outcome::Valid;
+    let assertions = assertions(core);
+    let mut overlays: Vec<PolicyOverlayOut> = Vec::new();
 
     // Governance findings and freshness both come from the receipt's own chain, which
     // `verify_receipt` has already validated back to the configured genesis anchor.
@@ -340,19 +350,14 @@ fn succeeded(
                 match freshness(&governance, checkpoint, evaluation) {
                     Ok(Some(finding)) => {
                         // Staleness is a finding, never by itself a disproof. `--require-fresh`
-                        // makes it an assertion of this run — `unverifiable`, never `invalid` —
-                        // and the status is then the reduction over the whole set, so no
-                        // consumer sees a status its assertions do not account for.
+                        // makes it a POLICY OVERLAY of this run — `unverifiable`, never
+                        // `invalid` — reported in its own field rather than among the
+                        // receipt's required assertions, which §7.7 enumerates exactly.
                         if options.require_fresh {
-                            outcome = Outcome::Unverifiable;
-                            assertions.push(AssertionOut {
-                                assertion: FRESHNESS.to_owned(),
+                            overlays.push(PolicyOverlayOut {
+                                overlay: FRESHNESS.to_owned(),
                                 outcome: CoreOutcome::Unverifiable.name().to_owned(),
-                                detail: Some(finding.detail.clone()),
-                                receipt_path: Vec::new(),
-                                // The freshness check itself produced it, so it is a cause and
-                                // can lead the report where no core cause outranks it.
-                                rests_on: None,
+                                detail: finding.detail.clone(),
                             });
                         }
                         findings.push(finding);
@@ -366,18 +371,20 @@ fn succeeded(
         }
     }
 
-    // The core's cause outranks the overlay, and the ordering is written out rather than left
-    // to fall out of the code: a receipt that also failed a required assertion failed it for a
-    // reason its holder must be told first, while freshness is a condition of this run. This
-    // arm is reached with a `verified` core report, so `dominating()` is `None` here and the
-    // overlay leads where it fired; the rule holds if that ever changes.
+    // The status in the two steps §7.7 and the overlay rule fix: the reduction of the core's
+    // required assertions, and THEN the promotion any overlay applies. This arm is reached with
+    // a `verified` core report, so the reduction is `Valid` here and only the promotion can
+    // move it — the ordering is written out anyway, because an overlay silently outranking a
+    // core result is what the split exists to prevent.
+    let outcome = if overlays.is_empty() { Outcome::Valid } else { Outcome::Unverifiable };
+
+    // The core's cause outranks the overlay for the same reason: a receipt that also failed a
+    // required assertion failed it for a reason its holder must be told first, while freshness
+    // is a condition of this run.
     let (reason_code, reason) = headline(core.dominating())
         .or_else(|| {
-            let overlay = assertions.iter().find(|entry| entry.assertion == FRESHNESS)?;
-            Some((
-                overlay.assertion.clone(),
-                overlay.detail.clone().unwrap_or_else(|| overlay.assertion.clone()),
-            ))
+            let overlay = overlays.first()?;
+            Some((overlay.overlay.clone(), overlay.detail.clone()))
         })
         .unwrap_or_else(|| ("verified".to_owned(), "every required rule verified".to_owned()));
 
@@ -420,6 +427,7 @@ fn succeeded(
         .and_then(Value::as_str)
         .map(str::to_owned);
     report.assertions = Some(assertions);
+    report.policy_overlays = overlays;
     report.with_findings(findings)
 }
 
@@ -898,6 +906,10 @@ mod tests {
             "without the flag nothing overlays the core's set: {assertions:?}"
         );
         assert_eq!(reduction(assertions), finding_only.status);
+        assert!(
+            finding_only.policy_overlays.is_empty(),
+            "without the flag freshness is a finding, not an overlay"
+        );
 
         let promoted = run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
         assert_eq!(promoted.status, "unverifiable");
@@ -907,19 +919,37 @@ mod tests {
         assert!(promoted.boundary.is_none(), "no boundary under a non-valid status");
         assert!(!promoted.to_text().contains("boundary:"), "{}", promoted.to_text());
 
-        // The status is the reduction of the assertions, overlay included.
+        // §7.7 enumerates the required assertions exactly, and freshness is not among them:
+        // the core's set is untouched and the overlay is reported in its own field.
         let assertions = promoted.assertions.as_ref().expect("assertions");
-        let freshness = assertions
-            .iter()
-            .find(|entry| entry.assertion == FRESHNESS)
-            .expect("the overlay is reported as an assertion");
-        assert_eq!(freshness.outcome, "unverifiable", "the overlay never yields `invalid`");
-        assert!(freshness.receipt_path.is_empty(), "it is an assertion of this run");
-        let detail = freshness.detail.as_deref().unwrap_or_default();
-        assert!(detail.contains("ns old at the evaluation time"), "the age is named: {detail}");
-        assert!(detail.contains("grace period"), "the grace period is named: {detail}");
-        assert_eq!(reduction(assertions), promoted.status);
+        assert!(
+            assertions.iter().all(|entry| entry.outcome == "verified"),
+            "the core's required assertions are untouched by an overlay: {assertions:?}"
+        );
+        assert!(
+            !assertions.iter().any(|entry| entry.assertion == FRESHNESS),
+            "an overlay is never a §7.7 assertion: {assertions:?}"
+        );
+        assert_eq!(reduction(assertions), "valid", "the reduction alone is still `valid`");
+
+        let overlay =
+            promoted.policy_overlays.first().expect("the overlay is reported in its own field");
+        assert_eq!(overlay.overlay, FRESHNESS);
+        assert_eq!(overlay.outcome, "unverifiable", "an overlay never yields `invalid`");
+        assert!(
+            overlay.detail.contains("ns old at the evaluation time"),
+            "the age is named: {}",
+            overlay.detail
+        );
+        assert!(
+            overlay.detail.contains("grace period"),
+            "the grace period is named: {}",
+            overlay.detail
+        );
+        // The status is the reduction, THEN the promotion the overlay applies.
+        assert_eq!(promoted.status, "unverifiable");
         assert_eq!(promoted.reason_code, FRESHNESS);
+        assert!(promoted.to_text().contains("policy overlays:"), "{}", promoted.to_text());
     }
 
     /// The §7.7 reduction over a reported assertion set, in the CLI's own status vocabulary.

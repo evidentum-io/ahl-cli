@@ -11,6 +11,21 @@
 //! edges as easily as omit real ones — the topology result is not a subset of the true
 //! closure, so it must not be describable as a partial one.
 //!
+//! # `status`, in two steps
+//!
+//! `status` is the I-D §7.7 reduction of `assertions[]` — `invalid` if any required assertion
+//! is `invalid`, otherwise `unverifiable` if any is `unverifiable`, otherwise `valid` — and
+//! **then** promoted to `unverifiable` by any entry in `policy_overlays[]`. The two steps are
+//! separate because the two lists answer different questions: `assertions[]` is what the
+//! receipt requires, decided identically by every conformant verifier, while an overlay is a
+//! condition this operator configured. Folding an overlay into `assertions[]` would put a
+//! verifier-local condition among the receipt's required assertions, which §7.7 enumerates
+//! exactly; leaving it out of the status would report `valid` for a run whose own policy was
+//! not satisfied.
+//!
+//! An overlay can only ever promote, and only to `unverifiable`: it never turns `invalid` into
+//! something weaker, and it never produces `invalid` itself.
+//!
 //! # Determinism
 //!
 //! Key order is the declaration order of these structs, and every printed set is ordered
@@ -130,6 +145,28 @@ pub struct AssertionOut {
     pub rests_on: Option<String>,
 }
 
+/// One locally configured policy condition this run applied on top of the receipt's own
+/// required assertions.
+///
+/// I-D §7.7 fixes the required assertions of a receipt "exactly", and freshness is not among
+/// them: it is a property of the run's evaluation time rather than of the artifact, so it
+/// cannot be a §7.7 finding and does not belong in [`Report::assertions`]. It is reported here
+/// instead, in its own field, so a consumer can tell what the receipt asserted from what this
+/// verifier's own policy added.
+///
+/// An overlay yields [`Self::outcome`] `unverifiable` and nothing else. It is verifier-local by
+/// construction, and a verifier-local condition reported as `invalid` would let two verifiers
+/// make contradictory statements about one artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyOverlayOut {
+    /// Stable code for the condition, e.g. `witness-freshness`.
+    pub overlay: String,
+    /// Always `unverifiable`: an overlay never disproves anything.
+    pub outcome: String,
+    /// What the condition found.
+    pub detail: String,
+}
+
 /// The checkpoint a result is grounded on, by identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckpointOut {
@@ -194,8 +231,11 @@ pub struct Report {
     /// Findings, ordered by `(code, detail)`. Reported in full, never suppressed.
     pub findings: Vec<Finding>,
     /// One entry per required assertion of the verified receipt, in the order the verification
-    /// algorithm reaches them. `null` for a command that verifies no receipt.
+    /// algorithm reaches them, **as the core reports them and nothing else**. `null` for a
+    /// command that verifies no receipt, and for a local failure that reached no result.
     pub assertions: Option<Vec<AssertionOut>>,
+    /// Locally configured conditions this run applied on top of those. Empty where none did.
+    pub policy_overlays: Vec<PolicyOverlayOut>,
     /// The receipt's informative `note`, quoted. Never a finding, never normative.
     pub receipt_note: Option<String>,
     /// The authenticated affected set. Present only on an authenticated `closure`.
@@ -243,6 +283,7 @@ impl Report {
             continued_history_bound: None,
             findings: Vec::new(),
             assertions: None,
+            policy_overlays: Vec::new(),
             receipt_note: None,
             affected: None,
             topology_affected: None,
@@ -335,6 +376,16 @@ impl Report {
                 let _ = writeln!(out, "  [{}] {}", finding.code, finding.detail);
             }
         }
+        if !self.policy_overlays.is_empty() {
+            out.push_str("policy overlays:\n");
+            for overlay in &self.policy_overlays {
+                let _ = writeln!(
+                    out,
+                    "  {}: {} — {}",
+                    overlay.overlay, overlay.outcome, overlay.detail
+                );
+            }
+        }
         if let Some(assertions) = &self.assertions {
             if !assertions.is_empty() {
                 out.push_str("assertions:\n");
@@ -418,6 +469,7 @@ mod tests {
             "\"continued_history_bound\"",
             "\"findings\"",
             "\"assertions\"",
+            "\"policy_overlays\"",
             "\"receipt_note\"",
         ]
         .into_iter()

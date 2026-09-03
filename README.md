@@ -482,9 +482,9 @@ for them are gone:
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
 
-## Three additions to the §6 field list
+## Four additions to the §6 field list
 
-`--json` carries three members §6's fixed list does not name, each added visibly rather than
+`--json` carries four members §6's fixed list does not name, each added visibly rather than
 silently:
 
 - `assertions` — one entry per required assertion of the verified receipt, as
@@ -493,12 +493,9 @@ silently:
   the scalar result, and `findings[]` is a different list: it carries this crate's own
   diagnostic codes, such as `witness-stale`. `null` for a command that verifies no receipt.
 
-  `status` is the reduction of this list, and the list is the core's required assertions plus
-  exactly one entry this crate adds: `witness-freshness`, present only where `--require-fresh`
-  is given and a carried cosignature is older than the cadence plus grace period the governing
-  manifest declares. Freshness is a property of the run's evaluation time rather than of the
-  receipt, so it is verifier-local by construction: it yields `unverifiable` and never
-  `invalid`, and without the flag it is a `findings[]` entry and not an assertion at all.
+  The list is the core's required assertions and **nothing else**: the result model enumerates
+  them exactly, and a verifier-local condition among them would be this crate asserting
+  something about the receipt another conformant verifier would not.
 
   `reason_code` names the assertion that **caused** the result, not the first non-`verified`
   entry in the list. The two differ whenever a budget runs out: every assertion the run could
@@ -506,7 +503,21 @@ silently:
   reader needs — which budget, and the value in force — is on the cause. `rests_on` is `null` on
   a cause and names an assertion on a derived entry, so a consumer can reproduce the choice from
   the list rather than parse it out of prose. Where the core reached a result of its own, its
-  cause is the headline; the freshness overlay leads only where the core reached `verified`.
+  cause is the headline; a policy overlay leads only where the core reached `verified`.
+- `policy_overlays` — locally configured conditions this run applied on top of the receipt's own
+  required assertions, each `{overlay, outcome, detail}`. Empty where none applied; this build
+  has one, `witness-freshness`, present only where `--require-fresh` is given and a carried
+  cosignature is older than the cadence plus grace period the governing manifest declares.
+  Freshness is a property of the run's evaluation time rather than of the receipt, so it is
+  verifier-local by construction: an overlay's `outcome` is `unverifiable` and never `invalid`,
+  and without the flag freshness is a `findings[]` entry (`witness-stale`) and not an overlay
+  at all.
+
+  **`status` is computed in two steps**: the result-model reduction of `assertions[]`, and then
+  a promotion to `unverifiable` by any entry in `policy_overlays[]`. An overlay can only ever
+  promote — it never weakens an `invalid` and never produces one. The headline follows the same
+  precedence: the core's cause wherever the core result is not `verified`, otherwise the first
+  overlay.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.

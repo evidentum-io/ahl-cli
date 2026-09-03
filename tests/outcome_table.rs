@@ -1414,6 +1414,11 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
         .collect();
     assert!(codes.contains(&"witness-stale"), "{codes:?}");
     assert!(document["boundary"].is_string(), "a valid result renders the boundary");
+    assert_eq!(
+        document["policy_overlays"].as_array().map(Vec::len),
+        Some(0),
+        "without the flag the overlay is absent and the field is an empty array: {document}"
+    );
 
     let run = ahl_cli(&[
         "--policy",
@@ -1431,20 +1436,23 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
     // `valid` and nowhere else — the core's boundary is never carried under a status the
     // freshness overlay moved.
     assert!(document["boundary"].is_null(), "{document}");
-    // And the status is the reduction of the assertions reported beside it: the overlay is one
-    // of them, `unverifiable` and never `invalid`.
+    // The core's required assertions are untouched — §7.7 enumerates them exactly — and the
+    // locally configured condition is reported in its own field, `unverifiable` and never
+    // `invalid`. The status is the reduction of the first list, then promoted by the second.
     let assertions = document["assertions"].as_array().expect("assertions");
-    let freshness = assertions
-        .iter()
-        .find(|entry| entry["assertion"] == "witness-freshness")
-        .expect("the overlay is reported as an assertion");
-    assert_eq!(freshness["outcome"], "unverifiable");
     assert!(
-        assertions.iter().all(
-            |entry| entry["outcome"] == "verified" || entry["assertion"] == "witness-freshness"
-        ),
-        "nothing else moved: {document}"
+        assertions.iter().all(|entry| entry["outcome"] == "verified"),
+        "an overlay never moves a required assertion: {document}"
     );
+    assert!(
+        !assertions.iter().any(|entry| entry["assertion"] == "witness-freshness"),
+        "an overlay is never a §7.7 assertion: {document}"
+    );
+    let overlays = document["policy_overlays"].as_array().expect("policy_overlays");
+    assert_eq!(overlays.len(), 1, "{document}");
+    assert_eq!(overlays[0]["overlay"], "witness-freshness");
+    assert_eq!(overlays[0]["outcome"], "unverifiable");
+    assert_eq!(document["reason_code"], "witness-freshness");
 }
 
 // --- exit 0 -----------------------------------------------------------------------------
