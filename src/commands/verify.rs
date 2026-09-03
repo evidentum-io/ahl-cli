@@ -225,27 +225,21 @@ fn verify(
 /// `Report::apply_policy_overlays` moves only `valid` — and it is reported because a holder
 /// deciding what to fix is better served by both facts than by one.
 ///
-/// `assurance.witnessed` is read AS CARRIED. For an accepted receipt that is the verified value,
-/// since §7.6's `witnessed` rule makes the carried member agree with what verified and the core
-/// refuses a receipt where it does not; for a rejected one nothing is established either way, so
-/// the freshness detail is a statement about the carried `checkpoint_time` and about nothing
-/// else — which is also why it can never move a result.
+/// `established` is the caller's answer to "did this run establish the cosignature a freshness
+/// overlay would speak of". It is not read from the carried assurance on a rejected receipt: a
+/// receipt is free to carry `witnessed: true` beside a cosignature that does not verify, and an
+/// overlay whose detail begins "the cosigned checkpoint's `checkpoint_time`" would then assert
+/// something this run refuted. See [`cosignature_established`].
 fn policy_overlays(
     receipt: &Value,
+    established: bool,
     policy: &LoadedPolicy,
     evaluation: &EvaluationTime,
     options: &Options,
 ) -> (Vec<PolicyOverlayOut>, Vec<Finding>) {
     let mut overlays = Vec::new();
     let mut findings = Vec::new();
-
-    let witnessed = receipt
-        .get("claim")
-        .and_then(|claim| claim.get("assurance"))
-        .and_then(|assurance| assurance.get("witnessed"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !witnessed {
+    if !established {
         return (overlays, findings);
     }
 
@@ -276,6 +270,40 @@ fn policy_overlays(
         Err(detail) => findings.push(Finding::new("witness-freshness-unavailable", detail)),
     }
     (overlays, findings)
+}
+
+/// Whether this run established the cosignature a freshness overlay would speak of.
+///
+/// Read from the reported assertions, never from `claim.assurance.witnessed` alone: a receipt is
+/// free to carry `witnessed: true` beside a cosignature that does not verify, or beside none at
+/// all, and taking the claim at its word would put "the cosigned checkpoint's `checkpoint_time`
+/// is …" in a report over a receipt whose cosignature this run refuted. Freshness is a statement
+/// about a cosignature; where none was established there is no statement to make.
+///
+/// Three assertions, all of the receipt's own — an embedded receipt's cosignatures say nothing
+/// about this one's checkpoint:
+///
+/// * `witnesses` — the cosignatures that were named verified, and where the level requires one,
+///   one exists;
+/// * `checkpoint-authentication` — the checkpoint they cosigned authenticates in its own right,
+///   so `checkpoint_time` is a member of an object this run accepted;
+/// * `cross-field` — where §7.6's `witnessed` rule is decided. The first two are not sufficient
+///   alone: below L3 no cosignature is REQUIRED, so `witnesses` verifies over a receipt that
+///   carries none, and only §7.6 catches the `witnessed: true` such a receipt might still claim.
+///   The conformance corpus is L3 and closes the case on the first two, which is exactly why the
+///   third is worth stating here rather than discovering later on another corpus.
+fn cosignature_established(receipt: &Value, assertions: &[AssertionOut]) -> bool {
+    let verified = |name: &str| {
+        assertions.iter().any(|entry| {
+            entry.assertion == name
+                && entry.receipt_path.is_empty()
+                && entry.outcome == CoreOutcome::Verified.name()
+        })
+    };
+    carried_assurance(receipt).is_some_and(|assurance| assurance.witnessed)
+        && verified(Assertion::Witnesses.name())
+        && verified(Assertion::CheckpointAuthentication.name())
+        && verified(Assertion::CrossField.name())
 }
 
 /// The `(reason_code, reason)` a core finding leads a report with: its assertion's stable name,
@@ -421,10 +449,13 @@ fn rejected(
         .and_then(Value::as_str)
         .map(str::to_owned);
     report.assurance = carried_assurance(receipt);
-    report.assertions = Some(assertions(core));
+    let assertions = assertions(core);
     // Reported, and unable to change anything: the receipt's own result is not `valid`, so
-    // `apply_policy_overlays` leaves `outcome` where `status` put it.
-    let (overlays, findings) = policy_overlays(receipt, policy, evaluation, options);
+    // `apply_policy_overlays` leaves `outcome` where `status` put it. Emitted at all only where
+    // this run established the cosignature it would speak of.
+    let established = cosignature_established(receipt, &assertions);
+    report.assertions = Some(assertions);
+    let (overlays, findings) = policy_overlays(receipt, established, policy, evaluation, options);
     report.policy_overlays = overlays;
     report.apply_policy_overlays();
     report.with_findings(findings)
@@ -450,7 +481,11 @@ fn succeeded(
 ) -> Report {
     let checkpoint = receipt.get("anchoring").and_then(|anchoring| anchoring.get("checkpoint"));
     let assertions = assertions(core);
-    let (overlays, mut findings) = policy_overlays(receipt, policy, evaluation, options);
+    // The core reached `verified`, so every assertion `cosignature_established` looks for holds;
+    // the carried `witnessed` is the verified value and is what decides whether there is a
+    // cosignature to be fresh about at all.
+    let (overlays, mut findings) =
+        policy_overlays(receipt, verdict.assurance.witnessed, policy, evaluation, options);
 
     // The chain the freshness check resolved also carries the §7.3 schema findings, and those
     // are reported for an accepted receipt because there is a result for them to qualify.
@@ -1186,19 +1221,69 @@ mod tests {
             &corpus_policy(true),
             &much_later,
             &Options {
-                receipt: corpus().join("receipts/overclaim-must-fail.ahl"),
+                // A vector whose defect is in its claim material: the cosignature, the
+                // checkpoint under it and the §7.6 rules all verify, so the overlay has
+                // something established to speak of.
+                receipt: corpus().join("receipts/record-derived-wrong-path-must-fail.ahl"),
                 require_fresh: true,
             },
         );
         assert_eq!(report.status, "invalid", "{}", report.reason);
         assert_eq!(report.outcome, "invalid", "an overlay never weakens an `invalid`");
-        assert_eq!(report.reason_code, "cross-field", "the core's cause still leads");
+        assert_eq!(report.reason_code, "claim-material", "the core's cause still leads");
         assert!(
             report.policy_overlays.iter().any(|overlay| overlay.overlay == FRESHNESS),
             "the overlay is still listed: {:?}",
             report.policy_overlays
         );
         assert!(!report.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
+    fn a_freshness_overlay_is_never_emitted_over_a_cosignature_this_run_refuted() {
+        // A receipt is free to carry `witnessed: true` beside a cosignature that does not
+        // verify. Taking that claim at its word would put "the cosigned checkpoint's
+        // `checkpoint_time` is …" in a report over a cosignature this very run refuted — a
+        // diagnostic asserting what the result denies.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut forged: Value = serde_json::from_slice(
+            &std::fs::read(corpus().join("receipts/statement-anchored-valid.ahl")).expect("read"),
+        )
+        .expect("parse");
+        assert_eq!(
+            forged["claim"]["assurance"]["witnessed"],
+            json!(true),
+            "the vector claims a witnessed checkpoint, and keeps claiming it"
+        );
+        forged["anchoring"]["witnesses"][0]["cosignature"] =
+            json!(format!("base64:{}==", "A".repeat(86)));
+        let path = dir.path().join("forged-witness.ahl");
+        std::fs::write(&path, ahl_core::jcs(&forged)).expect("write");
+
+        // A year past the cadence, so the carried `checkpoint_time` is unambiguously old.
+        let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
+        let report =
+            run(&corpus_policy(true), &much_later, &Options { receipt: path, require_fresh: true });
+        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.outcome, "invalid", "an overlay never weakens an `invalid`");
+        let assertions = report.assertions.as_ref().expect("assertions");
+        assert!(
+            assertions
+                .iter()
+                .any(|entry| entry.assertion == "witnesses" && entry.outcome == "invalid"),
+            "the cosignature is what failed: {assertions:?}"
+        );
+        assert!(
+            report.policy_overlays.is_empty(),
+            "nothing about the cosignature was established: {:?}",
+            report.policy_overlays
+        );
+        assert!(
+            !report.findings.iter().any(|finding| finding.code == "witness-stale"),
+            "the finding comes from the same check and is withheld with it: {:?}",
+            report.findings
+        );
+        assert!(!report.to_text().contains("cosigned checkpoint"), "{}", report.to_text());
     }
 
     #[test]
