@@ -92,7 +92,8 @@ use crate::outcome::Outcome;
 use crate::policy::LoadedPolicy;
 use crate::profile;
 use crate::report::{
-    AssertionOut, AssuranceOut, CheckpointOut, Completeness, Finding, PolicyOverlayOut, Report,
+    AssertionOut, AssuranceOut, CheckpointOut, Completeness, Finding, InformativeOut,
+    PolicyOverlayOut, Report,
 };
 use crate::secure;
 
@@ -132,6 +133,10 @@ pub fn run(policy: &LoadedPolicy, evaluation: &EvaluationTime, options: &Options
                     rests_on: None,
                 }]
             });
+            // A run that settled an assertion inspected no carried envelopes beyond the one
+            // that stopped it, so its void-entry list is empty rather than absent: `null` is
+            // for a run that reported no assertions at all.
+            report.informative = report.assertions.as_ref().map(|_| Vec::new());
             report
         }
     }
@@ -389,6 +394,7 @@ fn unsupported_version(receipt: &Value, evaluation: &EvaluationTime) -> Option<R
         // Its own check produced it: the version read is what stopped the run.
         rests_on: None,
     }]);
+    report.informative = Some(Vec::new());
     Some(report)
 }
 
@@ -402,6 +408,22 @@ fn assertions(core: &CoreReport) -> Vec<AssertionOut> {
             receipt_path: finding.receipt_path.clone(),
             detail: finding.detail.clone(),
             rests_on: finding.rests_on.map(|assertion| assertion.name().to_owned()),
+        })
+        .collect()
+}
+
+/// The void entries the run inspected, in the order it inspected them (I-D §7.5.1 4d).
+///
+/// Copied across verbatim and kept apart from the assertions: they are informative, and a
+/// verifier that folded them into `assertions[]` would give every one of them an outcome the
+/// model does not assign and a place in a reduction the model keeps them out of.
+fn informative(core: &CoreReport) -> Vec<InformativeOut> {
+    core.informative
+        .iter()
+        .map(|item| InformativeOut {
+            entry_index: item.entry_index,
+            reason: item.reason.name().to_owned(),
+            receipt_path: item.receipt_path.clone(),
         })
         .collect()
 }
@@ -478,6 +500,7 @@ fn rejected(
     // this run established the cosignature it would speak of.
     let established = cosignature_established(receipt, &assertions);
     report.assertions = Some(assertions);
+    report.informative = Some(informative(core));
     let (overlays, findings) = policy_overlays(receipt, established, policy, evaluation, options);
     report.policy_overlays = overlays;
     report.apply_policy_overlays();
@@ -577,6 +600,7 @@ fn succeeded(
         .and_then(Value::as_str)
         .map(str::to_owned);
     report.assertions = Some(assertions);
+    report.informative = Some(informative(core));
     report.policy_overlays = overlays;
     report.apply_policy_overlays();
     report.with_findings(findings)

@@ -496,9 +496,9 @@ for them are gone:
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
 
-## Five additions to the §6 field list
+## Six additions to the §6 field list
 
-`--json` carries five members §6's fixed list does not name, each added visibly rather than
+`--json` carries six members §6's fixed list does not name, each added visibly rather than
 silently:
 
 - `assertions` — one entry per required assertion of the verified receipt, as
@@ -524,6 +524,18 @@ silently:
   a cause and names an assertion on a derived entry, so a consumer can reproduce the choice from
   the list rather than parse it out of prose. Where the core reached a result of its own, its
   cause is the headline; a policy overlay leads only where the core reached `verified`.
+- `informative` — the void entries the run inspected, each `{entry_index, reason, receipt_path}`
+  with `reason` in `signature-invalid | key-not-active`. A non-verifying envelope the receipt
+  does not rest on — a purported competing-trigger envelope, an entry of a propagation prefix,
+  any entry an enumeration reveals — is **void**: excluded before any authority comparison,
+  never effective, never traversed, and it does not affect the result. These are therefore not
+  findings and not assertions: they carry no outcome, never enter the reduction, never reach
+  `status` or `outcome`, and are never rendered as a defect. Empty where the run found none,
+  `null` exactly where `assertions` is.
+
+  The rule is not a leniency. A log anchors opaque bytes and validates none of them, so were a
+  void entry a defect of every later receipt, any party able to anchor one envelope could
+  disable every enumerated claim of that log from that index on.
 - `policy_overlays` — locally configured conditions this run applied on top of the receipt's own
   required assertions, each `{overlay, outcome, detail}`. Empty where none applied; this build
   has one, `witness-freshness`, present only where `--require-fresh` is given and a carried

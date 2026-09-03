@@ -158,6 +158,30 @@ pub struct AssertionOut {
     pub rests_on: Option<String>,
 }
 
+/// One entry the run inspected and found VOID (I-D §2.1, §7.5.1 4d).
+///
+/// §7.5.1 4d decides what a non-verifying envelope means by RELIANCE. For an envelope the
+/// receipt RESTS ON — its subject, an embedded receipt's subject, a `governance.chain[]` element
+/// — failure is `invalid` and is reported as an assertion. For every other carried envelope — a
+/// purported competing-trigger envelope, an entry of a propagation prefix, any entry an
+/// enumeration reveals — it is VOID: excluded before any authority comparison, never effective,
+/// never traversed, and it does not affect the result.
+///
+/// So this is **not a finding**. It belongs to no required assertion, carries no outcome, never
+/// enters the reduction and never leads a report. The reason it cannot is worth keeping in
+/// sight: a log anchors opaque bytes and validates none of them, so were a void entry a defect
+/// of every later receipt, any party able to anchor one envelope could disable every enumerated
+/// claim of that log from that index on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InformativeOut {
+    /// The entry index of the void entry.
+    pub entry_index: u64,
+    /// Why it is void: `signature-invalid` or `key-not-active`.
+    pub reason: String,
+    /// The receipt whose material carried it, in [`AssertionOut::receipt_path`]'s terms.
+    pub receipt_path: Vec<String>,
+}
+
 /// One locally configured policy condition this run applied on top of the receipt's own
 /// required assertions.
 ///
@@ -276,6 +300,12 @@ pub struct Report {
     /// `null` for a command that verifies no receipt, and for a local failure that reached no
     /// result at all.
     pub assertions: Option<Vec<AssertionOut>>,
+    /// The void entries the run inspected (I-D §7.5.1 4d), in the order it inspected them.
+    ///
+    /// Never findings and never defects — see [`InformativeOut`]. Empty where the run found
+    /// none, and `null` in exactly the cases [`Self::assertions`] is `null`: there was no
+    /// receipt run to inspect anything.
+    pub informative: Option<Vec<InformativeOut>>,
     /// Locally configured conditions this run applied on top of those. Empty where none did.
     pub policy_overlays: Vec<PolicyOverlayOut>,
     /// The receipt's informative `note`, quoted. Never a finding, never normative.
@@ -327,6 +357,7 @@ impl Report {
             continued_history_bound: None,
             findings: Vec::new(),
             assertions: None,
+            informative: None,
             policy_overlays: Vec::new(),
             receipt_note: None,
             affected: None,
@@ -577,6 +608,7 @@ mod tests {
             "\"continued_history_bound\"",
             "\"findings\"",
             "\"assertions\"",
+            "\"informative\"",
             "\"policy_overlays\"",
             "\"receipt_note\"",
         ]
