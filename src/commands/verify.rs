@@ -97,13 +97,49 @@ pub struct Options {
 pub fn run(policy: &LoadedPolicy, evaluation: &EvaluationTime, options: &Options) -> Report {
     match verify(policy, evaluation, options) {
         Ok(report) => report,
-        Err(error) => Report::new(
-            error.outcome(),
-            error.reason_code(),
-            error.to_string(),
-            evaluation.rendered.clone(),
-            evaluation.source,
-        ),
+        Err(error) => {
+            let mut report = Report::new(
+                error.outcome(),
+                error.reason_code(),
+                error.to_string(),
+                evaluation.rendered.clone(),
+                evaluation.source,
+            );
+            report.assertions = settled_before_the_core(&error).map(|assertion| {
+                vec![AssertionOut {
+                    assertion: assertion.name().to_owned(),
+                    outcome: error.outcome().as_result_value().unwrap_or_default().to_owned(),
+                    receipt_path: Vec::new(),
+                    detail: Some(error.to_string()),
+                    // Its own check produced it: nothing was skipped for want of a
+                    // prerequisite, because nothing before it had run.
+                    rests_on: None,
+                }]
+            });
+            report
+        }
+    }
+}
+
+/// The §7.7 assertion a rejection the CLI reached BEFORE the core settled, where there is one.
+///
+/// §7.7 requires a verifier to "report the findings alongside" the result, and these runs
+/// completed: they reached one of the three values over the receipt's own bytes, and the
+/// assertion each belongs to is the one the core would have filed it under. Reporting the
+/// result without it would leave a consumer holding a status it cannot attribute — and would
+/// make the CLI's own rows the one place `assertions[]` goes silent.
+///
+/// `None` where the run reached no result at all: an unreadable file, an unusable policy, a
+/// broken local configuration. §7.7 scopes those out of the model entirely — they say nothing
+/// about the receipt — so they carry no assertion rather than an invented one.
+const fn settled_before_the_core(error: &CliError) -> Option<Assertion> {
+    match error {
+        // The container schema and identifier checks of §7.5 step 1: bytes that are not JSON,
+        // are not the JCS serialization, or name no adaptor profile at all.
+        CliError::Malformed { .. } => Some(Assertion::Structure),
+        // §7.5 step 2, resolved from local possession before the core is entered.
+        CliError::ProfileNotPossessed { .. } => Some(Assertion::AdaptorProfile),
+        _ => None,
     }
 }
 
@@ -794,6 +830,62 @@ mod tests {
             );
             assert_eq!(report.status, "invalid", "{}", report.reason);
         }
+    }
+
+    #[test]
+    fn a_completed_pre_core_result_reports_the_assertion_it_settled() {
+        // §7.7: "A verifier MUST report the findings alongside it." These runs reached one of
+        // the three values over the receipt's own bytes, so each names the assertion the core
+        // would have filed it under — the CLI's own rows are not where `assertions[]` goes
+        // silent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = corpus_policy(true);
+        let source: Value = serde_json::from_slice(
+            &std::fs::read(corpus().join("receipts/statement-anchored-valid.ahl")).expect("read"),
+        )
+        .expect("parse");
+
+        let sole = |report: &Report| -> (String, String) {
+            let assertions = report.assertions.as_ref().expect("the assertion is reported");
+            assert_eq!(assertions.len(), 1, "{assertions:?}");
+            assert!(assertions[0].receipt_path.is_empty());
+            assert!(assertions[0].rests_on.is_none(), "nothing ran before it to rest on");
+            assert!(assertions[0].detail.is_some());
+            (assertions[0].assertion.clone(), assertions[0].outcome.clone())
+        };
+
+        // Bytes that are not JSON at all: structural, and `invalid`.
+        let path = dir.path().join("broken.ahl");
+        std::fs::write(&path, b"{not json").expect("write");
+        let report =
+            run(&policy, &at_corpus_time(), &Options { receipt: path, require_fresh: false });
+        assert_eq!(report.status, "invalid");
+        assert_eq!(sole(&report), ("structure".to_owned(), "invalid".to_owned()));
+
+        // Bytes that are JSON but not the JCS serialization.
+        let path = dir.path().join("pretty.ahl");
+        std::fs::write(&path, serde_json::to_vec_pretty(&source).expect("pretty")).expect("write");
+        let report =
+            run(&policy, &at_corpus_time(), &Options { receipt: path, require_fresh: false });
+        assert_eq!(report.status, "invalid");
+        assert_eq!(sole(&report), ("structure".to_owned(), "invalid".to_owned()));
+
+        // A profile local policy does not hold: `unverifiable`, on the profile assertion.
+        let mut without = corpus_policy(true);
+        without.profiles.clear();
+        without.trust.adaptor_profiles.clear();
+        let report = verify_vector("statement-anchored-valid.ahl", &without);
+        assert_eq!(report.status, "unverifiable");
+        assert_eq!(sole(&report), ("adaptor-profile".to_owned(), "unverifiable".to_owned()));
+
+        // And a run that reached no result at all reports none: it is not a receipt report.
+        let report = run(
+            &policy,
+            &at_corpus_time(),
+            &Options { receipt: dir.path().join("absent.ahl"), require_fresh: false },
+        );
+        assert_eq!(report.status, "error");
+        assert!(report.assertions.is_none(), "a local failure carries no §7.7 value");
     }
 
     #[test]

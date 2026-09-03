@@ -497,6 +497,12 @@ silently:
   them exactly, and a verifier-local condition among them would be this crate asserting
   something about the receipt another conformant verifier would not.
 
+  A rejection the CLI reaches before the core is entered reports its assertion too, as a
+  one-element list: `structure` for bytes that are not JSON, are not the JCS serialization, or
+  name no adaptor profile, and `adaptor-profile` for a profile local policy does not hold. An
+  `error` (`2`) result carries `null` — it reached no result value at all and is not a report
+  about the receipt.
+
   `reason_code` names the assertion that **caused** the result, not the first non-`verified`
   entry in the list. The two differ whenever a budget runs out: every assertion the run could
   not reach then inherits the gap and carries `rests_on: "resource-limits"`, while the fact the
