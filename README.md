@@ -530,8 +530,9 @@ silently:
   any entry an enumeration reveals — is **void**: excluded before any authority comparison,
   never effective, never traversed, and it does not affect the result. These are therefore not
   findings and not assertions: they carry no outcome, never enter the reduction, never reach
-  `status` or `outcome`, and are never rendered as a defect. Empty where the run found none,
-  `null` exactly where `assertions` is.
+  `status` or `outcome`, and are never rendered as a defect. The text surface lists them under a
+  `void entries:` heading after the assertion table. Empty where the run found none, `null`
+  exactly where `assertions` is.
 
   The rule is not a leniency. A log anchors opaque bytes and validates none of them, so were a
   void entry a defect of every later receipt, any party able to anchor one envelope could

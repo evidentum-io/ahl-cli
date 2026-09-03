@@ -513,6 +513,25 @@ impl Report {
                 let _ = writeln!(out, "  [{}] {}", finding.code, finding.detail);
             }
         }
+        // After the assertion table, under a heading of their own, and only when there are any:
+        // a void entry is not a finding, is not an assertion, and never appears in the headline
+        // or in `reason_code`. Listing it anywhere else would read as a defect.
+        if let Some(informative) = &self.informative {
+            if !informative.is_empty() {
+                out.push_str("void entries:\n");
+                for item in informative {
+                    let mut where_at = item.receipt_path.join("/");
+                    if !where_at.is_empty() {
+                        where_at.push_str(": ");
+                    }
+                    let _ = writeln!(
+                        out,
+                        "  {where_at}entry index {} — {}",
+                        item.entry_index, item.reason
+                    );
+                }
+            }
+        }
         if !self.policy_overlays.is_empty() {
             out.push_str("policy overlays:\n");
             for overlay in &self.policy_overlays {
@@ -677,6 +696,38 @@ mod tests {
         assert_eq!(invalid.status, Some("invalid"));
         assert_eq!(invalid.outcome, "invalid", "an overlay only ever moves `valid`");
         assert!(!invalid.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
+    fn void_entries_are_listed_under_their_own_heading_and_never_as_a_defect() {
+        let mut report = report();
+        report.assertions = Some(Vec::new());
+        report.informative = Some(vec![
+            InformativeOut {
+                entry_index: 30,
+                reason: "signature-invalid".to_owned(),
+                receipt_path: Vec::new(),
+            },
+            InformativeOut {
+                entry_index: 7,
+                reason: "key-not-active".to_owned(),
+                receipt_path: vec!["trigger".to_owned()],
+            },
+        ]);
+        let text = report.to_text();
+        assert!(text.contains("void entries:\n"), "{text}");
+        assert!(text.contains("entry index 30 — signature-invalid"), "{text}");
+        assert!(text.contains("trigger: entry index 7 — key-not-active"), "{text}");
+        // Not a finding, not an assertion, and nowhere near the headline.
+        assert!(!text.contains("findings:"), "{text}");
+        assert!(!text.contains("assertions:"), "{text}");
+        assert!(text.starts_with("outcome: valid\n"), "{text}");
+        assert_eq!(report.reason_code, "verified");
+        assert_eq!(report.status, Some("valid"), "a void entry does not move the result");
+
+        // And nothing is printed for a run that found none.
+        report.informative = Some(Vec::new());
+        assert!(!report.to_text().contains("void entries"), "{}", report.to_text());
     }
 
     #[test]
