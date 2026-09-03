@@ -421,10 +421,17 @@ impl Governance {
                 "the genesis manifest must carry no predecessor reference".to_owned(),
             ));
         }
+        // A configured anchor DIFFERING from the carried one is `unverifiable`, not `invalid`,
+        // and the classification is made here rather than repaired by a caller: the material
+        // may be a perfectly valid corpus that this verifier simply is not configured for, and
+        // nothing about it has been disproved. The same holds for the key fingerprints, which
+        // are the same trust anchor read at a finer grain.
         let anchor = entry_id(envelope);
         if anchor != policy.genesis_entry_id {
-            return Err(CliError::RuleFired(format!(
-                "the anchored genesis manifest digests to {anchor}, local policy configures {}",
+            return Err(CliError::GenesisAnchorMismatch(format!(
+                "the anchored genesis manifest digests to {anchor}, local policy configures {}; \
+                 this material is not the corpus this verifier is anchored to, which is a gap \
+                 in local configuration rather than a defect shown in the material",
                 policy.genesis_entry_id
             )));
         }
@@ -432,8 +439,10 @@ impl Governance {
         // Compared only where local policy holds the fingerprints: `None` is "policy holds
         // none", and its absence is not a defect of the chain.
         if policy.genesis_key_ids.as_ref().is_some_and(|configured| &declared != configured) {
-            return Err(CliError::RuleFired(
-                "the genesis manifest's producer key fingerprints are not the configured ones"
+            return Err(CliError::GenesisAnchorMismatch(
+                "the genesis manifest's producer key fingerprints are not the configured ones; \
+                 the fingerprints are the same trust anchor read at a finer grain, so this is \
+                 the same gap in local configuration"
                     .to_owned(),
             ));
         }
@@ -1820,6 +1829,48 @@ mod tests {
             .witness_keys_for(15)
             .expect("witness keys")
             .contains_key(&producer(5).key_id()));
+    }
+
+    #[test]
+    fn a_configured_anchor_that_differs_is_unverifiable_at_its_source() {
+        // I-D §7.5.1 4a and the note's rule 1: a configured anchor differing from the carried
+        // one is `unverifiable`. Classified here rather than repaired downstream, so a caller
+        // that does not pass the result through a remote-candidate wrapper still gets the right
+        // answer, and so the two paths cannot drift apart.
+        let honest = producer(1);
+        let entries = chain("log_id");
+        let anchored = policy_for(&entries, &honest);
+
+        let mut elsewhere = TrustPolicy {
+            genesis_entry_id: format!("sha256:{}", "99".repeat(32)),
+            ..anchored.clone()
+        };
+        let error = Governance::resolve(&entries, &elsewhere).expect_err("another corpus");
+        assert!(matches!(error, CliError::GenesisAnchorMismatch(_)), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert_eq!(error.reason_code(), "genesis-anchor-mismatch");
+
+        // The fingerprints are the same anchor at a finer grain, and answer the same way.
+        elsewhere.genesis_entry_id = anchored.genesis_entry_id;
+        elsewhere.genesis_key_ids = Some(BTreeSet::from([format!("sha256:{}", "88".repeat(32))]));
+        let error = Governance::resolve(&entries, &elsewhere).expect_err("other fingerprints");
+        assert!(matches!(error, CliError::GenesisAnchorMismatch(_)), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+
+        // A defect in the anchor's own material is still a defect: only the CONFIGURATION gap
+        // moved, not the adjudication of what the chain carries.
+        let broken = ahl_core::envelope(
+            json!({ "type": "manifest", "keys": [], "log": log_object(&family(0xaa), &[]) }),
+            &honest,
+        );
+        let entries = vec![(0, broken)];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: None,
+            ..TrustPolicy::default()
+        };
+        let error = Governance::resolve(&entries, &policy).expect_err("schema failure");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid, "{error}");
     }
 
     #[test]

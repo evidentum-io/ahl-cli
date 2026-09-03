@@ -126,6 +126,16 @@ pub enum CliError {
     },
 
     // -- exit 3: required evidence could not be established ------------------------------
+    /// Local policy anchors a corpus other than the one the presented material carries.
+    ///
+    /// `unverifiable`, never `invalid`: the artifact may be a perfectly valid one of another
+    /// corpus, and what is missing is a trust anchor this verifier was not configured with —
+    /// a property of the verifier rather than of the material. Reporting it as a rule fired
+    /// against the artifact would let a verifier configured for corpus A make a statement about
+    /// corpus B's material that a verifier configured for B contradicts.
+    #[error("{0}")]
+    GenesisAnchorMismatch(String),
+
     /// The pinned adaptor profile is not locally possessed at all.
     #[error("adaptor profile `{id}` is not locally possessed")]
     ProfileNotPossessed {
@@ -171,7 +181,8 @@ impl CliError {
             Self::Malformed { .. }
             | Self::RuleFired(_)
             | Self::EquivocationAtOrBeyondFloor { .. } => Outcome::Invalid,
-            Self::ProfileNotPossessed { .. }
+            Self::GenesisAnchorMismatch(_)
+            | Self::ProfileNotPossessed { .. }
             | Self::ProfileLimitation(_)
             | Self::LimitExhausted(_)
             | Self::EvidenceMissing(_)
@@ -195,6 +206,7 @@ impl CliError {
             Self::Malformed { .. } => "malformed",
             Self::RuleFired(_) => "rule-fired",
             Self::EquivocationAtOrBeyondFloor { .. } => "equivocation-at-or-beyond-floor",
+            Self::GenesisAnchorMismatch(_) => "genesis-anchor-mismatch",
             Self::ProfileNotPossessed { .. } => "profile-not-possessed",
             Self::ProfileLimitation(_) => "profile-limitation",
             Self::LimitExhausted(_) => "limit-exhausted",
@@ -229,6 +241,7 @@ mod tests {
             CliError::Malformed { what: "receipt", detail: "d".to_owned() },
             CliError::RuleFired("r".to_owned()),
             CliError::EquivocationAtOrBeyondFloor { floor: 4 },
+            CliError::GenesisAnchorMismatch("another corpus".to_owned()),
             CliError::ProfileNotPossessed { id: "i".to_owned() },
             CliError::ProfileLimitation("l".to_owned()),
             CliError::LimitExhausted("l".to_owned()),
