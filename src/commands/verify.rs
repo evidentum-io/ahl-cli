@@ -1363,6 +1363,11 @@ mod tests {
         assert!(text.contains("void entries:\n"), "{file}: {text}");
         assert!(text.contains("entry index "), "{file}: {text}");
         assert!(!text.contains("findings:"), "{file}: a void entry is not a finding: {text}");
+        // Under its own heading, after the assertion table the receipt's own result is read
+        // from — end to end over a corpus vector, not only over a hand-built report.
+        let assertions_at = text.find("assertions:\n").expect("the assertion table is printed");
+        let void_at = text.find("void entries:\n").expect("the void entries are printed");
+        assert!(assertions_at < void_at, "{file}: {text}");
     }
 
     #[test]

@@ -513,25 +513,6 @@ impl Report {
                 let _ = writeln!(out, "  [{}] {}", finding.code, finding.detail);
             }
         }
-        // After the assertion table, under a heading of their own, and only when there are any:
-        // a void entry is not a finding, is not an assertion, and never appears in the headline
-        // or in `reason_code`. Listing it anywhere else would read as a defect.
-        if let Some(informative) = &self.informative {
-            if !informative.is_empty() {
-                out.push_str("void entries:\n");
-                for item in informative {
-                    let mut where_at = item.receipt_path.join("/");
-                    if !where_at.is_empty() {
-                        where_at.push_str(": ");
-                    }
-                    let _ = writeln!(
-                        out,
-                        "  {where_at}entry index {} — {}",
-                        item.entry_index, item.reason
-                    );
-                }
-            }
-        }
         if !self.policy_overlays.is_empty() {
             out.push_str("policy overlays:\n");
             for overlay in &self.policy_overlays {
@@ -559,6 +540,27 @@ impl Report {
                             let _ = writeln!(out, "  {name}: {}", assertion.outcome);
                         }
                     }
+                }
+            }
+        }
+        // Immediately AFTER the assertion table, under a heading of their own, and only when
+        // there are any. The order is the point: a reader works down from what the receipt
+        // required to what was merely inspected, and a void entry printed above the assertions
+        // would read as one of them. It is not a finding, not an assertion, and never appears in
+        // the headline or in `reason_code`.
+        if let Some(informative) = &self.informative {
+            if !informative.is_empty() {
+                out.push_str("void entries:\n");
+                for item in informative {
+                    let mut where_at = item.receipt_path.join("/");
+                    if !where_at.is_empty() {
+                        where_at.push_str(": ");
+                    }
+                    let _ = writeln!(
+                        out,
+                        "  {where_at}entry index {} — {}",
+                        item.entry_index, item.reason
+                    );
                 }
             }
         }
@@ -714,13 +716,25 @@ mod tests {
                 receipt_path: vec!["trigger".to_owned()],
             },
         ]);
+        report.assertions = Some(vec![AssertionOut {
+            assertion: "anchoring".to_owned(),
+            outcome: "verified".to_owned(),
+            receipt_path: Vec::new(),
+            detail: None,
+            rests_on: None,
+        }]);
         let text = report.to_text();
         assert!(text.contains("void entries:\n"), "{text}");
         assert!(text.contains("entry index 30 — signature-invalid"), "{text}");
         assert!(text.contains("trigger: entry index 7 — key-not-active"), "{text}");
-        // Not a finding, not an assertion, and nowhere near the headline.
+        // AFTER the assertion table. A reader works down from what the receipt required to what
+        // was merely inspected, and a void entry printed above the assertions would read as one
+        // of them.
+        let assertions_at = text.find("assertions:\n").expect("the assertion table is printed");
+        let void_at = text.find("void entries:\n").expect("the void entries are printed");
+        assert!(assertions_at < void_at, "void entries come after the assertion table: {text}");
+        // Not a finding, and nowhere near the headline.
         assert!(!text.contains("findings:"), "{text}");
-        assert!(!text.contains("assertions:"), "{text}");
         assert!(text.starts_with("outcome: valid\n"), "{text}");
         assert_eq!(report.reason_code, "verified");
         assert_eq!(report.status, Some("valid"), "a void entry does not move the result");
