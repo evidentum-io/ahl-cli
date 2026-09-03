@@ -35,7 +35,8 @@
 //! artifact has been adjudicated.
 
 use ahl_core::receipt::{
-    verify_receipt_report, Outcome as CoreOutcome, Report as CoreReport, Verdict,
+    verify_receipt_report, Assertion, Outcome as CoreOutcome, ReceiptError, Report as CoreReport,
+    Verdict, RECEIPT_VERSION, SPEC_VERSION,
 };
 use serde_json::Value;
 
@@ -89,6 +90,17 @@ fn verify(
         what: "receipt",
         detail: format!("not JSON: {source}"),
     })?;
+    // I-D §7.5 step 1: "Read `ahl_receipt_version` and act on it BEFORE ANY OTHER CHECK,
+    // including schema validation", and §7.1 follows a version this build does not implement
+    // with no further processing. The order is not a matter of taste. A receipt issued under
+    // rules this build does not implement would otherwise be adjudicated against the rules of a
+    // revision it never claimed — refused for non-canonical bytes, or for naming no adaptor
+    // profile — and reported `invalid` for a capability gap, which is the contradiction §7.7
+    // exists to forbid. The JCS check and the profile resolution keep their order behind it.
+    if let Some(report) = unsupported_version(&receipt, evaluation) {
+        return Ok(report);
+    }
+
     if ahl_core::jcs(&receipt) != bytes {
         return Err(CliError::Malformed {
             what: "receipt",
@@ -128,6 +140,45 @@ fn verify(
         // none is a rejection whatever else it carries.
         _ => Ok(rejected(&receipt, &core, evaluation)),
     }
+}
+
+/// The version result of I-D §7.5 step 1, where either container version is one this build does
+/// not implement.
+///
+/// Only a version that is CARRIED, is a string, and differs from the implemented one stops the
+/// run here. An absent or non-string member is a structural defect of the container — decided
+/// from the receipt's own bytes, `invalid` on the `structure` assertion — so it falls through to
+/// the steps below rather than being promoted to a capability gap.
+///
+/// The report carries the version assertion and nothing else: §7.5 step 1 follows an
+/// unimplemented version with "no further processing", so no claim type, no assurance block and
+/// no boundary is read off bytes this build has stated it cannot interpret.
+fn unsupported_version(receipt: &Value, evaluation: &EvaluationTime) -> Option<Report> {
+    let (field, expected, got) =
+        [("ahl_receipt_version", RECEIPT_VERSION), ("spec_version", SPEC_VERSION)]
+            .into_iter()
+            .find_map(|(field, expected)| {
+                let got = receipt.get(field).and_then(Value::as_str)?;
+                (got != expected).then(|| (field, expected, got.to_owned()))
+            })?;
+
+    // The core's own wording, so a consumer reads the same reason whichever of the two reached
+    // the version first.
+    let detail = ReceiptError::UnsupportedVersion { field, expected, got }.to_string();
+    let mut report = Report::new(
+        Outcome::Unverifiable,
+        Assertion::Versions.name(),
+        detail.clone(),
+        evaluation.rendered.clone(),
+        evaluation.source,
+    );
+    report.assertions = Some(vec![AssertionOut {
+        assertion: Assertion::Versions.name().to_owned(),
+        outcome: CoreOutcome::Unverifiable.name().to_owned(),
+        receipt_path: Vec::new(),
+        detail: Some(detail),
+    }]);
+    Some(report)
 }
 
 /// The §7.7 findings, in the order the verification algorithm reaches them.
@@ -546,6 +597,82 @@ mod tests {
         assert_eq!(assurance.canonicalization_namespace.as_deref(), Some("public"));
         assert!(report.to_text().contains("content_binding: keyed-authorized"));
     }
+    #[test]
+    fn an_unsupported_version_stops_the_run_before_any_other_check() {
+        // §7.5 step 1 reads the version "BEFORE ANY OTHER CHECK, including schema validation",
+        // and §7.1 follows an unimplemented one with no further processing. Each receipt below
+        // breaks a rule that would otherwise be reached first and reported `invalid`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let policy = corpus_policy(true);
+        let source: Value = serde_json::from_slice(
+            &std::fs::read(corpus().join("receipts/statement-anchored-valid.ahl")).expect("read"),
+        )
+        .expect("parse");
+
+        let run_over = |name: &str, value: &Value, canonical: bool| {
+            let path = dir.path().join(name);
+            let bytes = if canonical {
+                ahl_core::jcs(value)
+            } else {
+                serde_json::to_vec_pretty(value).expect("pretty")
+            };
+            std::fs::write(&path, bytes).expect("write");
+            run(&policy, &at_corpus_time(), &Options { receipt: path, require_fresh: false })
+        };
+
+        // The version alone.
+        let mut old_version = source;
+        old_version["spec_version"] = json!("0.3.0");
+        let report = run_over("v.ahl", &old_version, true);
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "versions");
+
+        // The version, on bytes that are not the JCS serialization.
+        let report = run_over("v-noncanonical.ahl", &old_version, false);
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "versions");
+
+        // The version, on a receipt naming no adaptor profile.
+        let mut no_adaptor = old_version;
+        no_adaptor["anchoring"]["adaptor"] = json!({});
+        let report = run_over("v-no-adaptor.ahl", &no_adaptor, true);
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "versions");
+        assert!(report.reason.contains("0.3.0"), "the carried value is named: {}", report.reason);
+
+        // Nothing is read off bytes this build has said it cannot interpret.
+        assert!(report.boundary.is_none());
+        assert!(report.assurance.is_none());
+        assert!(report.claim_type.is_none());
+        let assertions = report.assertions.as_ref().expect("the version finding is reported");
+        assert_eq!(assertions.len(), 1, "no further processing: {assertions:?}");
+        assert_eq!(assertions[0].assertion, "versions");
+        assert_eq!(assertions[0].outcome, "unverifiable");
+    }
+
+    #[test]
+    fn a_version_member_that_is_absent_or_not_a_string_is_a_structural_defect_not_a_gap() {
+        // The short circuit is for a version this build does not implement, never for one the
+        // container does not carry: that is decidable from the bytes, and the core decides it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source: Value = serde_json::from_slice(
+            &std::fs::read(corpus().join("receipts/statement-anchored-valid.ahl")).expect("read"),
+        )
+        .expect("parse");
+        for broken in [json!(2), Value::Null] {
+            let mut value = source.clone();
+            value["spec_version"] = broken;
+            let path = dir.path().join("x.ahl");
+            std::fs::write(&path, ahl_core::jcs(&value)).expect("write");
+            let report = run(
+                &corpus_policy(true),
+                &at_corpus_time(),
+                &Options { receipt: path, require_fresh: false },
+            );
+            assert_eq!(report.status, "invalid", "{}", report.reason);
+        }
+    }
+
     #[test]
     fn a_run_that_reaches_no_result_is_a_local_failure_and_never_one_of_the_three_values() {
         // §7.7: a run that does not complete "says nothing about the receipt and MUST NOT be
