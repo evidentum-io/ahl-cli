@@ -190,13 +190,25 @@ const FRESHNESS: &str = "witness-freshness";
 /// unimplemented version with "no further processing", so no claim type, no assurance block and
 /// no boundary is read off bytes this build has stated it cannot interpret.
 fn unsupported_version(receipt: &Value, evaluation: &EvaluationTime) -> Option<Report> {
-    let (field, expected, got) =
+    // Sequentially, in the core's own order, and stopping at the first member that is not a
+    // carried string. Scanning past such a member to reach a later one would report `versions`
+    // and `unverifiable` over a receipt whose FIRST version member the core never got past —
+    // material §7.7's first bullet makes `invalid`, decidable from the receipt's own bytes.
+    // A preflight that answered `unverifiable` there would state a capability gap where the
+    // core states a defect, which is the disagreement between two verifiers §7.7 forbids.
+    let mut mismatch = None;
+    for (field, expected) in
         [("ahl_receipt_version", RECEIPT_VERSION), ("spec_version", SPEC_VERSION)]
-            .into_iter()
-            .find_map(|(field, expected)| {
-                let got = receipt.get(field).and_then(Value::as_str)?;
-                (got != expected).then(|| (field, expected, got.to_owned()))
-            })?;
+    {
+        // `?` here is the stop: a member that is not a carried string ends the preflight for
+        // the whole receipt, and the core decides it.
+        let got = receipt.get(field).and_then(Value::as_str)?;
+        if got != expected {
+            mismatch = Some((field, expected, got.to_owned()));
+            break;
+        }
+    }
+    let (field, expected, got) = mismatch?;
 
     // The core's own wording, so a consumer reads the same reason whichever of the two reached
     // the version first.
@@ -700,6 +712,57 @@ mod tests {
         assert_eq!(assertions.len(), 1, "no further processing: {assertions:?}");
         assert_eq!(assertions[0].assertion, "versions");
         assert_eq!(assertions[0].outcome, "unverifiable");
+    }
+
+    #[test]
+    fn the_preflight_reads_the_version_members_in_order_and_stops_at_the_first_defect() {
+        // §7.5 step 1 reads `ahl_receipt_version` first, and the core stops there. A preflight
+        // that scanned past a malformed first member to reach an old `spec_version` would
+        // answer `unverifiable` where the core answers `invalid` on `structure` — two verifiers
+        // making contradictory statements about one artifact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source: Value = serde_json::from_slice(
+            &std::fs::read(corpus().join("receipts/statement-anchored-valid.ahl")).expect("read"),
+        )
+        .expect("parse");
+
+        for broken in [None, Some(json!(2)), Some(Value::Null)] {
+            let mut value = source.clone();
+            match broken.clone() {
+                None => {
+                    value.as_object_mut().expect("object").remove("ahl_receipt_version");
+                }
+                Some(member) => value["ahl_receipt_version"] = member,
+            }
+            // An old second member the preflight must NOT reach past the defective first one.
+            value["spec_version"] = json!("0.3.0");
+            let path = dir.path().join("first-member.ahl");
+            std::fs::write(&path, ahl_core::jcs(&value)).expect("write");
+            let report = run(
+                &corpus_policy(true),
+                &at_corpus_time(),
+                &Options { receipt: path, require_fresh: false },
+            );
+            assert_eq!(
+                report.status, "invalid",
+                "{broken:?}: the core decides the malformed first member: {}",
+                report.reason
+            );
+        }
+
+        // And a carried string that simply is not the implemented one still stops the run.
+        let mut value = source;
+        value["ahl_receipt_version"] = json!("1");
+        let path = dir.path().join("old-first-member.ahl");
+        std::fs::write(&path, ahl_core::jcs(&value)).expect("write");
+        let report = run(
+            &corpus_policy(true),
+            &at_corpus_time(),
+            &Options { receipt: path, require_fresh: false },
+        );
+        assert_eq!(report.status, "unverifiable", "{}", report.reason);
+        assert_eq!(report.reason_code, "versions");
+        assert!(report.reason.contains("ahl_receipt_version"), "{}", report.reason);
     }
 
     #[test]
