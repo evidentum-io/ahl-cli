@@ -803,7 +803,7 @@ fn row_unsupported_specification_version_is_unverifiable() {
     let run = verify(&policy_path.display().to_string(), &receipt.display().to_string(), &[]);
     assert_eq!(run.code, 3, "{}", run.stderr);
     assert!(run.output().contains("versions"), "{}", run.output());
-    assert!(!run.output().contains("status: invalid"), "{}", run.output());
+    assert!(!run.output().contains("outcome: invalid"), "{}", run.output());
 }
 
 #[test]
@@ -894,7 +894,7 @@ fn row_a_rejection_names_the_assertion_that_produced_it_and_the_ones_that_held()
     );
     assert_eq!(run.code, 1, "{}", run.stderr);
     let output = run.output();
-    assert!(output.contains("status: invalid"), "{output}");
+    assert!(output.contains("outcome: invalid"), "{output}");
     assert!(output.contains("cross-field: invalid"), "{output}");
     assert!(output.contains("anchoring: verified"), "{output}");
     assert!(!output.contains("boundary:"), "only `verified` renders a boundary: {output}");
@@ -917,7 +917,7 @@ fn row_a_rejection_the_core_classes_unverifiable_is_never_reclassified_here() {
     );
     assert_eq!(run.code, 3, "{}", run.output());
     let output = run.output();
-    assert!(output.contains("status: unverifiable"), "{output}");
+    assert!(output.contains("outcome: unverifiable"), "{output}");
     assert!(output.contains("envelope-validity: unverifiable"), "{output}");
 }
 
@@ -1419,6 +1419,7 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
         Some(0),
         "without the flag the overlay is absent and the field is an empty array: {document}"
     );
+    assert_eq!(document["status"], document["outcome"], "no overlay, no difference");
 
     let run = ahl_cli(&[
         "--policy",
@@ -1436,9 +1437,13 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
     // `valid` and nowhere else — the core's boundary is never carried under a status the
     // freshness overlay moved.
     assert!(document["boundary"].is_null(), "{document}");
+    // The receipt's own result stands where the reduction of its assertions put it; the run's
+    // decision is what the overlay moved, and the exit code follows the decision.
+    assert_eq!(document["status"], "valid", "local policy never rewrites the §7.7 result");
+    assert_eq!(document["outcome"], "unverifiable");
     // The core's required assertions are untouched — §7.7 enumerates them exactly — and the
     // locally configured condition is reported in its own field, `unverifiable` and never
-    // `invalid`. The status is the reduction of the first list, then promoted by the second.
+    // `invalid`.
     let assertions = document["assertions"].as_array().expect("assertions");
     assert!(
         assertions.iter().all(|entry| entry["outcome"] == "verified"),
@@ -1467,7 +1472,7 @@ fn row_every_required_rule_verified_is_valid() {
         &[],
     );
     assert_eq!(run.code, 0, "{}", run.stderr);
-    assert!(run.stdout.contains("status: valid"));
+    assert!(run.stdout.contains("outcome: valid"));
 }
 
 // --- the boundary the reviewer asked for -------------------------------------------------

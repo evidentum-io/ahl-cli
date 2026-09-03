@@ -11,20 +11,26 @@
 //! edges as easily as omit real ones — the topology result is not a subset of the true
 //! closure, so it must not be describable as a partial one.
 //!
-//! # `status`, in two steps
+//! # `status` and `outcome` are two different answers
 //!
-//! `status` is the I-D §7.7 reduction of `assertions[]` — `invalid` if any required assertion
-//! is `invalid`, otherwise `unverifiable` if any is `unverifiable`, otherwise `valid` — and
-//! **then** promoted to `unverifiable` by any entry in `policy_overlays[]`. The two steps are
-//! separate because the two lists answer different questions: `assertions[]` is what the
-//! receipt requires, decided identically by every conformant verifier, while an overlay is a
-//! condition this operator configured. Folding an overlay into `assertions[]` would put a
-//! verifier-local condition among the receipt's required assertions, which §7.7 enumerates
-//! exactly; leaving it out of the status would report `valid` for a run whose own policy was
-//! not satisfied.
+//! **`status` is the receipt's own result**, in the I-D §7.7 vocabulary, and nothing rewrites
+//! it: exactly the reduction of `assertions[]` — `invalid` if any required assertion is
+//! `invalid`, otherwise `unverifiable` if any is `unverifiable`, otherwise `valid` — or `error`
+//! where the run produced no receipt report at all. Two conformant verifiers reach the same
+//! `status` over the same bytes, in every year, whatever either one's local policy says.
 //!
-//! An overlay can only ever promote, and only to `unverifiable`: it never turns `invalid` into
-//! something weaker, and it never produces `invalid` itself.
+//! **`outcome` is this run's decision**, in the same vocabulary, after the locally configured
+//! conditions in `policy_overlays[]` are applied. **The exit code follows `outcome`.** Where no
+//! overlay applied — which is almost always — `outcome` equals `status`; an overlay can move it
+//! from `valid` to `unverifiable` and nothing else. It never weakens an `invalid`, never
+//! produces one, and never touches `status`.
+//!
+//! Keeping them apart is the whole point. Folding a verifier-local condition into `status`
+//! would report `unverifiable` for a receipt whose every required assertion verified — a
+//! finding presented as though it were the result, which §7.7 forbids — while dropping it from
+//! the exit code would return `0` for a run whose own policy was not satisfied. `reason_code`
+//! and `reason` describe `outcome`: the overlay where one decided, otherwise the finding that
+//! caused the receipt's result.
 //!
 //! # Determinism
 //!
@@ -202,15 +208,26 @@ pub struct RecordOut {
 /// The result document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
+    /// **The receipt's own result** (I-D §7.7): exactly the reduction of [`Self::assertions`],
+    /// or `error` where the run produced no receipt report. Never rewritten by local policy.
+    ///
     /// One of `valid`, `invalid`, `error`, `unverifiable`. Never `invalid` for a `3`.
     pub status: &'static str,
+    /// **This run's decision**, in the same vocabulary: [`Self::status`] after the locally
+    /// configured conditions in [`Self::policy_overlays`] are applied. The process exit code
+    /// follows this member, not `status`.
+    ///
+    /// Equal to `status` wherever no overlay applied. An overlay moves it from `valid` to
+    /// `unverifiable` and nothing else.
+    pub outcome: &'static str,
     /// Stable machine string naming the class of result.
     pub reason_code: String,
     /// Human-readable reason.
     pub reason: String,
     /// The proven claim type, where one applies.
     pub claim_type: Option<String>,
-    /// The rendered boundary. Never stronger than the boundary `ahl-core` carries.
+    /// The rendered boundary, present only where [`Self::outcome`] is `valid`. Never stronger
+    /// than the boundary `ahl-core` carries.
     pub boundary: Option<String>,
     /// The assurance block as the receipt carries it, on every outcome.
     pub assurance: Option<AssuranceOut>,
@@ -269,6 +286,7 @@ impl Report {
     ) -> Self {
         Self {
             status: outcome.as_str(),
+            outcome: outcome.as_str(),
             reason_code: reason_code.into(),
             reason: reason.into(),
             claim_type: None,
@@ -288,6 +306,26 @@ impl Report {
             affected: None,
             topology_affected: None,
             reconstruction: None,
+        }
+    }
+
+    /// Apply the locally configured conditions already in [`Self::policy_overlays`] to
+    /// [`Self::outcome`], leaving [`Self::status`] alone.
+    ///
+    /// The only move an overlay can make is `valid` → `unverifiable`. It never weakens an
+    /// `invalid` — a demonstrated defect in the artifact outranks a condition of this run — and
+    /// it never applies where the receipt's own result was already something other than `valid`,
+    /// which is why an overlay listed beside an `invalid` receipt is informative and nothing
+    /// more.
+    ///
+    /// A promotion takes the boundary with it. The boundary is the one member rendered in words
+    /// that ASSERT the property, and it is rendered where [`Self::outcome`] is `valid` and
+    /// nowhere else — so the rule lives here, in the one place that can move `outcome`, rather
+    /// than at each call site that sets a boundary.
+    pub fn apply_policy_overlays(&mut self) {
+        if !self.policy_overlays.is_empty() && self.status == Outcome::Valid.as_str() {
+            self.outcome = Outcome::Unverifiable.as_str();
+            self.boundary = None;
         }
     }
 
@@ -321,7 +359,21 @@ impl Report {
     #[allow(clippy::too_many_lines)]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "status: {}", self.status);
+        // The headline is the run's decision, because that is what the exit code carries. Where
+        // local policy moved it, the two answers are spelled out on their own line so no reader
+        // mistakes a condition of this run for the receipt's own result.
+        let _ = writeln!(out, "outcome: {}", self.outcome);
+        if self.outcome != self.status {
+            let deciding: Vec<&str> =
+                self.policy_overlays.iter().map(|overlay| overlay.overlay.as_str()).collect();
+            let _ = writeln!(
+                out,
+                "receipt result: {}; policy: {} ({})",
+                self.status,
+                self.outcome,
+                deciding.join(", ")
+            );
+        }
         let _ = writeln!(out, "reason: [{}] {}", self.reason_code, self.reason);
         if let Some(claim_type) = &self.claim_type {
             let _ = writeln!(out, "claim type: {claim_type}");
@@ -455,6 +507,7 @@ mod tests {
         let json = report().to_json().expect("serializes");
         let order: Vec<&str> = [
             "\"status\"",
+            "\"outcome\"",
             "\"reason_code\"",
             "\"reason\"",
             "\"claim_type\"",
@@ -504,6 +557,42 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_overlay_moves_the_outcome_and_never_the_receipts_own_result() {
+        let mut report = report();
+        report.assertions = Some(Vec::new());
+        report.policy_overlays = vec![PolicyOverlayOut {
+            overlay: "witness-freshness".to_owned(),
+            outcome: "unverifiable".to_owned(),
+            detail: "older than the grace period".to_owned(),
+        }];
+        report.apply_policy_overlays();
+        assert_eq!(report.status, "valid", "the receipt's own result is never rewritten");
+        assert_eq!(report.outcome, "unverifiable", "the run's decision carries the overlay");
+
+        // The text says both, so a policy decision is never read as the §7.7 result.
+        let text = report.to_text();
+        assert!(text.starts_with("outcome: unverifiable\n"), "{text}");
+        assert!(
+            text.contains("receipt result: valid; policy: unverifiable (witness-freshness)"),
+            "{text}"
+        );
+
+        // An overlay never weakens a receipt result that was not `valid` to begin with.
+        let mut invalid = Report::new(
+            Outcome::Invalid,
+            "cross-field",
+            "an assurance member overstates what the receipt proves",
+            "2026-08-17T00:00:00Z".to_owned(),
+            TimeSource::Override,
+        );
+        invalid.policy_overlays = report.policy_overlays.clone();
+        invalid.apply_policy_overlays();
+        assert_eq!(invalid.status, "invalid");
+        assert_eq!(invalid.outcome, "invalid", "an overlay only ever moves `valid`");
+        assert!(!invalid.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
     fn findings_are_ordered_and_deduplicated() {
         let report = report().with_findings([
             Finding::new("witness-stale", "b"),
@@ -526,9 +615,10 @@ mod tests {
         );
         let text = report.to_text();
         let json = report.to_json().expect("serializes");
-        assert!(text.contains("status: unverifiable"));
+        assert!(text.contains("outcome: unverifiable"));
         assert!(!text.to_lowercase().contains("invalid"));
         assert!(json.contains("\"status\": \"unverifiable\""));
+        assert!(json.contains("\"outcome\": \"unverifiable\""));
         assert!(!json.contains("invalid"));
     }
 

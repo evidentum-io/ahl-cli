@@ -58,6 +58,16 @@ makes a verifier useless in CI.
 family canon still reads them correctly. `3` is a documented AHL extension and is **never**
 rendered as INVALID in any surface — text, JSON, or exit status.
 
+**`status` is the receipt's result; `outcome` is this run's decision, and the exit code follows
+`outcome`.** `status` is exactly the result model's reduction of `assertions[]`, so two
+conformant verifiers reach the same value over the same bytes whatever either one's local policy
+says, and nothing rewrites it. `outcome` is `status` after the locally configured conditions in
+`policy_overlays[]` are applied — a move from `valid` to `unverifiable` and nothing else.
+Almost always the two are equal; where they differ, the text surface says so on its own line
+(`receipt result: valid; policy: unverifiable (witness-freshness)`) so no reader mistakes a
+condition of this run for the receipt's own result, and the boundary — the one thing rendered in
+words that assert the property — is dropped along with the `valid`.
+
 For `verify`, the first three are the three values of the AHL result model: a completed run
 reaches exactly one of `verified`, `invalid` and `unverifiable`, and which one a rejection
 produces is decided by `ahl-core` from the rule that fired, never re-derived here — a
@@ -482,9 +492,9 @@ for them are gone:
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
 
-## Four additions to the §6 field list
+## Five additions to the §6 field list
 
-`--json` carries four members §6's fixed list does not name, each added visibly rather than
+`--json` carries five members §6's fixed list does not name, each added visibly rather than
 silently:
 
 - `assertions` — one entry per required assertion of the verified receipt, as
@@ -519,11 +529,11 @@ silently:
   and without the flag freshness is a `findings[]` entry (`witness-stale`) and not an overlay
   at all.
 
-  **`status` is computed in two steps**: the result-model reduction of `assertions[]`, and then
-  a promotion to `unverifiable` by any entry in `policy_overlays[]`. An overlay can only ever
-  promote — it never weakens an `invalid` and never produces one. The headline follows the same
-  precedence: the core's cause wherever the core result is not `verified`, otherwise the first
-  overlay.
+  An overlay is evaluated on every completed run and reported whatever the receipt's result was.
+  It can only ever move a `valid` one: a demonstrated defect outranks a condition of this run,
+  so an overlay listed beside an `invalid` receipt is informative and changes nothing.
+- `outcome` — **this run's decision**, in the same vocabulary as `status`, after the conditions
+  in `policy_overlays[]` are applied. See below.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.

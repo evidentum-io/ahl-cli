@@ -13,12 +13,12 @@
 //! and a run that does not complete reaches none of them. This command maps that model onto
 //! the §6 exit-code contract and adds nothing to it:
 //!
-//! | §7.7 result | Outcome | Exit |
+//! | §7.7 result | `status` | Exit, where no overlay applied |
 //! |---|---|---|
-//! | `verified` | [`Outcome::Valid`] | `0` |
-//! | `invalid` | [`Outcome::Invalid`] | `1` |
-//! | `unverifiable` | [`Outcome::Unverifiable`] | `3` |
-//! | no result — the run did not complete | [`Outcome::Error`] | `2` |
+//! | `verified` | `valid` | `0` |
+//! | `invalid` | `invalid` | `1` |
+//! | `unverifiable` | `unverifiable` | `3` |
+//! | no result — the run did not complete | `error` | `2` |
 //!
 //! Which of `invalid` and `unverifiable` a rejection produces is decided by the core, from the
 //! rule that fired, and is never re-derived here: a verifier-local condition reported as
@@ -45,10 +45,18 @@
 //! disproves nothing — and without the flag it is not an overlay at all, only a `findings[]`
 //! entry (`witness-stale`).
 //!
-//! **`status` in two steps.** It is the §7.7 reduction of `assertions[]`, and then promoted to
-//! `unverifiable` by any overlay. An overlay can only ever promote, never weaken an `invalid`,
-//! and the headline follows the same precedence: the core's `dominating()` finding wherever the
-//! core result is not `verified`, and otherwise the first overlay.
+//! **`status` and `outcome` are two answers, not one.** `status` is the RECEIPT's result — the
+//! §7.7 reduction of `assertions[]` — and no local policy rewrites it. `outcome` is THIS RUN's
+//! decision: `status`, then promoted from `valid` to `unverifiable` by any overlay, and the
+//! exit code follows it. A receipt whose every required assertion verified therefore reports
+//! `status: valid` beside `outcome: unverifiable` and exits `3`, rather than having a condition
+//! of this run presented as though it were the receipt's result.
+//!
+//! An overlay is evaluated on every completed run and reported whatever the receipt's result
+//! was, but it can only ever move `valid`: a demonstrated defect outranks a condition of this
+//! run, so an overlay beside an `invalid` receipt is informative and changes nothing. The
+//! headline describes `outcome` and follows the same precedence — the core's `dominating()`
+//! finding wherever the core result is not `verified`, and otherwise the first overlay.
 //!
 //! A boundary is rendered where the FINAL status is `valid` and nowhere else. Carrying the
 //! core's boundary under a status the overlay moved would present words that assert the
@@ -205,8 +213,69 @@ fn verify(
         }
         // A boundary is rendered for `verified` and for nothing else, so a result carrying
         // none is a rejection whatever else it carries.
-        _ => Ok(rejected(&receipt, &core, evaluation)),
+        _ => Ok(rejected(&receipt, &core, evaluation, options, policy)),
     }
+}
+
+/// The locally configured conditions this run applied, and the findings the same checks raised.
+///
+/// Evaluated on every completed run, not only on an accepted one, so `policy_overlays[]` says
+/// what this verifier's own policy found rather than only what it was able to act on. Where the
+/// receipt's own result is already something other than `valid` an overlay changes nothing —
+/// `Report::apply_policy_overlays` moves only `valid` — and it is reported because a holder
+/// deciding what to fix is better served by both facts than by one.
+///
+/// `assurance.witnessed` is read AS CARRIED. For an accepted receipt that is the verified value,
+/// since §7.6's `witnessed` rule makes the carried member agree with what verified and the core
+/// refuses a receipt where it does not; for a rejected one nothing is established either way, so
+/// the freshness detail is a statement about the carried `checkpoint_time` and about nothing
+/// else — which is also why it can never move a result.
+fn policy_overlays(
+    receipt: &Value,
+    policy: &LoadedPolicy,
+    evaluation: &EvaluationTime,
+    options: &Options,
+) -> (Vec<PolicyOverlayOut>, Vec<Finding>) {
+    let mut overlays = Vec::new();
+    let mut findings = Vec::new();
+
+    let witnessed = receipt
+        .get("claim")
+        .and_then(|claim| claim.get("assurance"))
+        .and_then(|assurance| assurance.get("witnessed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !witnessed {
+        return (overlays, findings);
+    }
+
+    // Resolving the chain again here is what supplies the cadence and the grace period the
+    // freshness check needs, under the same §7.4.1 rules rather than a weaker walk.
+    let Ok(entries) = chain_entries(receipt) else { return (overlays, findings) };
+    let Ok((governance, _)) = Governance::resolve(&entries, &policy.trust) else {
+        return (overlays, findings);
+    };
+    let checkpoint = receipt.get("anchoring").and_then(|anchoring| anchoring.get("checkpoint"));
+
+    match freshness(&governance, checkpoint, evaluation) {
+        Ok(Some(finding)) => {
+            // Staleness is a finding, never by itself a disproof. `--require-fresh` makes it a
+            // POLICY OVERLAY of this run — `unverifiable`, never `invalid` — reported in its
+            // own field rather than among the receipt's required assertions, which §7.7
+            // enumerates exactly.
+            if options.require_fresh {
+                overlays.push(PolicyOverlayOut {
+                    overlay: FRESHNESS.to_owned(),
+                    outcome: CoreOutcome::Unverifiable.name().to_owned(),
+                    detail: finding.detail.clone(),
+                });
+            }
+            findings.push(finding);
+        }
+        Ok(None) => {}
+        Err(detail) => findings.push(Finding::new("witness-freshness-unavailable", detail)),
+    }
+    (overlays, findings)
 }
 
 /// The `(reason_code, reason)` a core finding leads a report with: its assertion's stable name,
@@ -322,7 +391,13 @@ fn carried_assurance(receipt: &Value) -> Option<AssuranceOut> {
 /// No boundary is rendered — §7.7 permits only `verified` to be "rendered in words that assert
 /// the property" — and the assurance block is reproduced as carried rather than rewritten to
 /// express the result.
-fn rejected(receipt: &Value, core: &CoreReport, evaluation: &EvaluationTime) -> Report {
+fn rejected(
+    receipt: &Value,
+    core: &CoreReport,
+    evaluation: &EvaluationTime,
+    options: &Options,
+    policy: &LoadedPolicy,
+) -> Report {
     let outcome = match core.result {
         CoreOutcome::Invalid => Outcome::Invalid,
         // `Verified` cannot reach here: it is handled above, and a report carrying no verdict
@@ -347,7 +422,12 @@ fn rejected(receipt: &Value, core: &CoreReport, evaluation: &EvaluationTime) -> 
         .map(str::to_owned);
     report.assurance = carried_assurance(receipt);
     report.assertions = Some(assertions(core));
-    report
+    // Reported, and unable to change anything: the receipt's own result is not `valid`, so
+    // `apply_policy_overlays` leaves `outcome` where `status` put it.
+    let (overlays, findings) = policy_overlays(receipt, policy, evaluation, options);
+    report.policy_overlays = overlays;
+    report.apply_policy_overlays();
+    report.with_findings(findings)
 }
 
 fn adaptor_id(receipt: &Value) -> Result<String, ()> {
@@ -369,54 +449,27 @@ fn succeeded(
     policy: &LoadedPolicy,
 ) -> Report {
     let checkpoint = receipt.get("anchoring").and_then(|anchoring| anchoring.get("checkpoint"));
-    let mut findings = Vec::new();
     let assertions = assertions(core);
-    let mut overlays: Vec<PolicyOverlayOut> = Vec::new();
+    let (overlays, mut findings) = policy_overlays(receipt, policy, evaluation, options);
 
-    // Governance findings and freshness both come from the receipt's own chain, which
-    // `verify_receipt` has already validated back to the configured genesis anchor.
-    let chain = chain_entries(receipt);
-    if let Ok(entries) = &chain {
-        // `verify_receipt` has already validated this chain from the configured genesis
-        // anchor; resolving it again here is what supplies the cadence and grace period the
-        // freshness check needs, and it uses the same §7.4.1 rules rather than a weaker walk.
-        if let Ok((governance, _)) = Governance::resolve(entries, &policy.trust) {
+    // The chain the freshness check resolved also carries the §7.3 schema findings, and those
+    // are reported for an accepted receipt because there is a result for them to qualify.
+    if let Ok(entries) = chain_entries(receipt) {
+        if let Ok((governance, _)) = Governance::resolve(&entries, &policy.trust) {
             findings.extend(governance.log_object_findings());
-            if verdict.assurance.witnessed {
-                match freshness(&governance, checkpoint, evaluation) {
-                    Ok(Some(finding)) => {
-                        // Staleness is a finding, never by itself a disproof. `--require-fresh`
-                        // makes it a POLICY OVERLAY of this run — `unverifiable`, never
-                        // `invalid` — reported in its own field rather than among the
-                        // receipt's required assertions, which §7.7 enumerates exactly.
-                        if options.require_fresh {
-                            overlays.push(PolicyOverlayOut {
-                                overlay: FRESHNESS.to_owned(),
-                                outcome: CoreOutcome::Unverifiable.name().to_owned(),
-                                detail: finding.detail.clone(),
-                            });
-                        }
-                        findings.push(finding);
-                    }
-                    Ok(None) => {}
-                    Err(detail) => {
-                        findings.push(Finding::new("witness-freshness-unavailable", detail));
-                    }
-                }
-            }
         }
     }
 
-    // The status in the two steps §7.7 and the overlay rule fix: the reduction of the core's
-    // required assertions, and THEN the promotion any overlay applies. This arm is reached with
-    // a `verified` core report, so the reduction is `Valid` here and only the promotion can
-    // move it — the ordering is written out anyway, because an overlay silently outranking a
-    // core result is what the split exists to prevent.
-    let outcome = if overlays.is_empty() { Outcome::Valid } else { Outcome::Unverifiable };
+    // `status` is the receipt's own result and this arm is the `verified` one, so it is `Valid`
+    // here whatever local policy says; `outcome` is decided from it below, by
+    // `Report::apply_policy_overlays`.
+    let outcome = Outcome::Valid;
 
-    // The core's cause outranks the overlay for the same reason: a receipt that also failed a
-    // required assertion failed it for a reason its holder must be told first, while freshness
-    // is a condition of this run.
+    // The headline describes `outcome`. The core's cause outranks the overlay: a receipt that
+    // also failed a required assertion failed it for a reason its holder must be told first,
+    // while freshness is a condition of this run. `dominating()` is `None` on this arm, so the
+    // overlay leads where it fired; the ordering is written out because an overlay silently
+    // outranking a core cause is what the split exists to prevent.
     let (reason_code, reason) = headline(core.dominating())
         .or_else(|| {
             let overlay = overlays.first()?;
@@ -427,13 +480,11 @@ fn succeeded(
     let mut report =
         Report::new(outcome, reason_code, reason, evaluation.rendered.clone(), evaluation.source);
     report.claim_type = Some(verdict.claim_type.clone());
-    // Rendered where the FINAL status is `valid` and nowhere else: only `verified` may be
-    // rendered in words that assert the property, and the overlay above can move the status
-    // after the core has rendered its boundary. Never stronger than the boundary
-    // `ahl_core::receipt::Verdict` carries, either.
-    if outcome == Outcome::Valid {
-        report.boundary = Some(verdict.boundary.clone());
-    }
+    // Only `verified` may be rendered in words that assert the property, and never more
+    // strongly than the boundary `ahl_core::receipt::Verdict` carries. This arm has the
+    // receipt's own result at `valid`; `apply_policy_overlays` below takes the boundary away
+    // again where a locally configured condition moves the run's decision off it.
+    report.boundary = Some(verdict.boundary.clone());
     report.assurance = Some(AssuranceOut {
         governance: verdict.assurance.governance.clone(),
         competing_triggers: verdict.assurance.competing_triggers.clone(),
@@ -464,6 +515,7 @@ fn succeeded(
         .map(str::to_owned);
     report.assertions = Some(assertions);
     report.policy_overlays = overlays;
+    report.apply_policy_overlays();
     report.with_findings(findings)
 }
 
@@ -1002,9 +1054,14 @@ mod tests {
             finding_only.policy_overlays.is_empty(),
             "without the flag freshness is a finding, not an overlay"
         );
+        assert_eq!(finding_only.outcome, finding_only.status, "no overlay, no difference");
+        assert!(!finding_only.to_text().contains("receipt result:"));
 
         let promoted = run(&policy, &much_later, &Options { receipt: path, require_fresh: true });
-        assert_eq!(promoted.status, "unverifiable");
+        // The receipt's own result is untouched; the run's decision carries the overlay, and
+        // the exit code follows the decision.
+        assert_eq!(promoted.status, "valid", "local policy never rewrites the §7.7 result");
+        assert_eq!(promoted.outcome, "unverifiable");
         assert!(promoted.findings.iter().any(|f| f.code == "witness-stale"));
         // A boundary asserts the property in words, so it is rendered where the FINAL status is
         // `valid` and nowhere else — never carried over from a core result the overlay moved.
@@ -1038,10 +1095,17 @@ mod tests {
             "the grace period is named: {}",
             overlay.detail
         );
-        // The status is the reduction, THEN the promotion the overlay applies.
-        assert_eq!(promoted.status, "unverifiable");
-        assert_eq!(promoted.reason_code, FRESHNESS);
-        assert!(promoted.to_text().contains("policy overlays:"), "{}", promoted.to_text());
+        // `status` is the reduction of the assertions and stays there; `outcome` is what the
+        // overlay moved, and the text spells the difference out on its own line.
+        assert_eq!(reduction(assertions), promoted.status);
+        assert_eq!(promoted.reason_code, FRESHNESS, "the headline describes `outcome`");
+        let text = promoted.to_text();
+        assert!(text.starts_with("outcome: unverifiable\n"), "{text}");
+        assert!(
+            text.contains("receipt result: valid; policy: unverifiable (witness-freshness)"),
+            "{text}"
+        );
+        assert!(text.contains("policy overlays:"), "{text}");
     }
 
     /// The §7.7 reduction over a reported assertion set, in the CLI's own status vocabulary.
@@ -1111,6 +1175,30 @@ mod tests {
             "the core's cause leads, not the CLI overlay: {}",
             report.reason
         );
+    }
+
+    #[test]
+    fn an_overlay_beside_a_rejected_receipt_is_reported_and_changes_nothing() {
+        // A condition of this run is worth reporting whatever the receipt's own result was, and
+        // it can never move a result that was not `valid`: a demonstrated defect outranks it.
+        let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
+        let report = run(
+            &corpus_policy(true),
+            &much_later,
+            &Options {
+                receipt: corpus().join("receipts/overclaim-must-fail.ahl"),
+                require_fresh: true,
+            },
+        );
+        assert_eq!(report.status, "invalid", "{}", report.reason);
+        assert_eq!(report.outcome, "invalid", "an overlay never weakens an `invalid`");
+        assert_eq!(report.reason_code, "cross-field", "the core's cause still leads");
+        assert!(
+            report.policy_overlays.iter().any(|overlay| overlay.overlay == FRESHNESS),
+            "the overlay is still listed: {:?}",
+            report.policy_overlays
+        );
+        assert!(!report.to_text().contains("receipt result:"), "nothing to disambiguate");
     }
 
     #[test]

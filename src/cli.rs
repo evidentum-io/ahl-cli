@@ -340,7 +340,9 @@ fn emit_report(
 ) -> CliResult<Outcome> {
     let rendered = if cli.json { report.to_json()? } else { report.to_text() };
     write_out(stdout, &rendered)?;
-    Ok(match report.status {
+    // The exit code follows `outcome`, the run's decision, not `status`, the receipt's own
+    // result: a receipt that verified under a policy this run did not satisfy must not exit 0.
+    Ok(match report.outcome {
         "valid" => Outcome::Valid,
         "invalid" => Outcome::Invalid,
         "unverifiable" => Outcome::Unverifiable,
@@ -443,7 +445,7 @@ mod tests {
         ]);
         assert_eq!(run.outcome, Outcome::Valid);
         assert_eq!(run.outcome.exit_code(), 0);
-        assert!(run.stdout.contains("status: valid"));
+        assert!(run.stdout.contains("outcome: valid"));
         assert!(run.stderr.is_empty(), "diagnostics leaked into stdout: {}", run.stderr);
     }
 
