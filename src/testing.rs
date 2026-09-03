@@ -15,7 +15,7 @@
 //! **Test material only.** Every key this module uses is a published constant of the AHL
 //! conformance corpus. Nothing here is suitable for production key handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -1000,12 +1000,7 @@ pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
         let Some(payload) = value.get("envelope").and_then(|e| e.get("payload")) else {
             return true;
         };
-        ["outputs_root", "affected_root"].iter().all(|member| {
-            payload
-                .get(*member)
-                .and_then(Value::as_str)
-                .is_none_or(|hash| material.get(hash).is_some())
-        })
+        tree_material_reaches(payload, &material)
     };
 
     let Ok(entries) = std::fs::read_dir(root.join("vectors/statements")) else { return out };
@@ -1026,6 +1021,56 @@ pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Every committed tree root reachable from `value`, at any depth.
+///
+/// A root is any member whose name ends in `_root` — `outputs_root`, `affected_root`,
+/// `input_set_root` — read off the whole subtree rather than off a fixed list of members, so a
+/// commitment a later revision adds is followed here without an edit.
+fn committed_roots(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(members) => {
+            for (name, member) in members {
+                if name.ends_with("_root") {
+                    if let Some(hash) = member.as_str() {
+                        out.insert(hash.to_owned());
+                    }
+                }
+                committed_roots(member, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                committed_roots(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `material` publishes every committed tree a closure over `payload` would open,
+/// **transitively**.
+///
+/// Following only the roots named in the payload is not enough, and the gap is not theoretical:
+/// a batch derivation's `outputs_root` opens a tree whose leaves each carry their own `inputs`,
+/// and a leaf's `inputs` may itself be a wide-input commitment `{input_set_root,
+/// input_set_count}` that the closure opens in turn. A selector that stopped at the payload
+/// would hand a topology test a corpus that fails halfway through the walk, for want of
+/// material, on a statement it believed it had checked.
+fn tree_material_reaches(payload: &Value, material: &Value) -> bool {
+    let mut pending = BTreeSet::new();
+    committed_roots(payload, &mut pending);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    while let Some(root) = pending.pop_first() {
+        if !seen.insert(root.clone()) {
+            continue;
+        }
+        let Some(leaves) = material.get(&root) else { return false };
+        committed_roots(leaves, &mut pending);
+    }
+    true
 }
 
 /// Write [`tree_material`] into `dir` and return the path.
@@ -1057,6 +1102,61 @@ pub fn identity_at(fixture: &MirrorFixture, tree_size: u64) -> CheckpointIdentit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selector_follows_every_committed_tree_the_closure_would_open() {
+        // The closure opens a batch derivation's `outputs_root`, and then each leaf's `inputs`
+        // — which may itself be a wide-input commitment naming another tree. A selector that
+        // read only the payload's own roots would pass a statement whose closure fails halfway
+        // through the walk for want of material.
+        let nested = format!("sha256:{}", "11".repeat(32));
+        let outputs = format!("sha256:{}", "22".repeat(32));
+        let material = json!({
+            outputs.as_str(): [
+                { "dataset": "d", "record": "sha256:aa",
+                  "inputs": { "input_set_root": nested.as_str(), "input_set_count": 2 } },
+            ],
+            nested.as_str(): [ { "dataset": "d", "record": "sha256:bb" } ],
+        });
+
+        // Nothing committed at all: nothing to publish.
+        assert!(tree_material_reaches(&json!({ "type": "ingestion" }), &material));
+
+        // A root named in the payload and not published.
+        let unpublished = format!("sha256:{}", "33".repeat(32));
+        assert!(!tree_material_reaches(
+            &json!({ "inputs": { "input_set_root": unpublished, "input_set_count": 1 } }),
+            &material
+        ));
+
+        // A published outputs tree whose LEAF names an input set — the transitive case.
+        let payload = json!({ "outputs_root": outputs.as_str(), "outputs_count": 1 });
+        assert!(tree_material_reaches(&payload, &material));
+        let without_nested = json!({ outputs.as_str(): material[&outputs].clone() });
+        assert!(
+            !tree_material_reaches(&payload, &without_nested),
+            "a root reachable only through another tree's leaves is still required"
+        );
+    }
+
+    #[test]
+    fn the_selected_corpus_keeps_the_wide_input_derivation_and_drops_the_unpublished_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selected = statements_with_published_tree_material(dir.path());
+        let names: Vec<String> = std::fs::read_dir(&selected)
+            .expect("selected corpus")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("derivation-batch-wide-inputs")),
+            "a wide-input derivation whose input-set tree IS published stays: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("defective-input-sets")),
+            "the statement whose committed tree the corpus does not publish is dropped: {names:?}"
+        );
+    }
 
     #[test]
     fn the_fixture_loads_the_whole_conformance_corpus() {
