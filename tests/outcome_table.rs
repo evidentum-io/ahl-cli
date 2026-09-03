@@ -261,7 +261,7 @@ fn row_an_anchored_statement_of_an_unknown_type_is_invalid_never_inert() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "42",
+        &common::newest_published_size("mirror-transcript-unknown-statement.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -530,7 +530,7 @@ fn row_a_forged_key_binding_never_authorizes_a_successor_manifest() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "43",
+        &common::newest_published_size("mirror-transcript-forged-key-transition.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -614,7 +614,7 @@ fn row_a_log_key_that_is_not_active_yet_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "42",
+        &common::newest_published_size("mirror-transcript-inactive-log-key.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -663,7 +663,7 @@ fn row_a_log_key_id_that_does_not_recompute_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "42",
+        &common::newest_published_size("mirror-transcript-mismatched-key-id.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -713,7 +713,7 @@ fn row_a_manifest_version_moving_the_cadence_epoch_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "42",
+        &common::newest_published_size("mirror-transcript-moved-epoch.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -986,7 +986,7 @@ fn a_forged_later_manifest_never_authenticates_a_checkpoint() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "42",
+        &common::newest_published_size("mirror-transcript-forged-manifest.json").to_string(),
         "--transcript",
         &transcript.display().to_string(),
     ]);

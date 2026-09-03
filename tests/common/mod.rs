@@ -221,3 +221,43 @@ pub fn set_exchange_body(exchange: &mut serde_json::Value, body: &serde_json::Va
     exchange["body_base64"] =
         serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes));
 }
+
+/// The largest `tree_size` the recorded transcript at `name` publishes.
+///
+/// Read from the recording rather than written down: the fixtures are regenerated from the
+/// conformance corpus, so every size in them moves when the corpus grows. A test that names one
+/// as a literal does not fail when the corpus changes — it silently grounds itself on an older
+/// checkpoint, or on none, which is the kind of drift a recording exists to prevent.
+pub fn newest_published_size(name: &str) -> u64 {
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures().join(name)).expect("transcript"))
+            .expect("transcript parses");
+    let exchanges = recorded
+        .get("exchanges")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| recorded.as_array())
+        .expect("exchanges");
+    exchanges
+        .iter()
+        .filter(|exchange| {
+            exchange["url"].as_str().is_some_and(|url| url.ends_with("/v1/checkpoints"))
+        })
+        .filter_map(|exchange| {
+            let body = exchange_body(exchange);
+            let members = body
+                .get("checkpoints")
+                .and_then(serde_json::Value::as_array)
+                .or_else(|| body.as_array())?
+                .clone();
+            members
+                .iter()
+                .filter_map(|member| {
+                    member["tree_size"]
+                        .as_u64()
+                        .or_else(|| member["checkpoint"]["tree_size"].as_u64())
+                })
+                .max()
+        })
+        .max()
+        .expect("the transcript publishes a checkpoint series")
+}
