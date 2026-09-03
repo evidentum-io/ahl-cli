@@ -689,3 +689,60 @@ fn a_symlinked_policy_or_key_is_refused_rather_than_traversed() {
     assert_eq!(run.code, 2);
     assert!(run.output().contains("symbolic link"), "{}", run.output());
 }
+
+#[test]
+fn a_receipt_whose_enumeration_carries_only_void_entries_is_not_promoted_by_the_cli() {
+    // I-D §7.5.1 4d: a non-verifying envelope the receipt does not rest on is VOID — excluded,
+    // never effective, never traversed, and it does not affect the result. The temptation for a
+    // client is to treat "this enumeration contains entries that do not verify" as evidence of
+    // something; it is not, and a CLI-side promotion would hand any party able to anchor one
+    // envelope the power to disable every enumerated claim of that log from that index on. The
+    // result is whatever the core says over the same bytes, and nothing here moves it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("receipts/index.json")).expect("index"),
+    )
+    .expect("index parses");
+
+    let mut checked = 0;
+    for vector in index["vectors"].as_array().expect("vectors") {
+        let Some(void) = vector["informative"].as_u64() else { continue };
+        let file = vector["file"].as_str().expect("file");
+        let expect = vector["expect"].as_str().expect("expect");
+        let (code, status) = match expect {
+            "verified" => (0, "valid"),
+            "invalid" => (1, "invalid"),
+            "unverifiable" => (3, "unverifiable"),
+            other => panic!("unknown expectation `{other}` for {file}"),
+        };
+        let run = ahl_cli(&[
+            "--policy",
+            &policy_path,
+            AT,
+            FIXED,
+            "--json",
+            "verify",
+            &corpus().join("receipts").join(file).display().to_string(),
+        ]);
+        let report = run.json();
+        assert_eq!(run.code, code, "{file}: {}", report["reason"]);
+        assert_eq!(report["status"], status, "{file}");
+        assert_eq!(report["outcome"], status, "{file}");
+        assert_eq!(
+            report["informative"].as_array().expect("void entries").len() as u64,
+            void,
+            "{file}: {report}"
+        );
+        // Counted, and never converted into a finding on the way out.
+        let codes: Vec<&str> = report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|finding| finding["code"].as_str())
+            .collect();
+        assert!(!codes.contains(&"void-entry"), "{file}: {codes:?}");
+        checked += 1;
+    }
+    assert!(checked >= 3, "the corpus should carry vectors with void entries, got {checked}");
+}

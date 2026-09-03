@@ -4,6 +4,11 @@
 //! outcome it produces, so no code path can invent one by accident. A path that is not in the
 //! table is a defect, not a default — which is why [`CliError::outcome`] is a total match with
 //! no wildcard arm.
+//!
+//! What is NOT here is the class of a receipt rejection. A completed verification run reaches
+//! one of the three I-D §7.7 values and the core decides which, so this enum carries only the
+//! rows §6 assigns to the CLI itself: usage, local configuration, local I/O, the artifact's own
+//! bytes before the core is entered, and evidence a server did not supply.
 
 use crate::outcome::Outcome;
 
@@ -84,6 +89,17 @@ pub enum CliError {
     #[error("internal invariant: {0}")]
     Internal(String),
 
+    /// A verification run did not complete, so it reached no result at all.
+    ///
+    /// I-D §7.7: "A run that does not complete — an I/O failure, an exhausted heap, a crash —
+    /// yields no result in this model. It is a local execution failure, reported as such; it
+    /// says nothing about the receipt and MUST NOT be rendered as any of the three values."
+    /// Kept apart from [`Self::Internal`] because the two answer different questions: an
+    /// invariant this crate broke is a defect here, while a run that stopped is a statement
+    /// about the local environment and about nothing else.
+    #[error("the verification run did not complete: {0}")]
+    ExecutionFailed(String),
+
     // -- exit 1: a rule fired against the user's own artifact ---------------------------
     /// The artifact's bytes are present but malformed, non-canonical, or structurally invalid.
     #[error("{what} is malformed: {detail}")]
@@ -110,6 +126,16 @@ pub enum CliError {
     },
 
     // -- exit 3: required evidence could not be established ------------------------------
+    /// Local policy anchors a corpus other than the one the presented material carries.
+    ///
+    /// `unverifiable`, never `invalid`: the artifact may be a perfectly valid one of another
+    /// corpus, and what is missing is a trust anchor this verifier was not configured with —
+    /// a property of the verifier rather than of the material. Reporting it as a rule fired
+    /// against the artifact would let a verifier configured for corpus A make a statement about
+    /// corpus B's material that a verifier configured for B contradicts.
+    #[error("{0}")]
+    GenesisAnchorMismatch(String),
+
     /// The pinned adaptor profile is not locally possessed at all.
     #[error("adaptor profile `{id}` is not locally possessed")]
     ProfileNotPossessed {
@@ -122,32 +148,9 @@ pub enum CliError {
     #[error("{0}")]
     ProfileLimitation(String),
 
-    /// A `keyed` content binding was claimed but no authorized dataset key is held.
-    #[error("no authorized dataset key is held for dataset `{dataset}`")]
-    DatasetKeyNotHeld {
-        /// The dataset whose key is missing.
-        dataset: String,
-    },
-
     /// A resource limit was exhausted. Rejection, never a degraded acceptance.
     #[error("limit exhausted: {0}")]
     LimitExhausted(String),
-
-    /// The receipt asks for a combination the frozen container format cannot evidence.
-    ///
-    /// Not a rule fired against the artifact: a rule the format leaves no material to satisfy.
-    /// The receipt is well-formed and nothing about it has been disproved — what is absent is
-    /// evidence the format defines no way to carry — so this is `3`, alongside the other rows
-    /// where a limitation of the *format or profile* is named rather than the artifact
-    /// adjudicated. Given an explicit variant so the outcome is a decision, never the
-    /// fall-through arm for a rejection this build does not recognise.
-    #[error("{combination} cannot be evidenced under this format revision: {conflict}")]
-    FormatConflict {
-        /// The combination of receipt features that cannot be evidenced.
-        combination: String,
-        /// The conflicting requirements, each named by section.
-        conflict: String,
-    },
 
     /// Required evidence could not be obtained: an unreachable server, a malformed remote
     /// response, an enumeration that does not tile, a proof that did not verify on a
@@ -173,15 +176,15 @@ impl CliError {
             | Self::ProfileBroken { .. }
             | Self::Output { .. }
             | Self::RefusedTarget { .. }
-            | Self::Internal(_) => Outcome::Error,
+            | Self::Internal(_)
+            | Self::ExecutionFailed(_) => Outcome::Error,
             Self::Malformed { .. }
             | Self::RuleFired(_)
             | Self::EquivocationAtOrBeyondFloor { .. } => Outcome::Invalid,
-            Self::ProfileNotPossessed { .. }
+            Self::GenesisAnchorMismatch(_)
+            | Self::ProfileNotPossessed { .. }
             | Self::ProfileLimitation(_)
-            | Self::DatasetKeyNotHeld { .. }
             | Self::LimitExhausted(_)
-            | Self::FormatConflict { .. }
             | Self::EvidenceMissing(_)
             | Self::TopologyMode(_) => Outcome::Unverifiable,
         }
@@ -199,14 +202,14 @@ impl CliError {
             Self::Output { .. } => "output-io",
             Self::RefusedTarget { .. } => "target-refused",
             Self::Internal(_) => "internal",
+            Self::ExecutionFailed(_) => "execution-failed",
             Self::Malformed { .. } => "malformed",
             Self::RuleFired(_) => "rule-fired",
             Self::EquivocationAtOrBeyondFloor { .. } => "equivocation-at-or-beyond-floor",
+            Self::GenesisAnchorMismatch(_) => "genesis-anchor-mismatch",
             Self::ProfileNotPossessed { .. } => "profile-not-possessed",
             Self::ProfileLimitation(_) => "profile-limitation",
-            Self::DatasetKeyNotHeld { .. } => "dataset-key-not-held",
             Self::LimitExhausted(_) => "limit-exhausted",
-            Self::FormatConflict { .. } => "format-conflict",
             Self::EvidenceMissing(_) => "evidence-missing",
             Self::TopologyMode(_) => "topology-mode",
         }
@@ -234,14 +237,14 @@ mod tests {
             CliError::Output { path: "p".to_owned(), detail: "d".to_owned() },
             CliError::RefusedTarget { url: "u".to_owned(), detail: "d".to_owned() },
             CliError::Internal("i".to_owned()),
+            CliError::ExecutionFailed("stopped".to_owned()),
             CliError::Malformed { what: "receipt", detail: "d".to_owned() },
             CliError::RuleFired("r".to_owned()),
             CliError::EquivocationAtOrBeyondFloor { floor: 4 },
+            CliError::GenesisAnchorMismatch("another corpus".to_owned()),
             CliError::ProfileNotPossessed { id: "i".to_owned() },
             CliError::ProfileLimitation("l".to_owned()),
-            CliError::DatasetKeyNotHeld { dataset: "d".to_owned() },
             CliError::LimitExhausted("l".to_owned()),
-            CliError::FormatConflict { combination: "c".to_owned(), conflict: "why".to_owned() },
             CliError::EvidenceMissing("e".to_owned()),
             CliError::TopologyMode("t".to_owned()),
         ]

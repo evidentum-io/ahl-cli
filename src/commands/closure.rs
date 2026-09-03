@@ -369,7 +369,7 @@ mod tests {
     use crate::testing::MirrorFixture;
 
     fn corpus_dir() -> PathBuf {
-        MirrorFixture::corpus_root().join("vectors/statements")
+        crate::testing::statements_with_published_tree_material(&std::env::temp_dir())
     }
 
     fn at_corpus_time() -> EvaluationTime {
@@ -401,10 +401,31 @@ mod tests {
     #[test]
     fn topology_mode_never_returns_valid_however_clean_the_corpus_is() {
         let report = run_topology(&topology_options(TriggerRef::EntryIndex(6)));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(!report.authenticated);
         assert!(report.topology_affected.is_some());
         assert!(report.affected.is_none(), "the two results never share a field name");
+    }
+
+    #[test]
+    fn neither_mode_reports_a_receipt_result_because_neither_verifies_a_receipt() {
+        // The result model has three values and a receipt to attach them to. `closure` verifies
+        // none, in either mode, so it reports its own decision under `outcome` and leaves
+        // `status` empty rather than putting a value there that no reduction produced.
+        let topology = run_topology(&topology_options(TriggerRef::EntryIndex(6)));
+        assert_eq!(topology.status, None);
+        assert_eq!(topology.outcome, "unverifiable");
+        assert!(topology.assertions.is_none());
+        assert!(topology.to_json().expect("serializes").contains("\"status\": null"));
+        assert!(!topology.to_text().contains("status:"), "{}", topology.to_text());
+
+        let fixture = MirrorFixture::conformance();
+        let authenticated =
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
+        assert_eq!(authenticated.outcome, "valid", "{}", authenticated.reason);
+        assert_eq!(authenticated.status, None, "an affected set is not a receipt result");
+        assert!(authenticated.assertions.is_none());
+        assert!(!authenticated.to_text().contains("receipt result:"));
     }
 
     #[test]
@@ -423,7 +444,7 @@ mod tests {
         // The conformance corpus deliberately carries entries whose signatures do not verify.
         assert!(report.findings.iter().any(|f| f.code == "signature-does-not-verify"));
         assert!(report.findings.iter().any(|f| f.code == "topology-mode"));
-        assert_eq!(report.status, "unverifiable", "a finding never changes the outcome");
+        assert_eq!(report.outcome, "unverifiable", "a finding never changes the outcome");
     }
 
     #[test]
@@ -475,10 +496,10 @@ mod tests {
     #[test]
     fn an_unknown_trigger_reference_is_reported_rather_than_guessed() {
         let report = run_topology(&topology_options(TriggerRef::EntryIndex(9999)));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         let report =
             run_topology(&topology_options(TriggerRef::StatementId("sha256:nope".to_owned())));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
     }
 
     #[test]
@@ -486,7 +507,7 @@ mod tests {
         let mut options = topology_options(TriggerRef::EntryIndex(6));
         options.corpus = None;
         let report = run_topology(&options);
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert_eq!(report.reason_code, "usage");
     }
 
@@ -501,7 +522,7 @@ mod tests {
         let mut options = topology_options(TriggerRef::EntryIndex(0));
         options.corpus = Some(dir.path().join("absent.json"));
         let report = run_topology(&options);
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert_eq!(report.reason_code, "input-unreadable");
 
         // (b) opens but does not parse — still before any walking, so still `2`.
@@ -509,12 +530,12 @@ mod tests {
         std::fs::write(&path, b"{ this is not json").expect("write");
         options.corpus = Some(path);
         let report = run_topology(&options);
-        assert_eq!(report.status, "error", "a parse failure happens before any walking begins");
+        assert_eq!(report.outcome, "error", "a parse failure happens before any walking begins");
         assert_eq!(report.reason_code, "input-unparseable");
 
         // (c) parses, and the walk finds violations — findings, not verdicts, outcome `3`.
         let report = run_topology(&topology_options(TriggerRef::EntryIndex(6)));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert_eq!(report.reason_code, "topology-mode");
         assert!(!report.findings.is_empty(), "violations are reported in full");
     }
@@ -524,7 +545,7 @@ mod tests {
         let mut options = topology_options(TriggerRef::EntryIndex(12));
         options.tree_material = None;
         let report = run_topology(&options);
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("was not supplied"), "{}", report.reason);
     }
 
@@ -549,7 +570,7 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert!(report.authenticated);
         assert_eq!(report.completeness, Completeness::Complete);
         assert_eq!(report.series_usable_bound, Some(ObservationBound::RunObserved));
@@ -588,7 +609,7 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 13));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("does not govern"), "{}", report.reason);
         assert!(report.reason.contains("entry index 12"), "{}", report.reason);
 
@@ -596,7 +617,7 @@ mod tests {
         // and the governing index moves again.
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(12), 20));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("entry index 18"), "{}", report.reason);
     }
 
@@ -606,7 +627,7 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(23), 32));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("does not govern"), "{}", report.reason);
     }
 
@@ -616,14 +637,14 @@ mod tests {
         let mut options = authenticated_options(TriggerRef::EntryIndex(6), 8);
         options.checkpoint = None;
         let report = run_authenticated(&fixture, &options);
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert!(report.reason.contains("never inferred"), "{}", report.reason);
 
         let mut fixture = MirrorFixture::conformance();
         fixture.policy.endpoints.mirror = None;
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
     }
 
     #[test]
@@ -631,7 +652,7 @@ mod tests {
         let fixture = MirrorFixture::conformance().with_equivocation_at(8);
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
-        assert_eq!(report.status, "invalid");
+        assert_eq!(report.outcome, "invalid");
         assert_eq!(report.reason_code, "equivocation-at-or-beyond-floor");
     }
 
@@ -640,7 +661,7 @@ mod tests {
         let fixture = MirrorFixture::conformance().with_equivocation_at(20);
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert!(report.findings.iter().any(|f| f.code == "divergence-below-floor"));
     }
 
@@ -648,9 +669,45 @@ mod tests {
     fn an_entry_that_is_not_a_statement_is_excluded_and_reported() {
         let fixture = MirrorFixture::conformance();
         let report =
-            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(31), 32));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(29), 32));
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert!(report.findings.iter().any(|f| f.code == "entry-is-not-a-statement"));
+    }
+
+    #[test]
+    fn a_non_verifying_anchored_statement_is_void_for_a_closure_and_never_a_defect() {
+        // I-D §7.5.1 4d: a non-verifying envelope no claim rests on is VOID — excluded before
+        // any authority comparison, never effective, never traversed, and it does not affect
+        // the result. An authenticated closure over a checkpoint that commits one therefore
+        // still answers, with the void entry reported beside the answer rather than in place of
+        // it. Anything else would let one anchored envelope disable every closure over that log
+        // from its index on.
+        let fixture = MirrorFixture::conformance();
+        // Entry 18 is the retraction that governs its record at tree_size 32, which is where
+        // the corpus's first non-verifying entry is already committed.
+        let report =
+            run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(18), 32));
+        assert_eq!(
+            report.outcome, "valid",
+            "a void entry never moves the outcome: {}",
+            report.reason
+        );
+        assert!(report.affected.is_some(), "the closure is still answered: {}", report.reason);
+        assert_eq!(report.completeness, Completeness::Complete);
+
+        let void: Vec<&crate::report::Finding> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.code == "entry-is-not-a-statement")
+            .collect();
+        assert!(!void.is_empty(), "the corpus commits at least one below tree_size 32");
+        for finding in &void {
+            assert!(
+                finding.detail.contains("excluded from every decision"),
+                "the void entry is named and its exclusion stated: {}",
+                finding.detail
+            );
+        }
     }
 
     #[test]
@@ -658,7 +715,7 @@ mod tests {
         let fixture = MirrorFixture::conformance();
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(1), 8));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("not a trigger"), "{}", report.reason);
     }
 }

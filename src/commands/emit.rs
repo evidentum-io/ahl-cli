@@ -496,7 +496,7 @@ mod tests {
 
     fn ingestion() -> Value {
         json!({
-            "ahl_version": "0.3",
+            "ahl_version": "0.4",
             "type": "ingestion",
             "producer": "producer-1",
             "manifest": commitment(0x11),
@@ -569,7 +569,7 @@ mod tests {
     fn a_manifest_statement_carries_no_manifest_member_and_others_must() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut manifest = json!({
-            "ahl_version": "0.3",
+            "ahl_version": "0.4",
             "type": "manifest",
             "producer": "producer-1",
             "valid_time": "2026-08-16T12:00:00Z",
@@ -596,7 +596,7 @@ mod tests {
     fn a_manifest_log_object_is_held_to_core_spec_7_3_in_full() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = json!({
-            "ahl_version": "0.3", "type": "manifest", "producer": "p",
+            "ahl_version": "0.4", "type": "manifest", "producer": "p",
             "valid_time": "2026-08-16T12:00:00Z", "issued_at": "2026-08-16T12:00:00Z",
             "keys": [], "datasets": {}, "pipelines": {},
             "log": {
@@ -632,7 +632,7 @@ mod tests {
     fn prohibited_duration_components_are_rejected_rather_than_approximated() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = json!({
-            "ahl_version": "0.3", "type": "manifest", "producer": "p",
+            "ahl_version": "0.4", "type": "manifest", "producer": "p",
             "valid_time": "2026-08-16T12:00:00Z", "issued_at": "2026-08-16T12:00:00Z",
             "keys": [], "datasets": {}, "pipelines": {},
             "log": {
@@ -661,7 +661,7 @@ mod tests {
     fn a_scopeless_trigger_is_malformed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut payload = json!({
-            "ahl_version": "0.3", "type": "retraction", "producer": "p",
+            "ahl_version": "0.4", "type": "retraction", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "dataset": "customers",
             "record": commitment(0x22), "reason_code": "error",
@@ -678,7 +678,7 @@ mod tests {
     fn an_unregistered_reason_code_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let payload = json!({
-            "ahl_version": "0.3", "type": "retraction", "producer": "p",
+            "ahl_version": "0.4", "type": "retraction", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "dataset": "customers",
             "record": commitment(0x22), "reason_code": "because",
@@ -691,7 +691,7 @@ mod tests {
     fn a_correction_must_name_its_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut payload = json!({
-            "ahl_version": "0.3", "type": "correction", "producer": "p",
+            "ahl_version": "0.4", "type": "correction", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "dataset": "customers",
             "record": commitment(0x22), "replacement": commitment(0x23),
@@ -707,7 +707,7 @@ mod tests {
     fn a_derivation_carries_either_outputs_or_a_batch_commitment_never_both() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = json!({
-            "ahl_version": "0.3", "type": "derivation", "producer": "p",
+            "ahl_version": "0.4", "type": "derivation", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "pipeline": "scoring-v1",
             "inputs": [ { "dataset": "customers", "record": commitment(0x22) } ],
@@ -739,7 +739,7 @@ mod tests {
     fn every_derivation_input_names_the_record_a_trigger_would_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         let payload = json!({
-            "ahl_version": "0.3", "type": "derivation", "producer": "p",
+            "ahl_version": "0.4", "type": "derivation", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "pipeline": "scoring-v1",
             "inputs": [ { "dataset": "customers" } ],
@@ -788,7 +788,7 @@ mod tests {
     fn a_propagation_names_its_declared_checkpoint_in_full() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = json!({
-            "ahl_version": "0.3", "type": "propagation", "producer": "p",
+            "ahl_version": "0.4", "type": "propagation", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "trigger": commitment(0x61),
             "corpus_checkpoint": { "log_id": commitment(0x71), "tree_size": 8,
@@ -815,7 +815,7 @@ mod tests {
     fn a_key_statement_names_a_registered_action_and_a_complete_key_object() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base = json!({
-            "ahl_version": "0.3", "type": "key", "producer": "p",
+            "ahl_version": "0.4", "type": "key", "producer": "p",
             "manifest": commitment(0x11), "valid_time": "2026-08-16T12:00:00Z",
             "issued_at": "2026-08-16T12:00:00Z", "action": "add",
             "key": { "key_id": commitment(0xa1), "pubkey": "base64:AAAA", "valid_from": 9 },

@@ -323,7 +323,7 @@ fn with_locally_trusted(
     policy: &LoadedPolicy,
 ) -> std::collections::BTreeMap<String, String> {
     let mut trusted = declared.clone();
-    for key_id in &policy.trust.trusted_witness_key_ids {
+    for key_id in policy.trust.trusted_witness_keys.keys() {
         if let Some(pubkey) = declared.get(key_id) {
             trusted.insert(key_id.clone(), pubkey.clone());
         }
@@ -475,7 +475,7 @@ mod tests {
     fn a_witnessed_reconstruction_is_valid_and_bounded_by_what_this_run_observed() {
         let fixture = MirrorFixture::conformance();
         let report = run_with(&fixture, &options(&fixture, 32));
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert_eq!(report.continued_history_bound, Some(ObservationBound::RunObserved));
         assert_eq!(report.series_usable_bound, Some(ObservationBound::RunObserved));
         assert!(report
@@ -512,7 +512,7 @@ mod tests {
         // At tree_size 8 the correction at entry 6 governs the record; further along the log a
         // second correction and then a retraction supersede it.
         let early = run_with(&fixture, &options(&fixture, 8));
-        assert_eq!(early.status, "valid", "{}", early.reason);
+        assert_eq!(early.outcome, "valid", "{}", early.reason);
         let late = run_with(&fixture, &options(&fixture, 32));
         let early_governing = early
             .reconstruction
@@ -549,7 +549,7 @@ mod tests {
                 checkpoint: Some(32),
             },
         );
-        assert_eq!(report.status, "valid", "{}", report.reason);
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
         let reconstruction = report.reconstruction.expect("reconstructed");
         assert_eq!(reconstruction.status, "as-asserted");
         assert!(reconstruction.governing_trigger.is_none());
@@ -561,7 +561,7 @@ mod tests {
         let mut fixture = MirrorFixture::conformance();
         fixture.policy.endpoints.witness = Some("https://witness.unreachable".to_owned());
         let report = run_with(&fixture, &options(&fixture, 32));
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("never downlevelled"), "{}", report.reason);
     }
 
@@ -570,7 +570,7 @@ mod tests {
         let mut fixture = MirrorFixture::conformance();
         fixture.policy.endpoints.witness = None;
         let report = run_with(&fixture, &options(&fixture, 32));
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert!(report.reason.contains("not a weaker success"), "{}", report.reason);
     }
 
@@ -580,13 +580,26 @@ mod tests {
         let mut options = options(&fixture, 32);
         options.checkpoint = None;
         let report = run_with(&fixture, &options);
-        assert_eq!(report.status, "error");
+        assert_eq!(report.outcome, "error");
         assert!(report.reason.contains("never inferred"), "{}", report.reason);
 
         let mut options = self::options(&fixture, 32);
         options.valid_time = "yesterday".to_owned();
         let report = run_with(&fixture, &options);
-        assert_eq!(report.status, "invalid", "a bad artifact time is a rule against the input");
+        assert_eq!(report.outcome, "invalid", "a bad artifact time is a rule against the input");
+    }
+
+    #[test]
+    fn a_reconstruction_reports_no_receipt_result_because_it_verifies_no_receipt() {
+        // As for `closure`: the evidenced assertion set is not a receipt, so there is no §7.7
+        // result to report beside it.
+        let fixture = MirrorFixture::conformance();
+        let report = run_with(&fixture, &options(&fixture, 8));
+        assert_eq!(report.outcome, "valid", "{}", report.reason);
+        assert_eq!(report.status, None);
+        assert!(report.assertions.is_none());
+        assert!(report.to_json().expect("serializes").contains("\"status\": null"));
+        assert!(!report.to_text().contains("status:"), "{}", report.to_text());
     }
 
     #[test]
@@ -601,7 +614,7 @@ mod tests {
                 checkpoint: Some(32),
             },
         );
-        assert_eq!(report.status, "unverifiable");
+        assert_eq!(report.outcome, "unverifiable");
         assert!(report.reason.contains("nothing to reconstruct"), "{}", report.reason);
     }
 

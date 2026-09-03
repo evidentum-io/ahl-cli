@@ -194,6 +194,16 @@ pub fn load_tree_material(path: &Path, limits: LocalLimits) -> CliResult<TreeMat
     Ok(material)
 }
 
+/// What one pass over an entry's signatures established, so nothing verifies them twice.
+enum VoidVerdict {
+    /// The envelope verifies under the key set active at its own entry index.
+    Verifies,
+    /// It does not: I-D §7.5.1 4d makes it VOID.
+    DoesNotVerify,
+    /// Its signatures could not be read at all.
+    Unreadable(String),
+}
+
 /// Walk a corpus and report every rule violation as a finding.
 ///
 /// Nothing here adjudicates: the corpus is unauthenticated input, so a violation found in it
@@ -235,6 +245,29 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
         )),
     }
 
+    // Which entries are VOID, decided before anything keys on a statement id. I-D §7.5.1 4d
+    // makes a non-verifying envelope void, and §2.1's first-wins rule is about GOVERNING
+    // statements: a void entry occupies no statement id, so a later verifying copy of the same
+    // statement is the governing one and not a duplicate. Deciding this inside the loop below
+    // would accuse the copy of a §2.1 violation the erratum says is not one, purely because the
+    // void entry came first.
+    let void: BTreeMap<u64, VoidVerdict> = corpus
+        .entries
+        .iter()
+        .filter_map(|(index, envelope)| {
+            let chain = governance.chain.as_ref().ok()?;
+            envelope.get("signatures")?;
+            Some((
+                *index,
+                match chain.envelope_verifies_at(envelope, *index) {
+                    Ok(true) => VoidVerdict::Verifies,
+                    Ok(false) => VoidVerdict::DoesNotVerify,
+                    Err(source) => VoidVerdict::Unreadable(source.to_string()),
+                },
+            ))
+        })
+        .collect();
+
     for (index, envelope) in &corpus.entries {
         let Some(payload) = envelope.get("payload").filter(|value| value.is_object()) else {
             findings.push(Finding::new(
@@ -245,6 +278,8 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
         };
 
         match ahl_core::statement_id(envelope) {
+            // A void entry claims no id, so it neither occupies one nor repeats one.
+            Ok(_) if matches!(void.get(index), Some(VoidVerdict::DoesNotVerify)) => {}
             Ok(statement_id) => {
                 if let Some(first) = statement_ids.insert(statement_id.clone(), *index) {
                     findings.push(Finding::new(
@@ -320,24 +355,20 @@ pub fn walk(corpus: &Corpus) -> Vec<Finding> {
                     "entry {index} carries no signatures; unsigned objects are not AHL statements"
                 ),
             )),
-            Some(_) => {
-                if let Ok(chain) = &governance.chain {
-                    match chain.envelope_verifies_at(envelope, *index) {
-                        Ok(true) => {}
-                        Ok(false) => findings.push(Finding::new(
-                            "signature-does-not-verify",
-                            format!(
-                                "entry {index} carries a signature that does not resolve to a \
-                                 key active at that index, or does not verify"
-                            ),
-                        )),
-                        Err(source) => findings.push(Finding::new(
-                            "signature-unreadable",
-                            format!("entry {index}: {source}"),
-                        )),
-                    }
-                }
-            }
+            // Read from the pass above rather than verified again: one carried envelope, one
+            // signature check.
+            Some(_) => match void.get(index) {
+                None | Some(VoidVerdict::Verifies) => {}
+                Some(VoidVerdict::DoesNotVerify) => findings.push(Finding::new(
+                    "signature-does-not-verify",
+                    format!(
+                        "entry {index} carries a signature that does not resolve to a key \
+                         active at that index, or does not verify"
+                    ),
+                )),
+                Some(VoidVerdict::Unreadable(source)) => findings
+                    .push(Finding::new("signature-unreadable", format!("entry {index}: {source}"))),
+            },
         }
     }
 
@@ -449,9 +480,18 @@ mod tests {
             "the regenerated corpus should carry no duplicate statement ids: {findings:?}"
         );
 
+        // `governance-element-excluded` is the honest answer of an UNAUTHENTICATED walk, not a
+        // defect of the corpus. The corpus anchors a manifest that does not verify, and the
+        // manifest after it links past that one to the version that governs. Deciding it links
+        // correctly needs the void rule of I-D §7.5.1 4d, and the void rule needs signatures
+        // checked against an established key set — which is exactly what topology mode refuses
+        // to do. So the walk reports what it can see from the file: from the bytes alone, that
+        // predecessor does not link. §6 makes that a finding and never a verdict, and
+        // `Governance::resolve` — which does authenticate — accepts the same manifest.
+        assert!(codes.contains("governance-element-excluded"));
         assert_eq!(
             codes,
-            BTreeSet::from(["signature-does-not-verify"]),
+            BTreeSet::from(["governance-element-excluded", "signature-does-not-verify"]),
             "unexpected findings: {findings:?}"
         );
     }
@@ -468,7 +508,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "producer": "producer-1",
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa", "keys": [] },
                 }),
                 &key,
@@ -558,7 +598,7 @@ mod tests {
                     "type": "manifest",
                     "producer": "producer-1",
                     "predecessor": format!("sha256:{}", "aa".repeat(32)),
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa", "keys": [] },
                 }),
                 &key,
@@ -595,7 +635,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "producer": "producer-1",
-                    "keys": [ key.key_object(0) ],
+                    "keys": [ key.producer_key_object() ],
                     "log": { "log_id": "sha256:aa",
                              "keys": [ { "key_id": "sha256:aa", "pubkey": "base64:zzz" } ] },
                 }),

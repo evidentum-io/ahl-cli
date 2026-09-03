@@ -340,7 +340,9 @@ fn emit_report(
 ) -> CliResult<Outcome> {
     let rendered = if cli.json { report.to_json()? } else { report.to_text() };
     write_out(stdout, &rendered)?;
-    Ok(match report.status {
+    // The exit code follows `outcome`, the run's decision, not `status`, the receipt's own
+    // result: a receipt that verified under a policy this run did not satisfy must not exit 0.
+    Ok(match report.outcome {
         "valid" => Outcome::Valid,
         "invalid" => Outcome::Invalid,
         "unverifiable" => Outcome::Unverifiable,
@@ -443,7 +445,7 @@ mod tests {
         ]);
         assert_eq!(run.outcome, Outcome::Valid);
         assert_eq!(run.outcome.exit_code(), 0);
-        assert!(run.stdout.contains("status: valid"));
+        assert!(run.stdout.contains("outcome: valid"));
         assert!(run.stderr.is_empty(), "diagnostics leaked into stdout: {}", run.stderr);
     }
 
@@ -532,7 +534,7 @@ mod tests {
         std::fs::write(
             &payload,
             serde_json::to_vec(&serde_json::json!({
-                "ahl_version": "0.3", "type": "ingestion", "producer": "p",
+                "ahl_version": "0.4", "type": "ingestion", "producer": "p",
                 "manifest": format!("sha256:{}", "11".repeat(32)),
                 "valid_time": "2026-08-16T12:00:00Z", "issued_at": "2026-08-16T12:00:00Z",
                 "dataset": "customers", "record": format!("sha256:{}", "22".repeat(32)),
@@ -573,7 +575,9 @@ mod tests {
             "closure",
             "--unauthenticated",
             "--corpus",
-            &corpus().join("vectors/statements").display().to_string(),
+            &crate::testing::statements_with_published_tree_material(dir.path())
+                .display()
+                .to_string(),
             "--tree-material",
             &trees.display().to_string(),
             "--trigger-index",

@@ -66,6 +66,21 @@ impl Outcome {
         }
     }
 
+    /// The I-D §7.7 result value this outcome renders, where it renders one.
+    ///
+    /// `Valid`, `Invalid` and `Unverifiable` are the three values of a COMPLETED run, under the
+    /// names §7.7 spells them. [`Self::Error`] is none of them: §7.7 scopes a run that did not
+    /// complete out of the model, so it maps to `None` rather than to a fourth string.
+    #[must_use]
+    pub const fn as_result_value(self) -> Option<&'static str> {
+        match self {
+            Self::Valid => Some("verified"),
+            Self::Invalid => Some("invalid"),
+            Self::Unverifiable => Some("unverifiable"),
+            Self::Error => None,
+        }
+    }
+
     /// Precedence rank: higher wins when two outcomes are combined.
     ///
     /// A rule fired against the artifact outranks missing external evidence, which outranks a
@@ -136,6 +151,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_a_completed_run_renders_one_of_the_three_result_values() {
+        assert_eq!(Outcome::Valid.as_result_value(), Some("verified"));
+        assert_eq!(Outcome::Invalid.as_result_value(), Some("invalid"));
+        assert_eq!(Outcome::Unverifiable.as_result_value(), Some("unverifiable"));
+        // A local failure is not one of the three values and must never be rendered as one.
+        assert_eq!(Outcome::Error.as_result_value(), None);
     }
 
     #[test]

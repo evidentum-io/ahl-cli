@@ -52,11 +52,43 @@ makes a verifier useless in CI.
 | `0` | `valid` | every required rule verified |
 | `1` | `invalid` | a normative rule fired against the artifact: structure, signature, proof, cross-field rule, equivocation between authenticated checkpoints, unknown claim or statement type |
 | `2` | `error` | the CLI could not begin: usage, unreadable or unparseable policy, output-path I/O, internal invariant |
-| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established — including a combination the frozen container format defines no material to evidence (`format-conflict`) |
+| `3` | `unverifiable` | well-formed, nothing disproved, but required evidence could not be established: a capability the verifier lacks, a local configuration it has not been given, or a local budget it has set |
 
 `0`, `1` and `2` carry exactly their `atl-cli` meanings, so a consumer written against the
 family canon still reads them correctly. `3` is a documented AHL extension and is **never**
 rendered as INVALID in any surface — text, JSON, or exit status.
+
+**`status` is the receipt's result; `outcome` is this run's decision, and the exit code follows
+`outcome`.** `status` is exactly the result model's reduction of `assertions[]` — one of `valid`,
+`invalid` and `unverifiable` — so two conformant verifiers reach the same value over the same
+bytes whatever either one's local policy says, and nothing rewrites it. It is `null` wherever
+there is no such result to report, and that is exactly two cases: a command that verifies no
+receipt (`closure`, `reconstruct`), and a run that did not complete. `error` is therefore a value
+of `outcome` alone — the result model has three values and a non-completing run reaches none of
+them, so reporting one under `status` would invent a fourth. `outcome` is `status` after the locally configured conditions in
+`policy_overlays[]` are applied — a move from `valid` to `unverifiable` and nothing else.
+Almost always the two are equal; where they differ, the text surface says so on its own line
+(`receipt result: valid; policy: unverifiable (witness-freshness)`) so no reader mistakes a
+condition of this run for the receipt's own result, and the boundary — the one thing rendered in
+words that assert the property — is dropped along with the `valid`.
+
+For `verify`, the first three are the three values of the AHL result model: a completed run
+reaches exactly one of `verified`, `invalid` and `unverifiable`, and which one a rejection
+produces is decided by `ahl-core` from the rule that fired, never re-derived here — a
+verifier-local condition reported as `invalid` would let two verifiers make contradictory
+statements about one artifact. A run that does not complete reaches no result at all and is
+reported as the local failure it is, which is exit `2`.
+
+The result is scalar — one receipt, one value — but it is not the whole report. `verify` also
+reports one entry per required assertion of the receipt, in `assertions[]`, because the result
+alone does not say which assertion produced it and a reader cannot act on `unverifiable`
+without knowing what was missing. A receipt whose content binding cannot be computed reports
+`unverifiable` as its result and `verified` on the assertions that did hold. A boundary is
+rendered where the final status is `valid` and nowhere else — including where a CLI-level
+assertion, and not the core, moved the status — and no result is ever expressed by rewriting the
+receipt's own assurance fields: the assurance block is reproduced as carried on every outcome,
+so a content binding the verifier could not compute is never re-rendered as
+`content_binding: "none"`.
 
 Where more than one thing goes wrong: a rule fired against the artifact (`1`) outranks missing
 external evidence (`3`), which outranks a local-environment failure (`2`) — except that a local
@@ -97,11 +129,12 @@ the output carries no verdict field for a consumer to misread.
 [policy]
 genesis_entry_id = "sha256:be129d…"
 genesis_key_ids  = ["sha256:34750f…"]
-trusted_witness_key_ids = []          # optional
 
-[policy.limits]                        # optional; receipt-format §3.1 budgets
-max_depth = 4
-max_embedded = 64
+[policy.trusted_witness_keys."sha256:c5b940…"]   # optional; whole entries, never bare ids
+pubkey     = "base64:ypOsFw…"
+witness_id = "witness-1"
+
+[policy.limits]                        # optional; the two verifier-local budgets
 max_decoded_bytes = 8388608
 max_work_units = 100000
 
@@ -138,6 +171,17 @@ is the attack this closes.
 
 Endpoints live outside `[policy]` deliberately: reading a URL must never look like reading a
 trust anchor.
+
+A trusted witness key is configured as a whole entry — `pubkey` and `witness_id` beside the key
+id — because the witness identity is inside the cosignature preimage: a key trusted to cosign
+for one witness is not thereby trusted to cosign as another.
+
+`[policy.limits]` carries the two verifier-local budgets and nothing else. The embedded nesting
+depth (4) and embedded-receipt count (64) are fixed properties of the artifact, decided
+identically by every verifier, so there is no key for them: a verifier able to lower either
+would refuse a receipt another verifier accepts. Unknown keys are refused rather than ignored,
+so a policy still carrying `max_depth` or `max_embedded` is reported as an unusable policy
+(exit `2`) rather than silently read with the member dropped.
 
 ## Keys
 
@@ -452,11 +496,67 @@ for them are gone:
   declares `equivocation` rather than the removed `inconsistent`, so both are exercised as
   positives.
 
-## Two additions to the §6 field list
+## Six additions to the §6 field list
 
-`--json` carries two members §6's fixed list does not name, both added visibly rather than
+`--json` carries six members §6's fixed list does not name, each added visibly rather than
 silently:
 
+- `assertions` — one entry per required assertion of the verified receipt, as
+  `{assertion, outcome, receipt_path, detail, rests_on}`, with the assertion names and the three outcome
+  values `ahl-core` reports. The result model requires the findings to be reported alongside
+  the scalar result, and `findings[]` is a different list: it carries this crate's own
+  diagnostic codes, such as `witness-stale`. `null` for a command that verifies no receipt.
+
+  The list is the core's required assertions and **nothing else**: the result model enumerates
+  them exactly, and a verifier-local condition among them would be this crate asserting
+  something about the receipt another conformant verifier would not.
+
+  A rejection the CLI reaches before the core is entered reports its assertion too, as a
+  one-element list: `structure` for bytes that are not JSON, are not the JCS serialization, or
+  name no adaptor profile, and `adaptor-profile` for a profile local policy does not hold. An
+  `error` (`2`) result carries `null` — it reached no result value at all and is not a report
+  about the receipt.
+
+  `reason_code` names the assertion that **caused** the result, not the first non-`verified`
+  entry in the list. The two differ whenever a budget runs out: every assertion the run could
+  not reach then inherits the gap and carries `rests_on: "resource-limits"`, while the fact the
+  reader needs — which budget, and the value in force — is on the cause. `rests_on` is `null` on
+  a cause and names an assertion on a derived entry, so a consumer can reproduce the choice from
+  the list rather than parse it out of prose. Where the core reached a result of its own, its
+  cause is the headline; a policy overlay leads only where the core reached `verified`.
+- `informative` — the void entries the run inspected, each `{entry_index, reason, receipt_path}`
+  with `reason` in `signature-invalid | key-not-active`. A non-verifying envelope the receipt
+  does not rest on — a purported competing-trigger envelope, an entry of a propagation prefix,
+  any entry an enumeration reveals — is **void**: excluded before any authority comparison,
+  never effective, never traversed, and it does not affect the result. These are therefore not
+  findings and not assertions: they carry no outcome, never enter the reduction, never reach
+  `status` or `outcome`, and are never rendered as a defect. The text surface lists them under a
+  `void entries:` heading after the assertion table. Empty where the run found none, `null`
+  exactly where `assertions` is.
+
+  The rule is not a leniency. A log anchors opaque bytes and validates none of them, so were a
+  void entry a defect of every later receipt, any party able to anchor one envelope could
+  disable every enumerated claim of that log from that index on.
+- `policy_overlays` — locally configured conditions this run applied on top of the receipt's own
+  required assertions, each `{overlay, outcome, detail}`. Empty where none applied; this build
+  has one, `witness-freshness`, present only where `--require-fresh` is given and a carried
+  cosignature is older than the cadence plus grace period the governing manifest declares.
+  Freshness is a property of the run's evaluation time rather than of the receipt, so it is
+  verifier-local by construction: an overlay's `outcome` is `unverifiable` and never `invalid`,
+  and without the flag freshness is a `findings[]` entry (`witness-stale`) and not an overlay
+  at all.
+
+  An overlay is evaluated on every completed run and reported whatever the receipt's result was,
+  but only over material the run established: on a rejected receipt the freshness overlay is
+  emitted only where the receipt carries a cosignature at all and its `witnesses` and
+  `checkpoint-authentication` assertions verified, since a receipt may carry `witnessed: true`
+  beside a cosignature that does not. It can only ever move a `valid` result: a demonstrated
+  defect outranks a condition of this run, so an overlay listed beside an `invalid` receipt is
+  informative and changes nothing.
+- `outcome` — **this run's decision**, always present: `valid`, `invalid`, `unverifiable` or
+  `error`. For a receipt it is `status` after the conditions in `policy_overlays[]` are applied;
+  for a command that verifies no receipt it is that command's own result, with `status` `null`
+  beside it. See above.
 - `receipt_note` — the receipt's informative `note`, quoted and attributed. §6 requires it to be
   displayed as a quotation attributed to the receipt and never as a finding, which the text
   surface alone could not give a `--json` consumer.

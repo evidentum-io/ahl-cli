@@ -421,17 +421,28 @@ impl Governance {
                 "the genesis manifest must carry no predecessor reference".to_owned(),
             ));
         }
+        // A configured anchor DIFFERING from the carried one is `unverifiable`, not `invalid`,
+        // and the classification is made here rather than repaired by a caller: the material
+        // may be a perfectly valid corpus that this verifier simply is not configured for, and
+        // nothing about it has been disproved. The same holds for the key fingerprints, which
+        // are the same trust anchor read at a finer grain.
         let anchor = entry_id(envelope);
         if anchor != policy.genesis_entry_id {
-            return Err(CliError::RuleFired(format!(
-                "the anchored genesis manifest digests to {anchor}, local policy configures {}",
+            return Err(CliError::GenesisAnchorMismatch(format!(
+                "the anchored genesis manifest digests to {anchor}, local policy configures {}; \
+                 this material is not the corpus this verifier is anchored to, which is a gap \
+                 in local configuration rather than a defect shown in the material",
                 policy.genesis_entry_id
             )));
         }
         let declared = manifest_key_ids(payload)?;
-        if declared != policy.genesis_key_ids {
-            return Err(CliError::RuleFired(
-                "the genesis manifest's producer key fingerprints are not the configured ones"
+        // Compared only where local policy holds the fingerprints: `None` is "policy holds
+        // none", and its absence is not a defect of the chain.
+        if policy.genesis_key_ids.as_ref().is_some_and(|configured| &declared != configured) {
+            return Err(CliError::GenesisAnchorMismatch(
+                "the genesis manifest's producer key fingerprints are not the configured ones; \
+                 the fingerprints are the same trust anchor read at a finer grain, so this is \
+                 the same gap in local configuration"
                     .to_owned(),
             ));
         }
@@ -479,13 +490,14 @@ impl Governance {
         let Some((snapshot_index, manifest)) = self.snapshot_manifest(index) else {
             return keys;
         };
-        // A key object is in force from its own `valid_from_index` forward (§7.2): declaring
-        // a key is not the same as it being in force, and an envelope signed before its
-        // activation index is signed by a key the corpus had not yet adopted. The comparison
-        // is `<=` here, unlike the `<` of `log_keys_for`, because both sides are entry indexes
-        // — an envelope *at* the activation index may already use the key, whereas a
-        // checkpoint of size `n` commits only `[0, n)`.
-        for (key_id, pubkey) in in_force_key_pairs(manifest, index) {
+        // The producer key array IS the key state at the manifest's own entry index: it
+        // discards the prior snapshot in full, and activity after it is decided by the `key`
+        // statements below, in entry order. There is deliberately no per-key activation index
+        // to honour here — a producer key object carries `{key_id, pubkey}` and nothing else —
+        // so a second activation mechanism cannot compete with the snapshot. Log and witness
+        // key objects are the ones that carry `valid_from_index`, and `log_keys_for` and
+        // `witness_keys_for` apply it.
+        for (key_id, pubkey, _) in bound_key_objects(manifest) {
             keys.insert(key_id, pubkey);
         }
         for event in self
@@ -824,9 +836,15 @@ fn moved_epoch(payload: &Value, genesis_epoch: Option<&str>) -> Option<String> {
 ///   §7.3.1, and `checkpoint_cadence` is greater than zero — a zero maximum gap states an
 ///   obligation no published series could ever meet;
 /// * `cadence_epoch` is RFC 3339;
-/// * every key object — producer, log or witness, which §7.2 gives one form — is
-///   `{key_id, pubkey, valid_from_index}`, the last an entry index, which is an unsigned
-///   integer because a negative or fractional value is not an index into an append-only log.
+/// * a log or witness key object is `{key_id, pubkey, valid_from_index}`, the last an entry
+///   index, which is an unsigned integer because a negative or fractional value is not an
+///   index into an append-only log;
+/// * a producer key object is `{key_id, pubkey}` and nothing else. The two shapes differ on
+///   purpose: a log or witness key may be declared valid from an index later than the
+///   manifest's own, while the producer array IS the producer key state at the manifest's
+///   entry index and activity after it is decided by `key` statements in entry order. A
+///   per-key index there would be a second activation mechanism competing with the snapshot,
+///   so a member beyond the two is a schema failure rather than a tolerated extra.
 ///
 /// The id member is `log_id` with no alias for `id`, for the reason recorded in the module
 /// documentation. What this does not fix is the encoding of `pubkey`, which core §2.3.6 leaves
@@ -836,7 +854,7 @@ fn moved_epoch(payload: &Value, genesis_epoch: Option<&str>) -> Option<String> {
 /// nothing is evidence and every violation is a finding, which is what
 /// [`Governance::log_object_findings`] reports.
 fn validate_manifest_schema(payload: &Value) -> Result<(), String> {
-    key_objects(payload, "keys")?;
+    producer_key_objects(payload)?;
 
     let log = payload
         .get("log")
@@ -928,18 +946,48 @@ fn family_string(what: &str, value: &str) -> Result<(), String> {
 /// manifest chose, and a checkpoint signed by the wrong key then verifies. Doing this once,
 /// where the map is built, is what makes every consumer of the map safe.
 fn key_objects(container: &Value, what: &str) -> Result<(), String> {
-    let keys = container
-        .get("keys")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("`{what}` is REQUIRED and must be an array"))?;
-    for (at, object) in keys.iter().enumerate() {
-        let named = format!("{what}[{at}]");
+    for (named, object) in keys_array(container, what)? {
         bind_key(object, &named)?;
         if object.get("valid_from_index").and_then(Value::as_u64).is_none() {
             return Err(format!("`{named}.valid_from_index` is not an entry index"));
         }
     }
     Ok(())
+}
+
+/// Validate the manifest's own `keys` array: producer key objects, which carry exactly
+/// `{key_id, pubkey}`.
+///
+/// The extra-member check is not pedantry. `valid_from_index` on a producer key object would
+/// read as an activation index, and a verifier that honoured it would resolve producer
+/// signatures against a key set the snapshot rule does not produce; one that ignored it would
+/// accept a manifest asserting something it never evaluates. Refusing the member is what keeps
+/// the snapshot the only producer-key activation mechanism.
+fn producer_key_objects(payload: &Value) -> Result<(), String> {
+    for (named, object) in keys_array(payload, "keys")? {
+        bind_key(object, &named)?;
+        let members = object.as_object().map_or(0, serde_json::Map::len);
+        if members != 2 {
+            return Err(format!(
+                "`{named}` is a producer key object and carries exactly `key_id` and \
+                 `pubkey`; a per-key activation index would compete with the manifest's own \
+                 snapshot"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One `keys` array element, paired with the name it is reported under.
+type NamedKeyObject<'a> = (String, &'a Value);
+
+/// The `keys` array of `container`, each element paired with the name it is reported under.
+fn keys_array<'a>(container: &'a Value, what: &str) -> Result<Vec<NamedKeyObject<'a>>, String> {
+    let keys = container
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("`{what}` is REQUIRED and must be an array"))?;
+    Ok(keys.iter().enumerate().map(|(at, object)| (format!("{what}[{at}]"), object)).collect())
 }
 
 /// Read one `key_id -> pubkey` binding, **recomputing the id from the key**.
@@ -1049,20 +1097,6 @@ fn active_key_pairs(container: &Value, tree_size: u64) -> Vec<(String, String)> 
         .collect()
 }
 
-/// `key_id -> pubkey` for the key objects of `container` in force at **entry index** `index`.
-///
-/// The comparison is `<=`, unlike the `<` of [`active_key_pairs`], because both sides are
-/// entry indexes here: a key is valid *from* its `valid_from_index`, so an envelope anchored at
-/// exactly that index may already use it. `log_keys_for` converts between scales — a checkpoint
-/// of size `n` commits `[0, n)` — and is strict for that reason.
-fn in_force_key_pairs(container: &Value, index: u64) -> Vec<(String, String)> {
-    bound_key_objects(container)
-        .into_iter()
-        .filter(|(_, _, valid_from)| *valid_from <= index)
-        .map(|(key_id, pubkey, _)| (key_id, pubkey))
-        .collect()
-}
-
 fn manifest_key_ids(manifest: &Value) -> CliResult<BTreeSet<String>> {
     let keys = manifest.get("keys").and_then(Value::as_array).ok_or_else(|| {
         CliError::RuleFired("the genesis manifest carries no producer `keys` array".to_owned())
@@ -1122,7 +1156,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "producer": "producer-1",
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "datasets": {
                     "customers": {
                         "commitment_mode": "keyed",
@@ -1155,7 +1189,7 @@ mod tests {
         let key = producer(1);
         let manifest = |log: Value| {
             ahl_core::envelope(
-                json!({ "type": "manifest", "keys": [ key.key_object(0) ], "log": log }),
+                json!({ "type": "manifest", "keys": [ key.producer_key_object() ], "log": log }),
                 &key,
             )
         };
@@ -1187,7 +1221,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[]),
             }),
             &key,
@@ -1198,7 +1232,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": format!("sha256:{}", "77".repeat(32)),
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[]),
             }),
             &key,
@@ -1276,7 +1310,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ second_key.key_object(5) ],
+                "keys": [ second_key.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[]),
             }),
             &first_key,
@@ -1334,7 +1368,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "log": { "log_id": family(0xcc), "operator": "op",
                          "adaptor": { "id": "ahl-test-log-v1", "hash": family(0xbb) },
                          "cadence_epoch": "2026-01-01T00:00:00Z",
@@ -1359,7 +1393,7 @@ mod tests {
         let envelope = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "log": { "log_id": family(0xaa), "checkpoint_cadence": "P1Y",
                          "witness_grace_period": "PT15M", "keys": [] },
             }),
@@ -1376,7 +1410,7 @@ mod tests {
         let envelope = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ key.key_object(0) ],
+                "keys": [ key.producer_key_object() ],
                 "log": { "log_id": family(0xaa), "checkpoint_cadence": "PT0S",
                          "witness_grace_period": "PT15M", "keys": [] },
             }),
@@ -1448,7 +1482,7 @@ mod tests {
     fn policy_for(entries: &[(u64, Value)], key: &TestKey) -> TrustPolicy {
         TrustPolicy {
             genesis_entry_id: entry_id(&entries[0].1),
-            genesis_key_ids: BTreeSet::from([key.key_id()]),
+            genesis_key_ids: Some(BTreeSet::from([key.key_id()])),
             ..TrustPolicy::default()
         }
     }
@@ -1460,7 +1494,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(predecessor),
-                "keys": [ attacker.key_object(0) ],
+                "keys": [ attacker.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[ log_key.key_object(0) ]),
             }),
             attacker,
@@ -1523,7 +1557,7 @@ mod tests {
         let entries = vec![(0, early), (1, first.clone())];
         let policy = TrustPolicy {
             genesis_entry_id: entry_id(&first),
-            genesis_key_ids: BTreeSet::from([honest.key_id()]),
+            genesis_key_ids: Some(BTreeSet::from([honest.key_id()])),
             ..TrustPolicy::default()
         };
         // The genesis is not at index 0 here, so there is no usable anchor at all.
@@ -1540,7 +1574,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ rotated.key_object(5) ],
+                "keys": [ rotated.producer_key_object() ],
                 "log": log_object(&family(0xcc), &[ producer(3).key_object(0) ]),
             }),
             &honest,
@@ -1563,7 +1597,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(&family(0xcc), &[]),
             }),
             &honest,
@@ -1573,7 +1607,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(&family(0xdd), &[]),
             }),
             &honest,
@@ -1603,7 +1637,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "predecessor": entry_id(&first),
-                    "keys": [ honest.key_object(0) ],
+                    "keys": [ honest.producer_key_object() ],
                     "log": log,
                 }),
                 &honest,
@@ -1648,7 +1682,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "predecessor": entry_id(&first),
-                    "keys": [ honest.key_object(0) ],
+                    "keys": [ honest.producer_key_object() ],
                     "log": log_object(&family(0xcc), std::slice::from_ref(&object)),
                 }),
                 &honest,
@@ -1705,7 +1739,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(
                     &family(0xaa),
                     &[json!({
@@ -1727,7 +1761,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
             }),
             &honest,
@@ -1748,7 +1782,7 @@ mod tests {
         let genesis = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(
                     &family(0xaa),
                     &[
@@ -1798,29 +1832,93 @@ mod tests {
     }
 
     #[test]
-    fn a_producer_key_counts_only_from_its_own_activation_index() {
-        // The same rule on the entry-index scale, where the comparison is `<=`: a key is valid
-        // *from* its `valid_from_index`, so an envelope anchored at exactly that index may
-        // already use it.
+    fn a_configured_anchor_that_differs_is_unverifiable_at_its_source() {
+        // I-D §7.5.1 4a and the note's rule 1: a configured anchor differing from the carried
+        // one is `unverifiable`. Classified here rather than repaired downstream, so a caller
+        // that does not pass the result through a remote-candidate wrapper still gets the right
+        // answer, and so the two paths cannot drift apart.
         let honest = producer(1);
-        let later = producer(2);
-        let genesis = ahl_core::envelope(
-            json!({
-                "type": "manifest",
-                "keys": [ honest.key_object(0), later.key_object(7) ],
-                "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
-            }),
+        let entries = chain("log_id");
+        let anchored = policy_for(&entries, &honest);
+
+        let mut elsewhere = TrustPolicy {
+            genesis_entry_id: format!("sha256:{}", "99".repeat(32)),
+            ..anchored.clone()
+        };
+        let error = Governance::resolve(&entries, &elsewhere).expect_err("another corpus");
+        assert!(matches!(error, CliError::GenesisAnchorMismatch(_)), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert_eq!(error.reason_code(), "genesis-anchor-mismatch");
+
+        // The fingerprints are the same anchor at a finer grain, and answer the same way.
+        elsewhere.genesis_entry_id = anchored.genesis_entry_id;
+        elsewhere.genesis_key_ids = Some(BTreeSet::from([format!("sha256:{}", "88".repeat(32))]));
+        let error = Governance::resolve(&entries, &elsewhere).expect_err("other fingerprints");
+        assert!(matches!(error, CliError::GenesisAnchorMismatch(_)), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+
+        // A defect in the anchor's own material is still a defect: only the CONFIGURATION gap
+        // moved, not the adjudication of what the chain carries.
+        let broken = ahl_core::envelope(
+            json!({ "type": "manifest", "keys": [], "log": log_object(&family(0xaa), &[]) }),
             &honest,
         );
-        let entries = vec![(0, genesis)];
+        let entries = vec![(0, broken)];
         let policy = TrustPolicy {
             genesis_entry_id: entry_id(&entries[0].1),
-            genesis_key_ids: BTreeSet::from([honest.key_id(), later.key_id()]),
+            genesis_key_ids: None,
+            ..TrustPolicy::default()
+        };
+        let error = Governance::resolve(&entries, &policy).expect_err("schema failure");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid, "{error}");
+    }
+
+    #[test]
+    fn a_producer_key_snapshot_is_the_whole_state_and_carries_no_per_key_activation_index() {
+        // The producer array IS the key state at the manifest's entry index, so every member
+        // of it is in force from that index on. A per-key activation index there would be a
+        // second activation mechanism competing with the snapshot, so carrying one is a schema
+        // failure rather than a member a verifier may quietly honour or quietly ignore —
+        // either reading resolves a producer signature against a key set the snapshot rule
+        // does not produce.
+        let honest = producer(1);
+        let later = producer(2);
+        let manifest = |keys: Value| {
+            ahl_core::envelope(
+                json!({
+                    "type": "manifest",
+                    "keys": keys,
+                    "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
+                }),
+                &honest,
+            )
+        };
+
+        let entries =
+            vec![(0, manifest(json!([honest.producer_key_object(), later.producer_key_object()])))];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: Some(BTreeSet::from([honest.key_id(), later.key_id()])),
             ..TrustPolicy::default()
         };
         let (resolved, _) = Governance::resolve(&entries, &policy).expect("conformant");
-        assert!(!resolved.producer_keys_at(6).contains_key(&later.key_id()));
-        assert!(resolved.producer_keys_at(7).contains_key(&later.key_id()));
+        for index in [0, 6, 7] {
+            assert!(
+                resolved.producer_keys_at(index).contains_key(&later.key_id()),
+                "every member of the snapshot is in force from the manifest's index on"
+            );
+        }
+
+        // The same manifest with an activation index on a producer key object is refused, and
+        // the trust anchor is the one version no later one can repair.
+        let with_index = vec![(0, manifest(json!([honest.key_object(0)])))];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&with_index[0].1),
+            genesis_key_ids: Some(BTreeSet::from([honest.key_id()])),
+            ..TrustPolicy::default()
+        };
+        let error = Governance::resolve(&with_index, &policy).expect_err("schema failure");
+        assert!(error.to_string().contains("producer key object"), "{error}");
     }
 
     #[test]
@@ -1837,7 +1935,7 @@ mod tests {
                 json!({
                     "type": "manifest",
                     "predecessor": entry_id(&first),
-                    "keys": [ honest.key_object(0) ],
+                    "keys": [ honest.producer_key_object() ],
                     "log": log,
                 }),
                 &honest,
@@ -1866,7 +1964,7 @@ mod tests {
         let honest = producer(1);
         let mut payload = json!({
             "type": "manifest",
-            "keys": [ honest.key_object(0) ],
+            "keys": [ honest.producer_key_object() ],
             "log": log_object(&family(0xaa), &[ producer(3).key_object(0) ]),
         });
         payload["log"]["cadence_epoch"] = json!("not-a-timestamp");
@@ -1888,7 +1986,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log,
             }),
             &honest,
@@ -1912,7 +2010,7 @@ mod tests {
             json!({
                 "type": "manifest",
                 "predecessor": entry_id(&first),
-                "keys": [ producer(2).key_object(9) ],
+                "keys": [ producer(2).producer_key_object() ],
                 "log": log_object(&family(0xcc), &[ producer(3).key_object(0) ]),
             }),
             &honest,
@@ -1950,7 +2048,7 @@ mod tests {
         assert!(error.to_string().contains("local policy configures"), "{error}");
 
         let mut policy = policy_for(&entries, &honest);
-        policy.genesis_key_ids = BTreeSet::from([format!("sha256:{}", "88".repeat(32))]);
+        policy.genesis_key_ids = Some(BTreeSet::from([format!("sha256:{}", "88".repeat(32))]));
         assert!(Governance::resolve(&entries, &policy).is_err());
     }
 
@@ -1962,7 +2060,7 @@ mod tests {
         let forged = ahl_core::envelope(
             json!({
                 "type": "manifest",
-                "keys": [ honest.key_object(0) ],
+                "keys": [ honest.producer_key_object() ],
                 "log": log_object(&family(0xaa), &[]),
             }),
             &stranger,

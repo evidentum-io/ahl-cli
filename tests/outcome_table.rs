@@ -15,6 +15,8 @@
 
 mod common;
 
+use std::fmt::Write as _;
+
 use common::{
     ahl_cli, corpus, exchange_body, fixtures, mutate_receipt, mutate_transcript, policy,
     set_exchange_body, PolicySpec,
@@ -101,7 +103,7 @@ fn row_output_path_io_failure_is_error() {
     std::fs::write(
         &payload,
         serde_json::to_vec(&serde_json::json!({
-            "ahl_version": "0.3", "type": "ingestion", "producer": "p",
+            "ahl_version": "0.4", "type": "ingestion", "producer": "p",
             "manifest": format!("sha256:{}", "11".repeat(32)),
             "valid_time": FIXED, "issued_at": FIXED,
             "dataset": "customers", "record": format!("sha256:{}", "22".repeat(32)),
@@ -259,7 +261,7 @@ fn row_an_anchored_statement_of_an_unknown_type_is_invalid_never_inert() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "33",
+        &common::newest_published_size("mirror-transcript-unknown-statement.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -528,7 +530,7 @@ fn row_a_forged_key_binding_never_authorizes_a_successor_manifest() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "34",
+        &common::newest_published_size("mirror-transcript-forged-key-transition.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -612,7 +614,7 @@ fn row_a_log_key_that_is_not_active_yet_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "33",
+        &common::newest_published_size("mirror-transcript-inactive-log-key.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -661,7 +663,7 @@ fn row_a_log_key_id_that_does_not_recompute_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "33",
+        &common::newest_published_size("mirror-transcript-mismatched-key-id.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -711,7 +713,7 @@ fn row_a_manifest_version_moving_the_cadence_epoch_is_unverifiable() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "33",
+        &common::newest_published_size("mirror-transcript-moved-epoch.json").to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
     ]);
@@ -791,14 +793,17 @@ fn row_a_consistency_proof_carrying_a_non_family_string_is_unusable_remote_evide
 
 #[test]
 fn row_unsupported_specification_version_is_unverifiable() {
+    // §7.7: "an artifact declaring a revision earlier than the one this document defines" is a
+    // capability the verifier lacks, never a defect of the artifact.
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = policy(dir.path(), &PolicySpec::default());
     let receipt = mutate_receipt(dir.path(), "statement-anchored-valid.ahl", |value| {
-        value["spec_version"] = serde_json::json!("0.4.0");
+        value["spec_version"] = serde_json::json!("0.5.0");
     });
     let run = verify(&policy_path.display().to_string(), &receipt.display().to_string(), &[]);
     assert_eq!(run.code, 3, "{}", run.stderr);
-    assert!(run.output().contains("profile-limitation"), "{}", run.output());
+    assert!(run.output().contains("versions"), "{}", run.output());
+    assert!(!run.output().contains("outcome: invalid"), "{}", run.output());
 }
 
 #[test]
@@ -825,26 +830,95 @@ fn row_keyed_binding_without_an_authorized_dataset_key_is_unverifiable() {
         &[],
     );
     assert_eq!(run.code, 3, "never downgraded to plain-verified: {}", run.stderr);
-    assert!(run.output().contains("dataset-key-not-held"), "{}", run.output());
+    let output = run.output();
+    // The content binding is the assertion that produced the result, and it is reported
+    // alongside the ones that did hold.
+    assert!(output.contains("content-binding: unverifiable"), "{output}");
+    assert!(output.contains("anchoring: verified"), "{output}");
+    // §7.7: "a content binding the verifier cannot compute MUST NOT be re-rendered as
+    // `content_binding: \"none\"`". The block is reproduced as the receipt carries it.
+    assert!(output.contains("content_binding: keyed-authorized"), "{output}");
+    assert!(!output.contains("content_binding: none"), "{output}");
+    assert!(!output.contains("boundary:"), "only `verified` renders a boundary: {output}");
 }
 
 #[test]
 fn row_receipt_limit_exhausted_is_unverifiable() {
+    // §7.8: "A verifier MUST report WHICH budget was exhausted and the value that was in force,
+    // since `unverifiable` without that is not actionable." Both budgets, because an exhausted
+    // one leaves every assertion the run could not reach inheriting the gap, and a report that
+    // led with one of those would name the symptom while the actionable fact sat further down.
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut text =
-        std::fs::read_to_string(policy(dir.path(), &PolicySpec::default())).expect("read policy");
-    text.push_str("\n[policy.limits]\nmax_decoded_bytes = 16\n");
-    let path = dir.path().join("tiny.toml");
-    std::fs::write(&path, text).expect("write");
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("mode");
+    for (budget, value, named) in [
+        ("max_decoded_bytes", "16", "decoded size"),
+        ("max_work_units", "3", "verification work units"),
+    ] {
+        let mut text = std::fs::read_to_string(policy(dir.path(), &PolicySpec::default()))
+            .expect("read policy");
+        let _ = writeln!(text, "\n[policy.limits]\n{budget} = {value}");
+        let path = dir.path().join(format!("{budget}.toml"));
+        std::fs::write(&path, text).expect("write");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("mode");
+        let run = verify(
+            &path.display().to_string(),
+            &corpus().join("receipts/statement-anchored-valid.ahl").display().to_string(),
+            &[],
+        );
+        assert_eq!(run.code, 3, "rejection, never a degraded acceptance: {}", run.stderr);
+        let output = run.output();
+        // The HEADLINE names the budget: the reason line is the cause, never an assertion that
+        // merely inherited the gap.
+        assert!(output.contains("reason: [resource-limits]"), "{output}");
+        assert!(!output.contains("reason: [versions]"), "{output}");
+        assert!(output.contains(named), "the budget is named: {output}");
+        assert!(output.contains(value), "the value in force is named: {output}");
+        // And the assertions the run could not reach are still reported, each naming the cause
+        // it rests on rather than being dropped or presented as a finding of its own.
+        assert!(output.contains("resource-limits: unverifiable"), "{output}");
+        assert!(output.contains("rests on `resource-limits`"), "{output}");
+    }
+}
+
+#[test]
+fn row_a_rejection_names_the_assertion_that_produced_it_and_the_ones_that_held() {
+    // §7.7: a verifier "MUST report the findings alongside" the result, "because the result
+    // alone does not say which assertion produced it". `invalid` on one assertion does not
+    // make the receipt's other assertions unreported.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default());
     let run = verify(
-        &path.display().to_string(),
-        &corpus().join("receipts/statement-anchored-valid.ahl").display().to_string(),
+        &policy_path.display().to_string(),
+        &corpus().join("receipts/overclaim-must-fail.ahl").display().to_string(),
         &[],
     );
-    assert_eq!(run.code, 3, "rejection, never a degraded acceptance: {}", run.stderr);
-    assert!(run.output().contains("limit-exhausted"), "{}", run.output());
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let output = run.output();
+    assert!(output.contains("outcome: invalid"), "{output}");
+    assert!(output.contains("cross-field: invalid"), "{output}");
+    assert!(output.contains("anchoring: verified"), "{output}");
+    assert!(!output.contains("boundary:"), "only `verified` renders a boundary: {output}");
+}
+
+#[test]
+fn row_a_rejection_the_core_classes_unverifiable_is_never_reclassified_here() {
+    // The class of a rejection is the core's answer, from the rule that fired. The corpus's one
+    // non-`invalid` negative vector is a declared-mode envelope naming a producer-key
+    // transition the mode does not carry (I-D §7.4).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = policy(dir.path(), &PolicySpec::default());
+    let run = verify(
+        &policy_path.display().to_string(),
+        &corpus()
+            .join("receipts/statement-anchored-uncarried-key-transition-must-fail.ahl")
+            .display()
+            .to_string(),
+        &[],
+    );
+    assert_eq!(run.code, 3, "{}", run.output());
+    let output = run.output();
+    assert!(output.contains("outcome: unverifiable"), "{output}");
+    assert!(output.contains("envelope-validity: unverifiable"), "{output}");
 }
 
 #[test]
@@ -912,7 +986,7 @@ fn a_forged_later_manifest_never_authenticates_a_checkpoint() {
         "--trigger-index",
         "6",
         "--checkpoint",
-        "33",
+        &common::newest_published_size("mirror-transcript-forged-manifest.json").to_string(),
         "--transcript",
         &transcript.display().to_string(),
     ]);
@@ -1107,7 +1181,9 @@ fn row_a_rule_violation_inside_a_topology_corpus_keeps_the_outcome_at_three() {
         "closure",
         "--unauthenticated",
         "--corpus",
-        &corpus().join("vectors/statements").display().to_string(),
+        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+            .display()
+            .to_string(),
         "--tree-material",
         &fixtures().join("tree-material.json").display().to_string(),
         "--trigger-index",
@@ -1337,17 +1413,51 @@ fn row_a_stale_cosignature_is_a_finding_and_require_fresh_promotes_it() {
         .filter_map(|finding| finding["code"].as_str())
         .collect();
     assert!(codes.contains(&"witness-stale"), "{codes:?}");
+    assert!(document["boundary"].is_string(), "a valid result renders the boundary");
+    assert_eq!(
+        document["policy_overlays"].as_array().map(Vec::len),
+        Some(0),
+        "without the flag the overlay is absent and the field is an empty array: {document}"
+    );
+    assert_eq!(document["status"], document["outcome"], "no overlay, no difference");
 
     let run = ahl_cli(&[
         "--policy",
         &policy_path.display().to_string(),
         AT,
         much_later,
+        "--json",
         "verify",
         &receipt.display().to_string(),
         "--require-fresh",
     ]);
     assert_eq!(run.code, 3, "--require-fresh promotes it to unverifiable, never to invalid");
+    let document = run.json();
+    // A boundary asserts the property in words, so it is rendered where the FINAL status is
+    // `valid` and nowhere else — the core's boundary is never carried under a status the
+    // freshness overlay moved.
+    assert!(document["boundary"].is_null(), "{document}");
+    // The receipt's own result stands where the reduction of its assertions put it; the run's
+    // decision is what the overlay moved, and the exit code follows the decision.
+    assert_eq!(document["status"], "valid", "local policy never rewrites the §7.7 result");
+    assert_eq!(document["outcome"], "unverifiable");
+    // The core's required assertions are untouched — §7.7 enumerates them exactly — and the
+    // locally configured condition is reported in its own field, `unverifiable` and never
+    // `invalid`.
+    let assertions = document["assertions"].as_array().expect("assertions");
+    assert!(
+        assertions.iter().all(|entry| entry["outcome"] == "verified"),
+        "an overlay never moves a required assertion: {document}"
+    );
+    assert!(
+        !assertions.iter().any(|entry| entry["assertion"] == "witness-freshness"),
+        "an overlay is never a §7.7 assertion: {document}"
+    );
+    let overlays = document["policy_overlays"].as_array().expect("policy_overlays");
+    assert_eq!(overlays.len(), 1, "{document}");
+    assert_eq!(overlays[0]["overlay"], "witness-freshness");
+    assert_eq!(overlays[0]["outcome"], "unverifiable");
+    assert_eq!(document["reason_code"], "witness-freshness");
 }
 
 // --- exit 0 -----------------------------------------------------------------------------
@@ -1362,7 +1472,7 @@ fn row_every_required_rule_verified_is_valid() {
         &[],
     );
     assert_eq!(run.code, 0, "{}", run.stderr);
-    assert!(run.stdout.contains("status: valid"));
+    assert!(run.stdout.contains("outcome: valid"));
 }
 
 // --- the boundary the reviewer asked for -------------------------------------------------
@@ -1422,7 +1532,9 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         "closure",
         "--unauthenticated",
         "--corpus",
-        &corpus().join("vectors/statements").display().to_string(),
+        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+            .display()
+            .to_string(),
         "--tree-material",
         &trees.display().to_string(),
         "--trigger-index",
