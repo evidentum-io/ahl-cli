@@ -533,9 +533,13 @@ silently:
   and without the flag freshness is a `findings[]` entry (`witness-stale`) and not an overlay
   at all.
 
-  An overlay is evaluated on every completed run and reported whatever the receipt's result was.
-  It can only ever move a `valid` one: a demonstrated defect outranks a condition of this run,
-  so an overlay listed beside an `invalid` receipt is informative and changes nothing.
+  An overlay is evaluated on every completed run and reported whatever the receipt's result was,
+  but only over material the run established: on a rejected receipt the freshness overlay is
+  emitted only where the receipt carries a cosignature at all and its `witnesses` and
+  `checkpoint-authentication` assertions verified, since a receipt may carry `witnessed: true`
+  beside a cosignature that does not. It can only ever move a `valid` result: a demonstrated
+  defect outranks a condition of this run, so an overlay listed beside an `invalid` receipt is
+  informative and changes nothing.
 - `outcome` — **this run's decision**, always present: `valid`, `invalid`, `unverifiable` or
   `error`. For a receipt it is `status` after the conditions in `policy_overlays[]` are applied;
   for a command that verifies no receipt it is that command's own result, with `status` `null`

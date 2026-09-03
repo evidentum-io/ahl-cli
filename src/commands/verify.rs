@@ -56,7 +56,12 @@
 //! of this run presented as though it were the receipt's result.
 //!
 //! An overlay is evaluated on every completed run and reported whatever the receipt's result
-//! was, but it can only ever move `valid`: a demonstrated defect outranks a condition of this
+//! was — but only over material this run established. On a rejected receipt the freshness
+//! overlay is emitted only where the receipt carries a cosignature at all and its own
+//! `witnesses` and `checkpoint-authentication` assertions verified: a receipt may carry
+//! `witnessed: true` beside a cosignature that does not verify, and an overlay speaking of "the
+//! cosigned checkpoint" would then assert what the result denies. It can only ever move
+//! `valid`: a demonstrated defect outranks a condition of this
 //! run, so an overlay beside an `invalid` receipt is informative and changes nothing. The
 //! headline describes `outcome` and follows the same precedence — the core's `dominating()`
 //! finding wherever the core result is not `verified`, and otherwise the first overlay.
@@ -277,25 +282,36 @@ fn policy_overlays(
 
 /// Whether this run established the cosignature a freshness overlay would speak of.
 ///
-/// Read from the reported assertions, never from `claim.assurance.witnessed` alone: a receipt is
-/// free to carry `witnessed: true` beside a cosignature that does not verify, or beside none at
-/// all, and taking the claim at its word would put "the cosigned checkpoint's `checkpoint_time`
-/// is …" in a report over a receipt whose cosignature this run refuted. Freshness is a statement
-/// about a cosignature; where none was established there is no statement to make.
+/// Nothing here is read from `claim.assurance`: a receipt is free to carry `witnessed: true`
+/// beside a cosignature that does not verify, or beside none at all, and taking that claim at
+/// its word would put "the cosigned checkpoint's `checkpoint_time` is …" in a report over a
+/// cosignature this very run refuted. Freshness is a statement about a cosignature; where none
+/// was established there is no statement to make.
 ///
-/// Three assertions, all of the receipt's own — an embedded receipt's cosignatures say nothing
-/// about this one's checkpoint:
+/// Three conditions, each answering a different question, all about the receipt's own material —
+/// an embedded receipt's cosignatures say nothing about this one's checkpoint:
 ///
-/// * `witnesses` — the cosignatures that were named verified, and where the level requires one,
-///   one exists;
-/// * `checkpoint-authentication` — the checkpoint they cosigned authenticates in its own right,
-///   so `checkpoint_time` is a member of an object this run accepted;
-/// * `cross-field` — where §7.6's `witnessed` rule is decided. The first two are not sufficient
-///   alone: below L3 no cosignature is REQUIRED, so `witnesses` verifies over a receipt that
-///   carries none, and only §7.6 catches the `witnessed: true` such a receipt might still claim.
-///   The conformance corpus is L3 and closes the case on the first two, which is exactly why the
-///   third is worth stating here rather than discovering later on another corpus.
+/// * `anchoring.witnesses[]` is carried and non-empty — there is a cosignature to speak OF.
+///   This is the one that holds below L3, where §3.3 requires no cosignature at all and the
+///   `witnesses` assertion therefore verifies over a receipt carrying none;
+/// * the `witnesses` assertion verified — the cosignatures that were named check out, and where
+///   the level requires one, one exists;
+/// * the `checkpoint-authentication` assertion verified — the checkpoint they cosigned
+///   authenticates in its own right, so `checkpoint_time` is a member of an object this run
+///   accepted.
+///
+/// The aggregate `cross-field` assertion is deliberately NOT among them. It carries every §7.6
+/// rule, not only the one about `witnessed`, so requiring it would withhold a true and useful
+/// overlay from every receipt whose cross-field defect lies somewhere else — a mismatched
+/// subject, an embedded ordering violation — none of which says anything about whether the
+/// cosignature verified. The carried-array condition closes the case §7.6 would have closed
+/// here, and closes only that case.
 fn cosignature_established(receipt: &Value, assertions: &[AssertionOut]) -> bool {
+    let carried = receipt
+        .get("anchoring")
+        .and_then(|anchoring| anchoring.get("witnesses"))
+        .and_then(Value::as_array)
+        .is_some_and(|witnesses| !witnesses.is_empty());
     let verified = |name: &str| {
         assertions.iter().any(|entry| {
             entry.assertion == name
@@ -303,10 +319,9 @@ fn cosignature_established(receipt: &Value, assertions: &[AssertionOut]) -> bool
                 && entry.outcome == CoreOutcome::Verified.name()
         })
     };
-    carried_assurance(receipt).is_some_and(|assurance| assurance.witnessed)
+    carried
         && verified(Assertion::Witnesses.name())
         && verified(Assertion::CheckpointAuthentication.name())
-        && verified(Assertion::CrossField.name())
 }
 
 /// The `(reason_code, reason)` a core finding leads a report with: its assertion's stable name,
@@ -1298,6 +1313,78 @@ mod tests {
             report.findings
         );
         assert!(!report.to_text().contains("cosigned checkpoint"), "{}", report.to_text());
+    }
+
+    #[test]
+    fn a_cross_field_defect_unrelated_to_the_witness_does_not_withhold_the_overlay() {
+        // The gate asks whether the cosignature was established, not whether the receipt is
+        // otherwise sound. Requiring the aggregate `cross-field` assertion would withhold a true
+        // overlay from every receipt whose cross-field defect lies somewhere else entirely,
+        // which says nothing about whether the cosignature verified.
+        let much_later = EvaluationTime::resolve(Some("2027-08-16T12:00:00Z")).expect("instant");
+        let report = run(
+            &corpus_policy(true),
+            &much_later,
+            &Options {
+                // `governance` overstated in the assurance block: `cross-field` is `invalid`,
+                // the cosignature and the checkpoint under it are untouched.
+                receipt: corpus().join("receipts/overclaim-must-fail.ahl"),
+                require_fresh: true,
+            },
+        );
+        assert_eq!(report.status, Some("invalid"), "{}", report.reason);
+        let assertions = report.assertions.as_ref().expect("assertions");
+        assert!(
+            assertions
+                .iter()
+                .any(|entry| entry.assertion == "cross-field" && entry.outcome == "invalid"),
+            "this vector's defect is a cross-field one: {assertions:?}"
+        );
+        for established in ["witnesses", "checkpoint-authentication"] {
+            assert!(
+                assertions
+                    .iter()
+                    .any(|entry| entry.assertion == established && entry.outcome == "verified"),
+                "`{established}` verified, so the cosignature stands: {assertions:?}"
+            );
+        }
+        assert!(
+            report.policy_overlays.iter().any(|overlay| overlay.overlay == FRESHNESS),
+            "the overlay is emitted over an established cosignature: {:?}",
+            report.policy_overlays
+        );
+        assert_eq!(report.outcome, "invalid", "and still changes nothing");
+    }
+
+    #[test]
+    fn a_receipt_carrying_no_cosignature_gets_no_freshness_overlay() {
+        // Below L3 no cosignature is REQUIRED, so `witnesses` verifies over a receipt that
+        // carries none — and there is then nothing for a freshness overlay to speak of. The
+        // carried-array condition is what closes that case; the assertions alone would not.
+        let assertions: Vec<AssertionOut> = ["witnesses", "checkpoint-authentication"]
+            .into_iter()
+            .map(|assertion| AssertionOut {
+                assertion: assertion.to_owned(),
+                outcome: CoreOutcome::Verified.name().to_owned(),
+                receipt_path: Vec::new(),
+                detail: None,
+                rests_on: None,
+            })
+            .collect();
+        // Both assertions verified, and `witnessed` claimed — but no cosignature is carried.
+        let receipt = json!({
+            "claim": { "assurance": { "witnessed": true } },
+            "anchoring": { "witnesses": [] },
+        });
+        assert!(!cosignature_established(&receipt, &assertions));
+
+        // The member absent entirely answers the same way.
+        let receipt = json!({ "claim": { "assurance": { "witnessed": true } }, "anchoring": {} });
+        assert!(!cosignature_established(&receipt, &assertions));
+
+        // One carried cosignature, with both assertions verified, is what opens the gate.
+        let receipt = json!({ "anchoring": { "witnesses": [ { "key_id": "sha256:aa" } ] } });
+        assert!(cosignature_established(&receipt, &assertions));
     }
 
     #[test]
