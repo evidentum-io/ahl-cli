@@ -526,6 +526,21 @@ impl MirrorFixture {
         sizes
     }
 
+    /// The corpus entries as parsed envelopes, in entry-index order.
+    ///
+    /// The index into the returned vector IS the entry index, which is what every governance
+    /// and closure walk keys on.
+    #[must_use]
+    pub fn corpus_entries(&self) -> Vec<Value> {
+        self.entries.iter().filter_map(|bytes| serde_json::from_slice(bytes).ok()).collect()
+    }
+
+    /// The trust policy this fixture's corpus is anchored to.
+    #[must_use]
+    pub const fn trust_policy(&self) -> &ahl_core::receipt::TrustPolicy {
+        &self.policy.trust
+    }
+
     /// The entry id of the manifest version that GOVERNS at the end of the corpus.
     ///
     /// §7.4.1 test 3 links a manifest to the version active immediately before it, not to

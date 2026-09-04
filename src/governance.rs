@@ -285,6 +285,10 @@ impl Governance {
         let mut findings = Vec::new();
         let mut previous_index: Option<u64> = None;
         let mut previous_manifest_entry_id: Option<String> = None;
+        // `statement_id -> the entry index that governs it`, for the §2.1 first-wins rule. A
+        // void entry never reaches this map: it is refused above, before its id is claimed, so
+        // a later verifying copy of the same statement still governs.
+        let mut governing_versions: BTreeMap<String, u64> = BTreeMap::new();
 
         for (index, envelope) in entries {
             if previous_index.is_some_and(|previous| previous >= *index) {
@@ -361,21 +365,23 @@ impl Governance {
             }
 
             match kind {
-                "manifest" => {
-                    let genesis_epoch =
-                        resolved.manifests.first().and_then(|(_, first)| cadence_epoch_of(first));
-                    if let Some(finding) = manifest_refusal(
-                        *index,
-                        payload,
-                        previous_manifest_entry_id.as_deref(),
-                        genesis_epoch,
-                    ) {
-                        findings.push(finding);
-                    } else {
+                "manifest" => match manifest_induction(
+                    *index,
+                    envelope,
+                    payload,
+                    &governing_versions,
+                    previous_manifest_entry_id.as_deref(),
+                    resolved.manifests.first().and_then(|(_, first)| cadence_epoch_of(first)),
+                ) {
+                    Err(finding) => findings.push(finding),
+                    Ok(statement_id) => {
+                        if let Some(id) = statement_id {
+                            governing_versions.insert(id, *index);
+                        }
                         previous_manifest_entry_id = Some(entry_id(envelope));
                         resolved.manifests.push((*index, payload.clone()));
                     }
-                }
+                },
                 _ => match read_key_event(*index, payload) {
                     Ok(event) => resolved.events.push(event),
                     Err(detail) => findings.push(Finding::new(
@@ -726,6 +732,44 @@ impl Governance {
     pub fn manifest_indexes(&self) -> Vec<u64> {
         self.manifests.iter().map(|(index, _)| *index).collect()
     }
+}
+
+/// Whether a signed `manifest` statement joins the chain, and why not where it does not.
+///
+/// Two refusals, in the order the rules apply.
+///
+/// **§2.1 first, before the predecessor test.** A version anchored twice is one version, and
+/// "the envelope with the smallest entry index governs and later ones are void". The predecessor
+/// test would refuse the second copy too — it links to the version active before the FIRST copy,
+/// which by then is no longer the active one — but it would refuse it as a mis-linked chain,
+/// which is not what happened. A diagnostic that is right for the wrong reason stops being right
+/// the moment the reason changes, and an operator reading it is being told the corpus is
+/// broken when it is merely repetitive.
+///
+/// Then [`manifest_refusal`]'s own two tests. Returns the statement id the version now governs
+/// under, where it joins.
+fn manifest_induction(
+    index: u64,
+    envelope: &Value,
+    payload: &Value,
+    governing_versions: &BTreeMap<String, u64>,
+    previous_manifest_entry_id: Option<&str>,
+    genesis_epoch: Option<&str>,
+) -> Result<Option<String>, Finding> {
+    let statement_id = ahl_core::statement_id(envelope).ok();
+    if let Some(first) = statement_id.as_ref().and_then(|id| governing_versions.get(id)) {
+        return Err(Finding::new(
+            "governance-version-anchored-twice",
+            format!(
+                "the manifest at entry index {index} anchors the version first anchored at \
+                 {first}; core spec §2.1 makes the smallest entry index govern and voids later \
+                 copies, so this one applies no effect and is not the version a \
+                 `subject.manifest` reference resolves to"
+            ),
+        ));
+    }
+    manifest_refusal(index, payload, previous_manifest_entry_id, genesis_epoch)
+        .map_or(Ok(statement_id), Err)
 }
 
 /// Why a signed non-genesis manifest does not join the chain, or `None` if it does.
@@ -1829,6 +1873,47 @@ mod tests {
             .witness_keys_for(15)
             .expect("witness keys")
             .contains_key(&producer(5).key_id()));
+    }
+
+    #[test]
+    fn a_version_anchored_twice_governs_once_and_says_why() {
+        // Core spec §2.1: "the envelope with the smallest entry index governs and later ones
+        // are void". The conformance corpus anchors one manifest version under three envelopes
+        // — one governing, one that verifies and repeats it, one that does not verify at all —
+        // and only the first may govern. The predecessor test would refuse the second copy too,
+        // for a reason that is not what happened, so the rule is applied where it belongs and
+        // the finding says which entry governs instead.
+        let fixture = crate::testing::MirrorFixture::conformance();
+        let entries: Vec<(u64, Value)> = fixture
+            .corpus_entries()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(at, envelope)| Some((u64::try_from(at).ok()?, envelope)))
+            .collect();
+        let (resolved, findings) =
+            Governance::resolve(&entries, fixture.trust_policy()).expect("the anchor holds");
+
+        let duplicates: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.code == "governance-version-anchored-twice")
+            .collect();
+        assert_eq!(duplicates.len(), 1, "one verifying second copy: {findings:?}");
+        assert!(
+            duplicates[0].detail.contains("§2.1")
+                && duplicates[0].detail.contains("applies no effect"),
+            "the reason is the duplicate rule, not the predecessor link: {}",
+            duplicates[0].detail
+        );
+
+        // And exactly one entry governs that version: the copies are not in the chain.
+        let governing = resolved.manifest_indexes();
+        assert!(
+            governing.len() >= 3,
+            "the corpus rotates governance more than once: {governing:?}"
+        );
+        let mut ascending = governing.clone();
+        ascending.dedup();
+        assert_eq!(ascending, governing, "each version appears once: {governing:?}");
     }
 
     #[test]
