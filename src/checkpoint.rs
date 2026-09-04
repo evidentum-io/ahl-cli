@@ -212,7 +212,13 @@ impl Checkpoint {
         let value = serde_json::to_value(self).map_err(|source| {
             CliError::Internal(format!("cannot re-serialize a checkpoint: {source}"))
         })?;
-        verify_signature(&key, &cosignature_bytes(&value, witness_id), cosignature).map_err(
+        // Adaptor §11.1 cosigns the six members of §6.2, and the projection is what keeps the
+        // preimage independent of whatever else a carried checkpoint happens to hold — the
+        // optional `raw` framing of §6.4 above all.
+        let cosigned = ahl_core::CosignedCheckpoint::project(&value).map_err(|source| {
+            CliError::EvidenceMissing(format!("the checkpoint is not cosignable: {source}"))
+        })?;
+        verify_signature(&key, &cosignature_bytes(&cosigned, witness_id), cosignature).map_err(
             |source| {
                 CliError::EvidenceMissing(format!("witness cosignature is unreadable: {source}"))
             },
@@ -502,7 +508,8 @@ mod tests {
         let witness = TestKey::from_seed_hex("witness-1", &"04".repeat(32)).expect("seed");
         let cp = signed(checkpoint(8, 0xaa, "2026-08-16T12:00:00Z"), SigningForm::CanonicalJson);
         let value = serde_json::to_value(&cp).expect("value");
-        let cosignature = witness.sign(&cosignature_bytes(&value, "witness-1"));
+        let cosigned = ahl_core::CosignedCheckpoint::project(&value).expect("cosignable");
+        let cosignature = witness.sign(&cosignature_bytes(&cosigned, "witness-1"));
 
         assert!(cp
             .cosignature_verifies("witness-1", &cosignature, &witness.pubkey())
