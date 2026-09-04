@@ -310,7 +310,14 @@ impl Dir {
             Err(Errno::EXIST) => Err(destination_exists(destination)),
             // An older kernel or a filesystem without `renameat2`/`renamex_np`: fall back to
             // `linkat`, which is equally no-replace, never to a racy plain rename.
-            Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP | Errno::OPNOTSUPP) => {
+            // Compared by value rather than matched as a pattern: on Linux `NOTSUP` and
+            // `OPNOTSUPP` are one errno and an `|` pattern over both is unreachable there.
+            Err(errno)
+                if errno == Errno::NOSYS
+                    || errno == Errno::INVAL
+                    || errno == Errno::NOTSUP
+                    || errno == Errno::OPNOTSUPP =>
+            {
                 self.link_install(temp, name, destination)
             }
             Err(errno) => Err(output_error(destination, format!("atomic install failed: {errno}"))),
@@ -338,7 +345,12 @@ impl Dir {
                 Ok(())
             }
             Err(Errno::EXIST) => Err(destination_exists(destination)),
-            Err(errno @ (Errno::NOSYS | Errno::NOTSUP | Errno::OPNOTSUPP | Errno::PERM)) => {
+            Err(errno)
+                if errno == Errno::NOSYS
+                    || errno == Errno::NOTSUP
+                    || errno == Errno::OPNOTSUPP
+                    || errno == Errno::PERM =>
+            {
                 // Fail closed: no no-replace primitive is available, so there is no safe
                 // install.
                 Err(output_error(
