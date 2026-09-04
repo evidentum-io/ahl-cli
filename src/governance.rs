@@ -285,10 +285,11 @@ impl Governance {
         let mut findings = Vec::new();
         let mut previous_index: Option<u64> = None;
         let mut previous_manifest_entry_id: Option<String> = None;
-        // `statement_id -> the entry index that governs it`, for the §2.1 first-wins rule. A
-        // void entry never reaches this map: it is refused above, before its id is claimed, so
-        // a later verifying copy of the same statement still governs.
-        let mut governing_versions: BTreeMap<String, u64> = BTreeMap::new();
+        // `statement_id -> the entry index that governs it`, for the §2.1 first-wins rule over
+        // EVERY governance statement — manifests and `key` statements alike, the genesis
+        // included. A void entry never reaches this map: it is refused before its id is
+        // claimed, so a later verifying copy of the same statement still governs.
+        let mut governing_statements: BTreeMap<String, u64> = BTreeMap::new();
 
         for (index, envelope) in entries {
             if previous_index.is_some_and(|previous| previous >= *index) {
@@ -312,14 +313,7 @@ impl Governance {
             let payload = match payload_of(envelope) {
                 Ok(payload) => payload,
                 Err(source) => {
-                    findings.push(Finding::new(
-                        "entry-structurally-invalid",
-                        format!(
-                            "the entry at entry index {index} is structurally invalid and is \
-                             excluded from governance resolution, its position in the sequence \
-                             kept: {source}"
-                        ),
-                    ));
+                    findings.push(structurally_invalid(*index, &source));
                     continue;
                 }
             };
@@ -331,17 +325,13 @@ impl Governance {
             // --- the genesis manifest: §7.4.1 test 4 ---------------------------------
             if resolved.manifests.is_empty() {
                 if kind != "manifest" {
-                    findings.push(Finding::new(
-                        "governance-statement-not-authorized",
-                        format!(
-                            "the `key` statement at entry index {index} precedes any manifest \
-                             version, so no key set is in force to authorize it; it is ignored \
-                             for key resolution"
-                        ),
-                    ));
+                    findings.push(precedes_any_manifest(*index));
                     continue;
                 }
                 resolved.accept_genesis(*index, envelope, payload, policy)?;
+                if let Ok(id) = ahl_core::statement_id(envelope) {
+                    governing_statements.insert(id, *index);
+                }
                 previous_manifest_entry_id = Some(entry_id(envelope));
                 continue;
             }
@@ -364,26 +354,41 @@ impl Governance {
                 continue;
             }
 
+            // §2.1, over both kinds and BEFORE any state effect is applied. A later copy of
+            // a statement already anchored governs nothing: for a manifest it is not the
+            // version a `subject.manifest` reference resolves to, and for a `key` statement it
+            // applies no effect — which is the half that bites, because a duplicate `add` after
+            // a valid `retire` would otherwise put a retired key back into the set.
+            let statement_id = ahl_core::statement_id(envelope).ok();
+            if let Some(finding) =
+                duplicate_refusal(*index, kind, statement_id.as_ref(), &governing_statements)
+            {
+                findings.push(finding);
+                continue;
+            }
+
             match kind {
-                "manifest" => match manifest_induction(
-                    *index,
-                    envelope,
-                    payload,
-                    &governing_versions,
-                    previous_manifest_entry_id.as_deref(),
-                    resolved.manifests.first().and_then(|(_, first)| cadence_epoch_of(first)),
-                ) {
-                    Err(finding) => findings.push(finding),
-                    Ok(statement_id) => {
-                        if let Some(id) = statement_id {
-                            governing_versions.insert(id, *index);
-                        }
+                "manifest" => {
+                    let epoch =
+                        resolved.manifests.first().and_then(|(_, first)| cadence_epoch_of(first));
+                    if let Some(finding) = manifest_refusal(
+                        *index,
+                        payload,
+                        previous_manifest_entry_id.as_deref(),
+                        epoch,
+                    ) {
+                        findings.push(finding);
+                    } else {
+                        record(&mut governing_statements, statement_id, *index);
                         previous_manifest_entry_id = Some(entry_id(envelope));
                         resolved.manifests.push((*index, payload.clone()));
                     }
-                },
+                }
                 _ => match read_key_event(*index, payload) {
-                    Ok(event) => resolved.events.push(event),
+                    Ok(event) => {
+                        record(&mut governing_statements, statement_id, *index);
+                        resolved.events.push(event);
+                    }
                     Err(detail) => findings.push(Finding::new(
                         "governance-statement-not-authorized",
                         format!("the `key` statement at entry index {index} is unusable: {detail}"),
@@ -734,42 +739,65 @@ impl Governance {
     }
 }
 
-/// Whether a signed `manifest` statement joins the chain, and why not where it does not.
-///
-/// Two refusals, in the order the rules apply.
-///
-/// **§2.1 first, before the predecessor test.** A version anchored twice is one version, and
-/// "the envelope with the smallest entry index governs and later ones are void". The predecessor
-/// test would refuse the second copy too — it links to the version active before the FIRST copy,
-/// which by then is no longer the active one — but it would refuse it as a mis-linked chain,
-/// which is not what happened. A diagnostic that is right for the wrong reason stops being right
-/// the moment the reason changes, and an operator reading it is being told the corpus is
-/// broken when it is merely repetitive.
-///
-/// Then [`manifest_refusal`]'s own two tests. Returns the statement id the version now governs
-/// under, where it joins.
-fn manifest_induction(
-    index: u64,
-    envelope: &Value,
-    payload: &Value,
-    governing_versions: &BTreeMap<String, u64>,
-    previous_manifest_entry_id: Option<&str>,
-    genesis_epoch: Option<&str>,
-) -> Result<Option<String>, Finding> {
-    let statement_id = ahl_core::statement_id(envelope).ok();
-    if let Some(first) = statement_id.as_ref().and_then(|id| governing_versions.get(id)) {
-        return Err(Finding::new(
-            "governance-version-anchored-twice",
-            format!(
-                "the manifest at entry index {index} anchors the version first anchored at \
-                 {first}; core spec §2.1 makes the smallest entry index govern and voids later \
-                 copies, so this one applies no effect and is not the version a \
-                 `subject.manifest` reference resolves to"
-            ),
-        ));
+/// A `key` statement anchored before any manifest version, so no key set authorizes it.
+fn precedes_any_manifest(index: u64) -> Finding {
+    Finding::new(
+        "governance-statement-not-authorized",
+        format!(
+            "the `key` statement at entry index {index} precedes any manifest version, so no \
+             key set is in force to authorize it; it is ignored for key resolution"
+        ),
+    )
+}
+
+/// A structurally broken envelope, excluded from governance resolution with its position kept.
+fn structurally_invalid(index: u64, source: &CliError) -> Finding {
+    Finding::new(
+        "entry-structurally-invalid",
+        format!(
+            "the entry at entry index {index} is structurally invalid and is excluded from \
+             governance resolution, its position in the sequence kept: {source}"
+        ),
+    )
+}
+
+/// Note that `index` now governs `statement_id`, where the envelope had one to compute.
+fn record(governing: &mut BTreeMap<String, u64>, statement_id: Option<String>, index: u64) {
+    if let Some(id) = statement_id {
+        governing.insert(id, index);
     }
-    manifest_refusal(index, payload, previous_manifest_entry_id, genesis_epoch)
-        .map_or(Ok(statement_id), Err)
+}
+
+/// The §2.1 refusal, where this envelope repeats a statement id already accepted.
+///
+/// "If duplicates nevertheless occur, the envelope with the smallest entry index governs and
+/// later ones are void." Applied to every governance statement, of either kind, and applied
+/// BEFORE the statement can have any effect — which is the whole of the rule. For a `key`
+/// statement that ordering is load-bearing rather than tidy: a duplicate `add` anchored after a
+/// valid `retire` would otherwise be replayed in entry order and put a retired key back into the
+/// set, so a party able to re-anchor one old envelope could revive a key the corpus retired.
+///
+/// It is also applied before the manifest predecessor test, which would refuse a second copy
+/// anyway — it links to the version active before the FIRST copy, which by then is no longer
+/// active — but would refuse it as a mis-linked chain. That is not what happened, and a
+/// diagnostic that is right for the wrong reason stops being right the moment the reason
+/// changes.
+fn duplicate_refusal(
+    index: u64,
+    kind: &str,
+    statement_id: Option<&String>,
+    governing: &BTreeMap<String, u64>,
+) -> Option<Finding> {
+    let first = statement_id.and_then(|id| governing.get(id))?;
+    Some(Finding::new(
+        "governance-statement-anchored-twice",
+        format!(
+            "the `{kind}` statement at entry index {index} repeats the statement id first \
+             anchored at {first}; core spec §2.1 makes the smallest entry index govern and \
+             voids later copies, so this one applies no effect: it contributes no key \
+             transition, and it is not the version a `subject.manifest` reference resolves to"
+        ),
+    ))
 }
 
 /// Why a signed non-genesis manifest does not join the chain, or `None` if it does.
@@ -1895,7 +1923,7 @@ mod tests {
 
         let duplicates: Vec<&Finding> = findings
             .iter()
-            .filter(|finding| finding.code == "governance-version-anchored-twice")
+            .filter(|finding| finding.code == "governance-statement-anchored-twice")
             .collect();
         assert_eq!(duplicates.len(), 1, "one verifying second copy: {findings:?}");
         assert!(
@@ -1904,6 +1932,7 @@ mod tests {
             "the reason is the duplicate rule, not the predecessor link: {}",
             duplicates[0].detail
         );
+        assert!(duplicates[0].detail.contains("`manifest` statement"), "{}", duplicates[0].detail);
 
         // And exactly one entry governs that version: the copies are not in the chain.
         let governing = resolved.manifest_indexes();
@@ -1914,6 +1943,97 @@ mod tests {
         let mut ascending = governing.clone();
         ascending.dedup();
         assert_eq!(ascending, governing, "each version appears once: {governing:?}");
+    }
+
+    #[test]
+    fn a_duplicate_key_statement_applies_no_effect_and_never_revives_a_retired_key() {
+        // Core spec §2.1: "the envelope with the smallest entry index governs and later ones are
+        // void." For a `key` statement that is not bookkeeping. Events are replayed in entry
+        // order, so a duplicate `add` anchored AFTER a valid `retire` would be applied a second
+        // time and put the retired key back into the producer set — handing anyone able to
+        // re-anchor one old envelope the power to revive a key the corpus retired.
+        let honest = producer(1);
+        let revived = producer(2);
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.producer_key_object() ],
+                "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
+            }),
+            &honest,
+        );
+        let add = ahl_core::envelope(
+            json!({ "type": "key", "action": "add", "key": revived.key_object(10) }),
+            &honest,
+        );
+        let retire = ahl_core::envelope(
+            json!({ "type": "key", "action": "retire", "key": revived.key_object(10) }),
+            &honest,
+        );
+        // Byte-identical to the `add`, so it carries the same statement id.
+        let entries = vec![(0, genesis), (10, add.clone()), (20, retire), (30, add)];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: Some(BTreeSet::from([honest.key_id()])),
+            ..TrustPolicy::default()
+        };
+        let (resolved, findings) = Governance::resolve(&entries, &policy).expect("anchor holds");
+
+        assert!(
+            resolved.producer_keys_at(15).contains_key(&revived.key_id()),
+            "the add governs from its own index"
+        );
+        assert!(
+            !resolved.producer_keys_at(25).contains_key(&revived.key_id()),
+            "the retire takes it out again"
+        );
+        assert!(
+            !resolved.producer_keys_at(35).contains_key(&revived.key_id()),
+            "and a duplicate of the add applies no effect: the key stays retired"
+        );
+        let duplicates: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.code == "governance-statement-anchored-twice")
+            .collect();
+        assert_eq!(duplicates.len(), 1, "the duplicate is reported, not silently dropped");
+        assert!(duplicates[0].detail.contains("`key` statement"), "{}", duplicates[0].detail);
+        assert!(duplicates[0].detail.contains("30"), "{}", duplicates[0].detail);
+    }
+
+    #[test]
+    fn a_second_copy_of_the_genesis_manifest_is_void_under_the_duplicate_rule() {
+        // The genesis is accepted on its own path — it is the one manifest checked against
+        // local policy rather than against the chain — so it has to claim its statement id
+        // there too. Otherwise its duplicate falls through to the predecessor test and is
+        // refused as a mis-linked chain, which is not what happened to it.
+        let honest = producer(1);
+        let genesis = ahl_core::envelope(
+            json!({
+                "type": "manifest",
+                "keys": [ honest.producer_key_object() ],
+                "log": log_object(&family(0xaa), &[producer(3).key_object(0)]),
+            }),
+            &honest,
+        );
+        let entries = vec![(0, genesis.clone()), (7, genesis)];
+        let policy = TrustPolicy {
+            genesis_entry_id: entry_id(&entries[0].1),
+            genesis_key_ids: Some(BTreeSet::from([honest.key_id()])),
+            ..TrustPolicy::default()
+        };
+        let (resolved, findings) = Governance::resolve(&entries, &policy).expect("anchor holds");
+
+        assert_eq!(resolved.manifest_indexes(), vec![0], "the genesis governs once");
+        let duplicates: Vec<&Finding> = findings
+            .iter()
+            .filter(|finding| finding.code == "governance-statement-anchored-twice")
+            .collect();
+        assert_eq!(duplicates.len(), 1, "{findings:?}");
+        assert!(
+            duplicates[0].detail.contains("first anchored at 0"),
+            "the entry that governs is named: {}",
+            duplicates[0].detail
+        );
     }
 
     #[test]
