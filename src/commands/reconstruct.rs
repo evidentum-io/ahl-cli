@@ -473,7 +473,8 @@ mod tests {
 
     #[test]
     fn a_witnessed_reconstruction_is_valid_and_bounded_by_what_this_run_observed() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report = run_with(&fixture, &options(&fixture, 32));
         assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert_eq!(report.continued_history_bound, Some(ObservationBound::RunObserved));
@@ -486,7 +487,8 @@ mod tests {
 
     #[test]
     fn the_result_never_claims_the_latest_witnessed_checkpoint() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report = run_with(&fixture, &options(&fixture, 32));
         let json = report.to_json().expect("serializes").to_lowercase();
         assert!(!json.contains("latest witnessed"), "{json}");
@@ -495,7 +497,8 @@ mod tests {
 
     #[test]
     fn reproducible_reconstruction_is_named_as_not_evaluated_never_implied_to_hold() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report = run_with(&fixture, &options(&fixture, 32));
         let reconstruction = report.reconstruction.as_ref().expect("reconstructed");
         assert_eq!(reconstruction.reproducible_reconstruction, "not-evaluated");
@@ -508,7 +511,8 @@ mod tests {
 
     #[test]
     fn knowledge_evolves_with_the_as_of_checkpoint() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         // At tree_size 8 the correction at entry 6 governs the record; further along the log a
         // second correction and then a retraction supersede it.
         let early = run_with(&fixture, &options(&fixture, 8));
@@ -538,7 +542,8 @@ mod tests {
 
     #[test]
     fn a_record_with_no_effective_trigger_reconstructs_as_asserted() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let (dataset, record) = fixture.record_b();
         let report = run_with(
             &fixture,
@@ -558,7 +563,8 @@ mod tests {
 
     #[test]
     fn an_unreachable_witness_makes_reconstruction_unverifiable_never_a_weaker_success() {
-        let mut fixture = MirrorFixture::conformance();
+        let mut fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         fixture.policy.endpoints.witness = Some("https://witness.unreachable".to_owned());
         let report = run_with(&fixture, &options(&fixture, 32));
         assert_eq!(report.outcome, "unverifiable");
@@ -567,7 +573,8 @@ mod tests {
 
     #[test]
     fn a_missing_witness_endpoint_is_a_usage_error_not_a_silent_downgrade() {
-        let mut fixture = MirrorFixture::conformance();
+        let mut fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         fixture.policy.endpoints.witness = None;
         let report = run_with(&fixture, &options(&fixture, 32));
         assert_eq!(report.outcome, "error");
@@ -576,7 +583,8 @@ mod tests {
 
     #[test]
     fn the_as_of_checkpoint_is_explicit_and_the_valid_time_is_rfc_3339() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let mut options = options(&fixture, 32);
         options.checkpoint = None;
         let report = run_with(&fixture, &options);
@@ -593,7 +601,8 @@ mod tests {
     fn a_reconstruction_reports_no_receipt_result_because_it_verifies_no_receipt() {
         // As for `closure`: the evidenced assertion set is not a receipt, so there is no §7.7
         // result to report beside it.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report = run_with(&fixture, &options(&fixture, 8));
         assert_eq!(report.outcome, "valid", "{}", report.reason);
         assert_eq!(report.status, None);
@@ -604,7 +613,8 @@ mod tests {
 
     #[test]
     fn a_record_that_was_never_introduced_has_nothing_to_reconstruct() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report = run_with(
             &fixture,
             &Options {
@@ -622,7 +632,8 @@ mod tests {
     fn a_non_retroactive_trigger_outside_the_asked_time_does_not_govern() {
         // Entry 17 retracts record C with `retroactive: false` from a boundary instant; asked
         // about an earlier valid time the trigger's scope does not cover it.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let vector: Value = serde_json::from_slice(
             &std::fs::read(
                 MirrorFixture::corpus_root()

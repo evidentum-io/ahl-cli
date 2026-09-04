@@ -949,7 +949,8 @@ mod tests {
 
     #[test]
     fn a_view_is_established_only_when_every_step_holds() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(8).expect("established");
         assert_eq!(anchored.checkpoint.tree_size, 8);
         assert_eq!(anchored.statements.len(), 8);
@@ -958,7 +959,8 @@ mod tests {
 
     #[test]
     fn a_checkpoint_the_mirror_never_published_is_never_inferred() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let error = fixture.establish(7).expect_err("unpublished size");
         assert!(error.to_string().contains("never inferred"), "{error}");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
@@ -966,7 +968,8 @@ mod tests {
 
     #[test]
     fn a_genesis_anchor_that_is_not_the_configured_one_is_missing_evidence_not_a_verdict() {
-        let mut fixture = MirrorFixture::conformance();
+        let mut fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         fixture.policy.trust.genesis_entry_id = format!("sha256:{}", "99".repeat(32));
         let error = fixture.establish(8).expect_err("wrong anchor");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
@@ -975,7 +978,8 @@ mod tests {
     #[test]
     fn the_predecessor_relationship_is_verified_and_an_unverified_one_is_never_a_success() {
         // tree_size 13 has both a predecessor and a successor, so neither gap is reported.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(13).expect("established");
         assert!(!anchored
             .findings
@@ -984,7 +988,10 @@ mod tests {
 
         // A member whose only published predecessor does not authenticate is missing evidence,
         // not a complete answer with a note attached.
-        let fixture = MirrorFixture::conformance().with_series_from(8).with_foreign_log_key(8);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_series_from(8)
+            .with_foreign_log_key(8);
         assert!(fixture.establish(13).is_err(), "the predecessor did not authenticate");
         let error = fixture.establish(13).expect_err("the predecessor did not authenticate");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
@@ -1000,7 +1007,9 @@ mod tests {
         // what the deployment published. Reading it as adaptor §5.2.2 item 3's exemption
         // would hand every mirror a switch that turns a missing relationship into a complete
         // answer, so the exemption is never claimed.
-        let withheld = MirrorFixture::conformance().with_series_from(13);
+        let withheld = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_series_from(13);
         let error = withheld.establish(13).expect_err("the predecessor was withheld");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
         assert!(error.to_string().contains("no authenticated series member precedes"), "{error}");
@@ -1008,7 +1017,8 @@ mod tests {
 
         // The very same checkpoint, from a mirror that serves the history the deployment
         // published, establishes: the predecessor relationship is verifiable there.
-        let full = MirrorFixture::conformance();
+        let full = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         assert_eq!(full.establish(13).expect("established").checkpoint.tree_size, 13);
     }
 
@@ -1029,7 +1039,8 @@ mod tests {
         // Pinned as a deliberate refusal so that it cannot become an accident of which sizes
         // the fixture happens to publish, and so that adopting the carve-out later is a visible
         // change to this test rather than a silent change of verdict.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let smallest = crate::testing::CHECKPOINT_SIZES
             .into_iter()
             .min()
@@ -1060,7 +1071,9 @@ mod tests {
         // over a size the client cannot show carries one tree. It is `3` — material that could
         // not be established — and never `1`, which §7 reserves for two members that both
         // authenticate.
-        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(13);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_foreign_divergence_at(13);
         let error = fixture.establish(13).expect_err("two roots at the grounded size");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
         assert!(error.to_string().contains("would be grounded at tree_size 13"), "{error}");
@@ -1068,7 +1081,9 @@ mod tests {
 
         // Where both members at the grounded size authenticate, it is `1` and the floor is
         // named: that is positive proof, not absence of evidence.
-        let equivocating = MirrorFixture::conformance().with_equivocation_at(13);
+        let equivocating = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(13);
         let error = equivocating.establish(13).expect_err("both authenticate");
         assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
     }
@@ -1081,7 +1096,9 @@ mod tests {
         // grounded at or beyond a floor in the reading that has not been excluded — and the
         // outcome cannot be `0` just because the size the divergence sits at is not the one
         // the checkpoint was selected at.
-        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(8);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_foreign_divergence_at(8);
         let error = fixture.establish(20).expect_err("grounded beyond an unresolved floor");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
         assert!(error.to_string().contains("at tree_size 8"), "{error}");
@@ -1090,14 +1107,18 @@ mod tests {
 
         // The same shape with both members authenticating is the confirmed floor, and a result
         // grounded beyond it is positive proof: `1`, not `3`.
-        let equivocating = MirrorFixture::conformance().with_equivocation_at(8);
+        let equivocating = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(8);
         let error = equivocating.establish(20).expect_err("confirmed floor at 8");
         assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 8 }), "{error}");
 
         // Strictly *above* the grounded size the result sits below the floor under every
         // reading, members below a divergence remain usable, and one bogus object from a mirror
         // must not derail an honest run — so it is carried as a finding.
-        let fixture = MirrorFixture::conformance().with_foreign_divergence_at(20);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_foreign_divergence_at(20);
         let anchored = fixture.establish(8).expect("grounded strictly below the divergence");
         assert!(anchored
             .findings
@@ -1112,11 +1133,14 @@ mod tests {
         // rotates its checkpoint-signing key, and this fixture keeps signing with the outgoing
         // one — a key the corpus really did declare, so what is being tested is the RESOLUTION
         // and not "unknown key", which `with_foreign_log_key` already covers.
-        let rotated = MirrorFixture::conformance();
+        let rotated = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let newest = rotated.newest_tree_size();
         rotated.establish(newest).expect("the governing key signs the newest checkpoint");
 
-        let stale = MirrorFixture::conformance().with_outgoing_log_key();
+        let stale = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_outgoing_log_key();
         let error = stale.establish(newest).expect_err("the outgoing key does not authenticate");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
         assert!(error.to_string().contains("does not verify"), "{error}");
@@ -1132,7 +1156,9 @@ mod tests {
         // **and active by `valid_from_index`**. Declaring a key is not adopting it, and a
         // checkpoint signed before its activation index is signed by a key the corpus had not
         // yet put in force.
-        let fixture = MirrorFixture::conformance().with_future_activated_log_key();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_future_activated_log_key();
         let size = fixture.appended_tree_size();
         let error = fixture.establish(size).expect_err("the key is not active yet");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
@@ -1157,7 +1183,9 @@ mod tests {
         // authorized key, the manifest links correctly to the version active before it, and
         // its own signature verifies against the key set the chain established. The rule that
         // stops it is the one about the pair, applied where the pair is read.
-        let fixture = MirrorFixture::conformance().with_forged_key_transition();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_forged_key_transition();
         let size = fixture.appended_tree_size();
         let error = fixture.establish(size).expect_err("the binding does not recompute");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
@@ -1174,7 +1202,9 @@ mod tests {
         // and MUST reject a mismatch"; §6.5 step 4 repeats it at the point of use. Without
         // that, a manifest filing one party's public key under another party's id makes every
         // later lookup resolve the name a checkpoint carries to the key the manifest chose.
-        let fixture = MirrorFixture::conformance().with_mismatched_log_key_id();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_mismatched_log_key_id();
         let size = fixture.appended_tree_size();
         let error = fixture.establish(size).expect_err("the key id does not recompute");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
@@ -1186,7 +1216,9 @@ mod tests {
         // Core §7.3 and adaptor §7.3.2: the epoch is declared once, by the genesis manifest,
         // and repeated unchanged by every later version. A movable epoch would let an operator
         // re-anchor the series after the fact and erase an interval it failed to cover.
-        let fixture = MirrorFixture::conformance().with_moved_cadence_epoch();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_moved_cadence_epoch();
         let size = fixture.appended_tree_size();
         let error = fixture.establish(size).expect_err("the epoch moved");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
@@ -1201,7 +1233,9 @@ mod tests {
         // branch — and here the server's choice is the one whose root nothing recomputes,
         // which would answer a divergence with "evidence not obtained" instead of the verdict
         // the divergence actually supports.
-        let fixture = MirrorFixture::conformance().with_equivocation_first_at(13);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_first_at(13);
         let error = fixture.establish(13).expect_err("at the floor");
         assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid);
@@ -1214,8 +1248,12 @@ mod tests {
         // the `(tree_size, checkpoint_time)` order — and §6.6 requires the relationship to a
         // following member where one exists. Neighbours taken by `tree_size` alone would step
         // straight past it and report a successor that was published as not observed.
-        let newest = MirrorFixture::conformance().newest_tree_size();
-        let fixture = MirrorFixture::conformance().with_republish_at(newest);
+        let newest = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .newest_tree_size();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_republish_at(newest);
         let anchored = fixture.establish(newest).expect("established");
 
         // The mirror serialized the later republication first. Core §7.3 makes the earliest
@@ -1236,7 +1274,10 @@ mod tests {
         );
 
         // Without the republication the same checkpoint is the newest observed member.
-        let anchored = MirrorFixture::conformance().establish(newest).expect("established");
+        let anchored = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .establish(newest)
+            .expect("established");
         assert!(anchored
             .findings
             .iter()
@@ -1251,7 +1292,9 @@ mod tests {
         // statement; what a verifier cannot do is read what it means. Leaving it inert is the
         // CLI deciding it carries no edge, no authority and no scope — which nothing
         // establishes.
-        let fixture = MirrorFixture::conformance().with_unknown_statement_type();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_unknown_statement_type();
         let error =
             fixture.establish(fixture.appended_tree_size()).expect_err("unknown statement type");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid, "{error}");
@@ -1264,7 +1307,8 @@ mod tests {
 
     #[test]
     fn the_newest_observed_member_is_labelled_run_observed_rather_than_latest() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let newest = fixture.newest_tree_size();
         let anchored = fixture.establish(newest).expect("established");
         assert!(anchored
@@ -1275,7 +1319,9 @@ mod tests {
 
     #[test]
     fn a_result_grounded_at_or_beyond_an_equivocation_floor_is_positive_proof_of_misbehaviour() {
-        let fixture = MirrorFixture::conformance().with_equivocation_at(13);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(13);
         let error = fixture.establish(13).expect_err("at the floor");
         assert!(matches!(error, CliError::EquivocationAtOrBeyondFloor { floor: 13 }), "{error}");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Invalid);
@@ -1283,14 +1329,18 @@ mod tests {
 
     #[test]
     fn a_result_grounded_below_the_floor_keeps_its_outcome_and_carries_the_divergence() {
-        let fixture = MirrorFixture::conformance().with_equivocation_at(13);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(13);
         let anchored = fixture.establish(8).expect("below the floor");
         assert!(anchored.findings.iter().any(|finding| finding.code == "divergence-below-floor"));
     }
 
     #[test]
     fn a_checkpoint_signed_by_a_key_the_manifest_does_not_declare_does_not_authenticate() {
-        let fixture = MirrorFixture::conformance().with_foreign_log_key(8);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_foreign_log_key(8);
         let error = fixture.establish(8).expect_err("foreign key");
         assert!(error.to_string().contains("does not verify"), "{error}");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
@@ -1298,14 +1348,17 @@ mod tests {
 
     #[test]
     fn a_tampered_entry_breaks_the_root_recomputation() {
-        let fixture = MirrorFixture::conformance().with_tampered_entry(3);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_tampered_entry(3);
         let error = fixture.establish(8).expect_err("tampered");
         assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
     }
 
     #[test]
     fn the_governing_trigger_is_the_greatest_entry_index_among_effective_ones() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(fixture.newest_tree_size()).expect("established");
         let (dataset, record) = fixture.record_f();
         let governing = governing_trigger(&anchored, &dataset, &record).expect("governs");
@@ -1327,7 +1380,8 @@ mod tests {
 
     #[test]
     fn a_record_that_was_never_introduced_has_no_authority_to_trigger_it() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(8).expect("established");
         let error = governing_trigger(&anchored, "customers", "sha256:deadbeef")
             .expect_err("never introduced");
@@ -1336,7 +1390,8 @@ mod tests {
 
     #[test]
     fn a_record_with_no_effective_trigger_is_reported_as_such() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(8).expect("established");
         let (dataset, record) = fixture.record_b();
         let error = governing_trigger(&anchored, &dataset, &record).expect_err("no trigger");
@@ -1402,7 +1457,8 @@ mod tests {
         // Adaptor §10.1.1 verifier duty 1: recompute the digest and reject unless it equals the
         // requested id. That makes retrieval self-checking — a deployment cannot substitute a
         // different entry, and the bytes need not be trusted because of their source.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let mirror = Mirror::new(
             &fixture,
             crate::testing::MIRROR,
@@ -1427,7 +1483,8 @@ mod tests {
 
     #[test]
     fn required_tree_roots_are_collected_before_traversal_begins() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let anchored = fixture.establish(fixture.newest_tree_size()).expect("established");
         let roots = required_tree_roots(&anchored.statements);
         assert!(!roots.is_empty(), "the corpus commits batch and disposition trees");
@@ -1444,7 +1501,9 @@ mod tests {
         // proofs are real, and the forged manifest even links correctly to the version active
         // before it — so if governance were collected before it was authenticated, this would
         // authenticate.
-        let fixture = MirrorFixture::conformance().with_forged_manifest();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_forged_manifest();
         let size = fixture.forged_tree_size();
 
         let error = fixture.establish(size).expect_err("the forged chain must not authenticate");

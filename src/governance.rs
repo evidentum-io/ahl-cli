@@ -1911,7 +1911,8 @@ mod tests {
         // and only the first may govern. The predecessor test would refuse the second copy too,
         // for a reason that is not what happened, so the rule is applied where it belongs and
         // the finding says which entry governs instead.
-        let fixture = crate::testing::MirrorFixture::conformance();
+        let fixture = crate::testing::MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let entries: Vec<(u64, Value)> = fixture
             .corpus_entries()
             .into_iter()
