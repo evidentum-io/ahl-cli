@@ -383,12 +383,33 @@ fn the_published_checkpoints_authenticate_under_the_corpus_manifests() {
         &std::fs::read(corpus().join("vectors/checkpoints/checkpoints.json")).expect("vector"),
     )
     .expect("parses");
-    let log_key = ahl_core::TestKey::from_seed_hex(
-        "log-1",
-        std::fs::read_to_string(corpus().join("keys/log-1.seed")).expect("seed").trim(),
-    )
-    .expect("seed");
-    let keys = std::collections::BTreeMap::from([(log_key.key_id(), log_key.pubkey())]);
+    // Every log key the corpus publishes, not just the first: the log rotates its
+    // checkpoint-signing key by anchoring a new manifest version, and the corpus does. Holding
+    // one key would make the members past the rotation fail for the one reason that is not a
+    // defect — this verifier not being given the key the governing version declares.
+    let mut seeds: Vec<std::path::PathBuf> = std::fs::read_dir(corpus().join("keys"))
+        .expect("keys")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("log-") && name.ends_with(".seed"))
+        })
+        .collect();
+    seeds.sort();
+    assert!(seeds.len() >= 2, "the corpus rotates its log key: {seeds:?}");
+    let keys: std::collections::BTreeMap<String, String> = seeds
+        .iter()
+        .map(|seed| {
+            let name = seed.file_stem().and_then(|name| name.to_str()).unwrap_or("log");
+            let key = ahl_core::TestKey::from_seed_hex(
+                name,
+                std::fs::read_to_string(seed).expect("seed").trim(),
+            )
+            .expect("seed");
+            (key.key_id(), key.pubkey())
+        })
+        .collect();
 
     let members = vector["checkpoints"].as_array().expect("checkpoints");
     assert!(!members.is_empty());

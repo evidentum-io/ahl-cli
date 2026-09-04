@@ -68,7 +68,8 @@ pub struct MirrorFixture {
     /// Canonical entry bytes, dense from entry index 0.
     entries: Vec<Vec<u8>>,
     /// The corpus log-signing key.
-    log_key: TestKey,
+    /// The log's checkpoint-signing keys, in the order the corpus adopts them.
+    log_keys: Vec<TestKey>,
     /// A key the corpus manifests never declare, for the "foreign key" fixture.
     foreign_key: TestKey,
     /// Witness keys by name.
@@ -158,7 +159,7 @@ impl MirrorFixture {
         Self {
             policy: corpus_policy(root),
             entries,
-            log_key: seed(root, "log-1"),
+            log_keys: vec![seed(root, "log-1"), seed(root, "log-2")],
             foreign_key: TestKey::from_seed_hex("foreign", &"7f".repeat(32))
                 .unwrap_or_else(|_| unreachable()),
             witness_keys: BTreeMap::from([
@@ -358,7 +359,7 @@ impl MirrorFixture {
             "checkpoint_cadence": "PT1H",
             "cadence_epoch": self.genesis_cadence_epoch(),
             "witness_grace_period": "PT15M",
-            "keys": [ self.log_key.key_object(0) ],
+            "keys": [ self.log_keys[0].key_object(0) ],
         });
         alter(&mut log);
         let manifest = ahl_core::envelope(
@@ -384,7 +385,7 @@ impl MirrorFixture {
     /// checkpoint does not commit has not been adopted yet (design note §2 rule 4).
     #[must_use]
     pub fn with_future_activated_log_key(self) -> Self {
-        let key = self.log_key.key_object(u64::MAX);
+        let key = self.log_keys[0].key_object(u64::MAX);
         self.with_appended_manifest(move |log| log["keys"] = json!([key]))
     }
 
@@ -398,7 +399,7 @@ impl MirrorFixture {
         let borrowed_id = self.foreign_key.key_id();
         let object = json!({
             "key_id": borrowed_id,
-            "pubkey": self.log_key.pubkey(),
+            "pubkey": self.log_keys[0].pubkey(),
             "valid_from_index": 0,
         });
         self.appended_key_id = Some(borrowed_id);
@@ -585,6 +586,32 @@ impl MirrorFixture {
         ahl_core::hash_hex(&compute_root(&hashes))
     }
 
+    /// The log key the manifest version governing a checkpoint of `tree_size` declares.
+    ///
+    /// A log rotates its checkpoint-signing key by anchoring a new manifest version, and the
+    /// corpus does exactly that. Signing every published checkpoint with the genesis key would
+    /// make the fixture a log that announces a rotation and never performs one — and every
+    /// client test grounded past the rotation would then be asserting against material no
+    /// conformant log would serve.
+    fn log_key_for(&self, tree_size: u64) -> &TestKey {
+        let entries: Vec<(u64, Value)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bytes)| {
+                Some((u64::try_from(index).ok()?, serde_json::from_slice(bytes).ok()?))
+            })
+            .collect();
+        let active = crate::governance::Governance::resolve(&entries, &self.policy.trust)
+            .ok()
+            .and_then(|(governance, _)| governance.log_keys_for(tree_size).ok())
+            .unwrap_or_default();
+        self.log_keys
+            .iter()
+            .find(|candidate| active.contains_key(&candidate.key_id()))
+            .unwrap_or(&self.log_keys[0])
+    }
+
     fn log_id(&self) -> String {
         // Read from the genesis manifest rather than restated, so the fixture cannot drift.
         self.entries
@@ -598,7 +625,7 @@ impl MirrorFixture {
     }
 
     fn checkpoint(&self, tree_size: u64, root: &str, time: &str, foreign: bool) -> Checkpoint {
-        let key = if foreign { &self.foreign_key } else { &self.log_key };
+        let key = if foreign { &self.foreign_key } else { self.log_key_for(tree_size) };
         let mut checkpoint = Checkpoint {
             log_id: self.log_id(),
             tree_size,
@@ -668,7 +695,7 @@ impl MirrorFixture {
         // Manifest v2 is anchored at entry 25 and rotates the witness set in full, so it
         // governs every checkpoint whose `tree_size` exceeds 25.
         let name = if tree_size > 25 { "witness-2" } else { "witness-1" };
-        (name, self.witness_keys.get(name).unwrap_or(&self.log_key))
+        (name, self.witness_keys.get(name).unwrap_or(&self.log_keys[0]))
     }
 
     /// A cosigned checkpoint, as the witness publishes it.
