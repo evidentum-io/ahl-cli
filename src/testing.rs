@@ -70,6 +70,8 @@ pub struct MirrorFixture {
     /// The corpus log-signing key.
     /// The log's checkpoint-signing keys, in the order the corpus adopts them.
     log_keys: Vec<TestKey>,
+    /// Sign every checkpoint with the outgoing key, ignoring the rotation.
+    outgoing_log_key: bool,
     /// A key the corpus manifests never declare, for the "foreign key" fixture.
     foreign_key: TestKey,
     /// Witness keys by name.
@@ -160,6 +162,7 @@ impl MirrorFixture {
             policy: corpus_policy(root),
             entries,
             log_keys: vec![seed(root, "log-1"), seed(root, "log-2")],
+            outgoing_log_key: false,
             foreign_key: TestKey::from_seed_hex("foreign", &"7f".repeat(32))
                 .unwrap_or_else(|_| unreachable()),
             witness_keys: BTreeMap::from([
@@ -446,6 +449,21 @@ impl MirrorFixture {
         self
     }
 
+    /// Sign every checkpoint with the log's OUTGOING key, as a log that rotated its
+    /// checkpoint-signing key and then kept signing with the old one would.
+    ///
+    /// Distinct from [`Self::with_foreign_log_key`], which signs with a key no manifest version
+    /// ever declared. This key IS declared by the corpus — by the version active before the
+    /// rotation — so it exercises I-D §7.5.1 4f rather than "unknown key": keys resolve from the
+    /// manifest version active for THE CHECKPOINT BEING VERIFIED, and a retired one does not
+    /// authenticate a checkpoint the version after it governs. A verifier resolving the key by
+    /// any other index would accept this.
+    #[must_use]
+    pub const fn with_outgoing_log_key(mut self) -> Self {
+        self.outgoing_log_key = true;
+        self
+    }
+
     /// Serve different bytes for the entry at `index`, so root recomputation fails.
     #[must_use]
     pub const fn with_tampered_entry(mut self, index: usize) -> Self {
@@ -609,6 +627,9 @@ impl MirrorFixture {
     /// client test grounded past the rotation would then be asserting against material no
     /// conformant log would serve.
     fn log_key_for(&self, tree_size: u64) -> &TestKey {
+        if self.outgoing_log_key {
+            return &self.log_keys[0];
+        }
         let entries: Vec<(u64, Value)> = self
             .entries
             .iter()

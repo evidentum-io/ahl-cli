@@ -1106,6 +1106,27 @@ mod tests {
     }
 
     #[test]
+    fn the_outgoing_log_key_never_authenticates_a_checkpoint_past_the_rotation() {
+        // I-D §7.5.1 4f, and design note §2 rule 4: the key a checkpoint's signature resolves
+        // through comes from the manifest version active FOR THAT CHECKPOINT. The corpus
+        // rotates its checkpoint-signing key, and this fixture keeps signing with the outgoing
+        // one — a key the corpus really did declare, so what is being tested is the RESOLUTION
+        // and not "unknown key", which `with_foreign_log_key` already covers.
+        let rotated = MirrorFixture::conformance();
+        let newest = rotated.newest_tree_size();
+        rotated.establish(newest).expect("the governing key signs the newest checkpoint");
+
+        let stale = MirrorFixture::conformance().with_outgoing_log_key();
+        let error = stale.establish(newest).expect_err("the outgoing key does not authenticate");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable, "{error}");
+        assert!(error.to_string().contains("does not verify"), "{error}");
+
+        // And the same key still authenticates the checkpoints the version before the rotation
+        // governs: a retired key is not a bad key, it is a key resolved at the wrong index.
+        stale.establish(20).expect("before the rotation the outgoing key is the governing one");
+    }
+
+    #[test]
     fn a_log_key_declared_but_not_yet_active_never_authenticates_a_checkpoint() {
         // Design note §2 rule 4: the signing key must be in the governing version's `log.keys`
         // **and active by `valid_from_index`**. Declaring a key is not adopting it, and a
