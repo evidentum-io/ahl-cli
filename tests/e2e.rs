@@ -93,16 +93,35 @@ pub struct Pilot {
     pub work: PathBuf,
 }
 
+/// Why a run did not start.
+///
+/// The two are not the same thing and must not be reported as one. A prerequisite this machine
+/// does not have is a **skip** — the pilot documents what it needs, and a reviewer without a
+/// sibling checkout is owed a message rather than a red test. Everything after the prerequisite
+/// check is a **failure**, because by then the pilot had what it asked for.
+pub enum Start {
+    /// A documented prerequisite is absent.
+    Skip(String),
+    /// The pilot had what it needed and did not come up anyway.
+    Failed(String),
+}
+
 /// Bring the deployment up: keys, genesis manifest, configurations, processes, policy.
 ///
 /// # Errors
 ///
-/// A reason a reviewer can act on: a missing checkout, a missing profile document, a build
-/// failure, or a server that never became ready. The caller decides whether that is a skip or
-/// a failure.
-pub fn start() -> Result<Pilot, String> {
+/// [`Start::Skip`] where a checkout or the adaptor profile document is absent;
+/// [`Start::Failed`] for a build failure, a server that never became ready, or anything else
+/// that goes wrong once the prerequisites are in place.
+pub fn start() -> Result<Pilot, Start> {
     let profile = profile_path();
-    stack::preflight(&profile)?;
+    stack::preflight(&profile).map_err(Start::Skip)?;
+    inner(&profile).map_err(Start::Failed)
+}
+
+/// Everything after the prerequisite check, where a failure is a failure.
+fn inner(profile: &Path) -> Result<Pilot, String> {
+    let profile = profile.to_path_buf();
     let profile_bytes = std::fs::read(&profile)
         .map_err(|source| format!("cannot read `{}`: {source}", profile.display()))?;
     let profile_hash = ahl_core::sha256_hex(&profile_bytes);
@@ -140,7 +159,14 @@ pub fn start() -> Result<Pilot, String> {
     let work = stack.dir.path().join("work");
     std::fs::create_dir_all(&work)
         .map_err(|source| format!("cannot create a work dir: {source}"))?;
-    let policy = scenario::policy_file(&work, &genesis, &keys, &profile, &profile_hash, &stack);
+    // The policy holds a SNAPSHOT of the profile document, not a path into a working tree.
+    // Adaptor §14 makes a profile its bytes, and the bytes a policy pins are the ones it
+    // possesses; reading them live would let an edit made while the run is in flight break a
+    // pin that was correct when it was taken — which is exactly what happened once here.
+    let held = work.join("ahl-adaptor-atl-v1.md");
+    std::fs::write(&held, &profile_bytes)
+        .map_err(|source| format!("cannot hold the profile document: {source}"))?;
+    let policy = scenario::policy_file(&work, &genesis, &keys, &held, &profile_hash, &stack);
     let mut key_files = BTreeMap::new();
     for (name, seed) in
         [(scenario::PRODUCER, scenario::PRODUCER_1_SEED), ("producer-2", scenario::PRODUCER_2_SEED)]
@@ -227,9 +253,14 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         eprintln!("skipped: set AHL_E2E=1 to run the end-to-end pilot");
         return;
     }
+    let before = stack::checkout_statuses();
     let pilot = match start() {
         Ok(pilot) => pilot,
-        Err(reason) => panic!("the pilot could not start: {reason}"),
+        Err(Start::Skip(reason)) => {
+            eprintln!("skipped: {reason}");
+            return;
+        }
+        Err(Start::Failed(reason)) => panic!("the pilot could not start: {reason}"),
     };
     let replay = pilot::replay(&pilot);
 
@@ -298,6 +329,7 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
     for (name, reason) in &replay.skipped {
         eprintln!("  SKIPPED {name}: {reason}");
     }
+    assert_pristine(&before);
     assert!(
         failures.is_empty(),
         "the live stack diverged from the corpus:\n{}",
@@ -311,9 +343,14 @@ fn the_live_stack_starts_and_binds_to_the_log_the_harness_derived() {
         eprintln!("skipped: set AHL_E2E=1 to run the end-to-end pilot");
         return;
     }
+    let before = stack::checkout_statuses();
     let pilot = match start() {
         Ok(pilot) => pilot,
-        Err(reason) => panic!("the pilot could not start: {reason}"),
+        Err(Start::Skip(reason)) => {
+            eprintln!("skipped: {reason}");
+            return;
+        }
+        Err(Start::Failed(reason)) => panic!("the pilot could not start: {reason}"),
     };
 
     // The mirror holds the genesis manifest at entry index 0, retrievable by its AHL entry id.
@@ -342,4 +379,21 @@ fn the_live_stack_starts_and_binds_to_the_log_the_harness_derived() {
     let policy = std::fs::read_to_string(&pilot.policy).expect("the policy is readable");
     assert!(policy.contains(&pilot.profile_hash), "the policy does not pin the digest it computed");
     assert!(policy.contains("PILOT-ONLY"), "the pilot-only pin is not stated in the policy");
+    assert_pristine(&before);
+}
+
+/// Every checkout the pilot reads must be exactly as it was found.
+///
+/// The harness builds from `git archive` copies with a scratch `CARGO_TARGET_DIR` precisely so
+/// that this holds; asserting it is what keeps it true when someone changes the build path.
+fn assert_pristine(before: &BTreeMap<String, String>) {
+    let after = stack::checkout_statuses();
+    for (checkout, status) in before {
+        let now = after.get(checkout).map(String::as_str).unwrap_or_default();
+        assert_eq!(
+            status.as_str(),
+            now,
+            "the pilot modified the `{checkout}` checkout; before:\n{status}\nafter:\n{now}"
+        );
+    }
 }

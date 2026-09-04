@@ -1,8 +1,17 @@
 //! Process supervision for the live stack: build, start, wait, tear down.
 //!
-//! Three server processes and no mocks. Every binary is built from its own checkout with
-//! `cargo build --release` and reused between runs; nothing here vendors a copy or shells out
-//! to a package manager.
+//! Three server processes and no mocks.
+//!
+//! # Nothing here writes to a checkout
+//!
+//! Every binary is built from a **scratch copy** of its checkout, extracted with
+//! `git archive HEAD`, with `--locked` and a scratch `CARGO_TARGET_DIR`. Building inside the
+//! checkouts themselves was the previous arrangement and it was wrong twice over: it wrote a
+//! `target/` into somebody's working tree, and it rewrote `atl-server`'s `Cargo.lock` — that
+//! checkout carries an untracked `.cargo/config.toml` patching `atl-core` to a sibling whose
+//! version no longer satisfies the manifest, so every build recorded a `[patch.unused]` stanza.
+//! `git archive` carries tracked files only, so the copy has no such config, `--locked`
+//! succeeds, and the checkout is untouched. The tests assert that afterwards.
 //!
 //! The whole stack lives in one scratch directory that is removed when [`Stack`] drops. The
 //! `atl-server` checkout carries an operator's own `atl.db` and `signing.key`; this harness
@@ -20,10 +29,21 @@ use std::time::{Duration, Instant};
 /// How long a server gets to answer before the harness gives up on it.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many times a server may be restarted on a fresh port before the harness gives up.
+///
+/// A free port is chosen by binding and releasing, which is inherently racy: something else can
+/// take it in between. Retrying is the honest answer; a fixed port would collide with whatever
+/// the developer already runs.
+const PORT_ATTEMPTS: usize = 5;
+
 /// The sibling checkouts this pilot runs against, relative to this crate's manifest directory.
 const ATL_SERVER: &str = "../../evidentum.io/atl-server";
+const CORE: &str = "../ahl-core";
 const MIRROR: &str = "../ahl-mirror";
 const WITNESS: &str = "../ahl-witness";
+
+/// Every checkout the pilot reads, in the order the pristine check reports them.
+pub const CHECKOUTS: [&str; 4] = [ATL_SERVER, CORE, MIRROR, WITNESS];
 
 /// A running server, its base URL, and the file its output went to.
 pub struct Server {
@@ -81,30 +101,137 @@ pub fn checkout(relative: &str) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
 }
 
-/// Build one checkout in release and return the path of the named binary.
+/// `git status --porcelain` for every checkout the pilot reads.
 ///
-/// The binary is reused between runs: `cargo build` is a no-op once the checkout is unchanged.
-pub fn build(relative: &str, binary: &str) -> Result<PathBuf, String> {
+/// Captured before a run and compared after it: the harness must leave a working tree exactly
+/// as it found it, and an assertion is the only way that stays true.
+pub fn checkout_statuses() -> BTreeMap<String, String> {
+    CHECKOUTS
+        .into_iter()
+        .map(|relative| {
+            let root = checkout(relative);
+            let status = Command::new("git")
+                .args(["-C", &root.display().to_string(), "status", "--porcelain"])
+                .output()
+                .map_or_else(
+                    |source| format!("<git status failed: {source}>"),
+                    |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+                );
+            (relative.to_owned(), status)
+        })
+        .collect()
+}
+
+/// The git tree object of a checkout's `HEAD` — what `git archive HEAD` will extract.
+///
+/// The build cache is keyed on it, so a rebuild happens when and only when the committed source
+/// changes. Uncommitted work in a checkout is deliberately invisible here: `git archive` would
+/// not carry it either, and a cache key that claimed otherwise would be lying.
+fn head_tree(relative: &str) -> Result<String, String> {
     let root = checkout(relative);
-    if !root.is_dir() {
-        return Err(format!("checkout `{}` is absent", root.display()));
+    let output = Command::new("git")
+        .args(["-C", &root.display().to_string(), "rev-parse", "HEAD^{tree}"])
+        .output()
+        .map_err(|source| format!("cannot run git in `{}`: {source}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!("`{}` has no HEAD to archive", root.display()));
     }
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--release", "--bin", binary])
-        .current_dir(&root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Extract a checkout's committed tree into `dest`.
+///
+/// `git archive` rather than a copy: it carries tracked files only, so nothing untracked — a
+/// local `.cargo/config.toml`, a database, a signing key, a `target/` — reaches the build.
+fn archive_into(relative: &str, dest: &Path) -> Result<(), String> {
+    let root = checkout(relative);
+    std::fs::create_dir_all(dest)
+        .map_err(|source| format!("cannot create `{}`: {source}", dest.display()))?;
+    let tarball = dest.join(".source.tar");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &root.display().to_string(),
+            "archive",
+            "--format=tar",
+            "-o",
+            &tarball.display().to_string(),
+            "HEAD",
+        ])
+        .output()
+        .map_err(|source| format!("cannot run git in `{}`: {source}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git archive` failed in `{}`: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let status = Command::new("tar")
+        .args(["-xf", &tarball.display().to_string(), "-C", &dest.display().to_string()])
         .status()
-        .map_err(|source| format!("cannot run cargo in `{}`: {source}", root.display()))?;
-    if !status.success() {
-        return Err(format!("`cargo build --release` failed in `{}`", root.display()));
-    }
-    let path = root.join("target/release").join(binary);
-    if path.is_file() {
-        Ok(path)
+        .map_err(|source| format!("cannot run tar: {source}"))?;
+    let _ = std::fs::remove_file(&tarball);
+    if status.success() {
+        Ok(())
     } else {
-        Err(format!("`{}` was not produced", path.display()))
+        Err(format!("`tar -xf` failed extracting `{relative}`"))
     }
+}
+
+/// Where built binaries are cached between runs, keyed by the source they were built from.
+fn cache_root() -> PathBuf {
+    std::env::temp_dir().join("ahl-cli-e2e-build")
+}
+
+/// Build one group of checkouts from scratch copies, and return the named binaries.
+///
+/// The group travels together because path dependencies do: `ahl-mirror` and `ahl-witness`
+/// depend on `../ahl-core`, so the copies have to keep their siblinghood. The cache key is
+/// every member's `HEAD` tree, so a change to `ahl-core` rebuilds the two that depend on it.
+fn build_group(
+    label: &str,
+    members: &[&'static str],
+    binaries: &[(&'static str, &'static str)],
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut key = String::from(label);
+    for member in members {
+        key.push('-');
+        key.push_str(&head_tree(member)?);
+    }
+    let root = cache_root().join(key);
+    let target = root.join("target");
+    let built: BTreeMap<String, PathBuf> = binaries
+        .iter()
+        .map(|(_, binary)| ((*binary).to_owned(), target.join("release").join(binary)))
+        .collect();
+    if built.values().all(|path| path.is_file()) {
+        return Ok(built);
+    }
+    for member in members {
+        let name = Path::new(member).file_name().unwrap_or_default();
+        archive_into(member, &root.join("src").join(name))?;
+    }
+    for (member, binary) in binaries {
+        let name = Path::new(member).file_name().unwrap_or_default();
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "--release", "--locked", "--bin", binary])
+            .current_dir(root.join("src").join(name))
+            .env("CARGO_TARGET_DIR", &target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|source| format!("cannot run cargo for `{binary}`: {source}"))?;
+        if !status.success() {
+            return Err(format!("`cargo build --release --locked` failed for `{binary}`"));
+        }
+    }
+    for (binary, path) in &built {
+        if !path.is_file() {
+            return Err(format!("`{binary}` was not produced at `{}`", path.display()));
+        }
+    }
+    Ok(built)
 }
 
 /// A free loopback port.
@@ -277,10 +404,39 @@ fn start_health_server(
 
 /// Build every binary the pilot needs, or say which checkout is missing.
 pub fn build_all() -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    Ok((
-        build(ATL_SERVER, "atl-server")?,
-        build(MIRROR, "ahl-mirror")?,
-        build(WITNESS, "ahl-witness")?,
+    let log = build_group("atl", &[ATL_SERVER], &[(ATL_SERVER, "atl-server")])?;
+    // `ahl-mirror` and `ahl-witness` are path-dependent on `../ahl-core`, so the three copies
+    // keep their siblinghood and share one cache key.
+    let ahl = build_group(
+        "ahl",
+        &[CORE, MIRROR, WITNESS],
+        &[(MIRROR, "ahl-mirror"), (WITNESS, "ahl-witness")],
+    )?;
+    let get = |set: &BTreeMap<String, PathBuf>, name: &str| {
+        set.get(name).cloned().ok_or_else(|| format!("`{name}` was not built"))
+    };
+    Ok((get(&log, "atl-server")?, get(&ahl, "ahl-mirror")?, get(&ahl, "ahl-witness")?))
+}
+
+/// Start a server, retrying on a fresh port when the one chosen was taken in between.
+fn with_port_retry(
+    name: &str,
+    mut attempt: impl FnMut(u16) -> Result<Server, String>,
+) -> Result<Server, String> {
+    let mut last = String::new();
+    for _ in 0..PORT_ATTEMPTS {
+        let port = free_port();
+        match attempt(port) {
+            Ok(server) => return Ok(server),
+            Err(reason) if reason.contains("in use") || reason.contains("AddrInUse") => {
+                last = reason;
+            }
+            Err(reason) => return Err(reason),
+        }
+    }
+    Err(format!(
+        "`{name}` could not hold a free loopback port over {PORT_ATTEMPTS} attempts; the last \
+         one reported: {last}"
     ))
 }
 
@@ -299,11 +455,17 @@ pub fn start(
         .map_err(|source| format!("cannot create a scratch directory: {source}"))?;
     let root = dir.path().to_path_buf();
 
-    let log = start_log(&root, &log_binary, free_port(), tree_uuid, log_signing_key)?;
-    let mirror = start_health_server(&root, &mirror_binary, "mirror", free_port(), mirror_config)?;
+    let log = with_port_retry("atl-server", |port| {
+        start_log(&root, &log_binary, port, tree_uuid, log_signing_key)
+    })?;
+    let mirror = with_port_retry("ahl-mirror", |port| {
+        start_health_server(&root, &mirror_binary, "mirror", port, mirror_config)
+    })?;
     let mut witnesses = BTreeMap::new();
     for (witness_id, config) in witness_configs {
-        let server = start_health_server(&root, &witness_binary, witness_id, free_port(), config)?;
+        let server = with_port_retry(witness_id, |port| {
+            start_health_server(&root, &witness_binary, witness_id, port, config)
+        })?;
         witnesses.insert(witness_id.clone(), server);
     }
     Ok(Stack { dir, log, mirror, witnesses })
@@ -311,7 +473,7 @@ pub fn start(
 
 /// Whether the pilot may run at all: the three checkouts and the profile document must be here.
 pub fn preflight(profile: &Path) -> Result<(), String> {
-    for relative in [ATL_SERVER, MIRROR, WITNESS] {
+    for relative in CHECKOUTS {
         let root = checkout(relative);
         if !root.join("Cargo.toml").is_file() {
             return Err(format!("sibling checkout `{}` is absent", root.display()));
