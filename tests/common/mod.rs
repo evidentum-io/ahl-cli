@@ -261,3 +261,56 @@ pub fn newest_published_size(name: &str) -> u64 {
         .max()
         .expect("the transcript publishes a checkpoint series")
 }
+
+/// A policy file for one receipt set, written from the set's own `index.json`.
+///
+/// The conformance corpus carries more than one toy log, and a trust policy names ONE published
+/// genesis anchor, so a second set brings its own policy with it: its own anchor, its own
+/// producer key fingerprints, and its own adaptor profile — a different id, a different held
+/// document, different capabilities. Every member is read from the index rather than written
+/// down here, so running a set through the binary exercises the CLI's profile plumbing over
+/// whatever the corpus actually publishes.
+pub fn policy_for_set(dir: &Path, set: &str) -> PathBuf {
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join(set).join("index.json")).expect("index"),
+    )
+    .expect("index parses");
+    let block = &index["policy"];
+    let key_ids: Vec<String> = block["genesis_key_ids"]
+        .as_array()
+        .expect("key ids")
+        .iter()
+        .map(|id| format!("\"{}\"", id.as_str().unwrap_or_default()))
+        .collect();
+
+    let mut text = format!(
+        "[policy]\ngenesis_entry_id = \"{}\"\ngenesis_key_ids = [{}]\n\n",
+        block["genesis_entry_id"].as_str().unwrap_or_default(),
+        key_ids.join(", ")
+    );
+    for (id, declared) in block["adaptor_profiles"].as_object().expect("adaptor profiles") {
+        let document = declared["document"]
+            .as_str()
+            .map_or_else(|| format!("adaptor/{id}.md"), std::borrow::ToOwned::to_owned);
+        let _ = write!(
+            text,
+            "[policy.adaptor_profiles.{id}]\nhash = \"{}\"\npath = \"{}\"\n\
+             checkpoint_raw = {}\nconsistency_proofs = {}\n\n",
+            declared["hash"].as_str().unwrap_or_default(),
+            corpus().join(document).display(),
+            declared["capabilities"]["checkpoint_raw"].as_bool().unwrap_or(false),
+            declared["capabilities"]["consistency_proofs"].as_bool().unwrap_or(false),
+        );
+    }
+    if block["dataset_keys"].get("customers").is_some() {
+        let key = dir.join("customers.key");
+        std::fs::copy(corpus().join("keys/dataset_customers.key"), &key).expect("copy key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        text.push_str("[policy.dataset_keys.customers]\nfile = \"customers.key\"\n\n");
+    }
+
+    let path = dir.join(format!("policy-{}.toml", set.replace('/', "-")));
+    std::fs::write(&path, text).expect("write policy");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    path
+}

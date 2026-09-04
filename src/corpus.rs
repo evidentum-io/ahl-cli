@@ -476,9 +476,9 @@ mod tests {
         // void of effect — so exactly one duplicate is reported, and the third is not among them:
         // a non-verifying entry is void under §7.5.1 4d and claims no statement id, so a later
         // copy is not repeating one it never took.
-        let duplicates: Vec<&Finding> =
-            findings.iter().filter(|finding| finding.code == "statement-id-not-unique").collect();
-        assert_eq!(duplicates.len(), 1, "one verifying duplicate, and only one: {findings:?}");
+        let duplicates =
+            findings.iter().filter(|finding| finding.code == "statement-id-not-unique").count();
+        assert_eq!(duplicates, 1, "one verifying duplicate, and only one: {findings:?}");
 
         // `governance-element-excluded` is the honest answer of an UNAUTHENTICATED walk, not a
         // defect of the corpus. The corpus anchors a manifest that does not verify, and the

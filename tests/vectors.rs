@@ -109,6 +109,65 @@ fn every_receipt_vector_reaches_the_outcome_the_corpus_declares() {
 }
 
 #[test]
+fn the_second_toy_log_conforms_through_the_binary_under_its_own_policy() {
+    // Design note §9: every vector in the corpus is exercised end to end through the BUILT
+    // BINARY, not only through the library. The corpus now publishes a second toy log, with its
+    // own genesis anchor and its own adaptor profile document, so "every vector" means this set
+    // too — and a second profile is the only thing that shows the CLI resolves A profile rather
+    // than THE profile.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy_path = common::policy_for_set(dir.path(), "receipts/atl").display().to_string();
+    let document: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(corpus().join("receipts/atl/index.json")).expect("index"),
+    )
+    .expect("index parses");
+    let vectors = document["vectors"].as_array().expect("vectors");
+    assert!(vectors.len() >= 10, "the ATL set carries 10+ receipts, got {}", vectors.len());
+
+    for vector in vectors {
+        let file = vector["file"].as_str().expect("file");
+        let expect = vector["expect"].as_str().expect("expect");
+        let (code, status) = match expect {
+            "verified" => (0, "valid"),
+            "invalid" => (1, "invalid"),
+            "unverifiable" => (3, "unverifiable"),
+            other => panic!("unknown expectation `{other}` for {file}"),
+        };
+        let run = ahl_cli(&[
+            "--policy",
+            &policy_path,
+            AT,
+            FIXED,
+            "--json",
+            "verify",
+            &corpus().join("receipts/atl").join(file).display().to_string(),
+        ]);
+        let report = run.json();
+        assert_eq!(run.code, code, "{file}: {}", report["reason"]);
+        assert_eq!(report["status"], status, "{file}");
+        assert_eq!(report["outcome"], status, "{file}");
+        assert_eq!(
+            report["informative"].as_array().expect("void entries").len() as u64,
+            vector["informative"].as_u64().unwrap_or(0),
+            "{file}: {report}"
+        );
+        if expect == "verified" {
+            assert_eq!(report["claim_type"], vector["claim_type"], "{file}");
+            continue;
+        }
+        assert!(report["boundary"].is_null(), "{file}: only `verified` renders a boundary");
+        let assertion = vector["finding"].as_str().expect("finding");
+        let assertions = report["assertions"].as_array().expect("assertions");
+        assert!(
+            assertions
+                .iter()
+                .any(|entry| entry["assertion"] == assertion && entry["outcome"] == expect),
+            "{file}: `{assertion}` is not reported as `{expect}`: {report}"
+        );
+    }
+}
+
+#[test]
 fn every_receipt_vector_also_inspects_without_a_verdict() {
     let dir = tempfile::tempdir().expect("tempdir");
     let policy_path = policy(dir.path(), &PolicySpec::default()).display().to_string();
@@ -391,9 +450,11 @@ fn the_published_checkpoints_authenticate_under_the_corpus_manifests() {
         .expect("keys")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("log-") && name.ends_with(".seed"))
+            path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("seed"))
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("log-"))
         })
         .collect();
     seeds.sort();

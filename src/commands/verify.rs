@@ -677,29 +677,64 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
     }
 
-    fn corpus_index() -> Value {
-        let bytes = std::fs::read(corpus().join("receipts/index.json")).expect("corpus index");
+    /// The main toy log's receipt set: `receipts/`.
+    const MAIN_SET: &str = "receipts";
+    /// The ATL-bound toy log's receipt set, a SECOND corpus with its own genesis anchor and its
+    /// own profile document: `receipts/atl/`.
+    const ATL_SET: &str = "receipts/atl";
+
+    fn index_of(set: &str) -> Value {
+        let bytes = std::fs::read(corpus().join(set).join("index.json")).expect("corpus index");
         serde_json::from_slice(&bytes).expect("index parses")
     }
 
+    fn corpus_index() -> Value {
+        index_of(MAIN_SET)
+    }
+
     fn corpus_policy(with_dataset_key: bool) -> LoadedPolicy {
-        let index = corpus_index();
+        policy_of(MAIN_SET, with_dataset_key)
+    }
+
+    /// The trust policy a receipt set's own `index.json` declares.
+    ///
+    /// Every member is read from the index — the anchor, the fingerprints, each profile's id,
+    /// pinned digest, held document and capabilities — because a set that brings its own log
+    /// brings its own policy with it. Hard-coding one id and one document path is what made
+    /// this helper unable to describe a second corpus at all, and the CLI's profile plumbing is
+    /// exactly what a second profile document exercises.
+    fn policy_of(set: &str, with_dataset_key: bool) -> LoadedPolicy {
+        let index = index_of(set);
         let policy_block = &index["policy"];
-        let profile_hash = policy_block["adaptor_profiles"]["ahl-test-log-v1"]["hash"]
-            .as_str()
-            .expect("pinned hash")
-            .to_owned();
-        // Declared by the corpus, never hard-coded: a capability is a property of the pinned
-        // profile document.
-        let declared = &policy_block["adaptor_profiles"]["ahl-test-log-v1"]["capabilities"];
-        let capabilities = ahl_core::receipt::AdaptorCapabilities {
-            checkpoint_raw: declared["checkpoint_raw"].as_bool().unwrap_or(false),
-            consistency_proofs: declared["consistency_proofs"].as_bool().unwrap_or(false),
-        };
-        let profile_path = corpus().join("adaptor/ahl-test-log-v1.md");
+
+        let mut profiles = BTreeMap::new();
+        for (id, declared) in
+            policy_block["adaptor_profiles"].as_object().expect("adaptor profiles")
+        {
+            let capabilities = ahl_core::receipt::AdaptorCapabilities {
+                checkpoint_raw: declared["capabilities"]["checkpoint_raw"]
+                    .as_bool()
+                    .unwrap_or(false),
+                consistency_proofs: declared["capabilities"]["consistency_proofs"]
+                    .as_bool()
+                    .unwrap_or(false),
+            };
+            // `document` where the index names one; otherwise the main set's own convention.
+            let document = declared["document"]
+                .as_str()
+                .map_or_else(|| format!("adaptor/{id}.md"), str::to_owned);
+            profiles.insert(
+                id.clone(),
+                ConfiguredProfile {
+                    hash: declared["hash"].as_str().expect("pinned hash").to_owned(),
+                    path: corpus().join(document),
+                    capabilities,
+                },
+            );
+        }
 
         let mut dataset_keys = BTreeMap::new();
-        if with_dataset_key {
+        if with_dataset_key && policy_block["dataset_keys"].get("customers").is_some() {
             let raw = std::fs::read_to_string(corpus().join("keys/dataset_customers.key"))
                 .expect("dataset key");
             dataset_keys.insert("customers".to_owned(), hex::decode(raw.trim()).expect("hex key"));
@@ -726,10 +761,7 @@ mod tests {
                 trusted_witness_keys: BTreeMap::new(),
                 limits: ahl_core::receipt::Limits::default(),
             },
-            profiles: BTreeMap::from([(
-                "ahl-test-log-v1".to_owned(),
-                ConfiguredProfile { hash: profile_hash, path: profile_path, capabilities },
-            )]),
+            profiles,
             endpoints: Endpoints::default(),
             network: NetworkLimits::default(),
             local: LocalLimits::default(),
@@ -753,11 +785,60 @@ mod tests {
     }
 
     fn verify_vector(file: &str, policy: &LoadedPolicy) -> Report {
+        verify_vector_of(MAIN_SET, file, policy)
+    }
+
+    fn verify_vector_of(set: &str, file: &str, policy: &LoadedPolicy) -> Report {
         run(
             policy,
             &at_corpus_time(),
-            &Options { receipt: corpus().join("receipts").join(file), require_fresh: false },
+            &Options { receipt: corpus().join(set).join(file), require_fresh: false },
         )
+    }
+
+    /// Every vector of one receipt set reaches the result, the assertion and the void-entry
+    /// count its own index declares.
+    fn assert_set_conforms(set: &str) -> usize {
+        let policy = policy_of(set, true);
+        let index = index_of(set);
+        let vectors = index["vectors"].as_array().expect("vectors");
+        for vector in vectors {
+            let file = vector["file"].as_str().expect("file");
+            let expect = vector["expect"].as_str().expect("expect");
+            let report = verify_vector_of(set, file, &policy);
+            let status = match expect {
+                "verified" => "valid",
+                "invalid" => "invalid",
+                "unverifiable" => "unverifiable",
+                other => panic!("unknown expectation `{other}` for {set}/{file}"),
+            };
+            assert_eq!(report.status, Some(status), "{set}/{file}: {}", report.reason);
+            assert_eq!(report.outcome, status, "{set}/{file}");
+
+            let void = vector["informative"].as_u64().unwrap_or(0);
+            let reported = report.informative.as_ref().expect("void entries are reported");
+            assert_eq!(
+                u64::try_from(reported.len()).expect("small count"),
+                void,
+                "{set}/{file}: {reported:?}"
+            );
+
+            if expect == "verified" {
+                assert_eq!(report.claim_type.as_deref(), vector["claim_type"].as_str(), "{file}");
+                assert!(report.boundary.is_some(), "{set}/{file}");
+                continue;
+            }
+            assert!(report.boundary.is_none(), "{set}/{file}: only `verified` renders a boundary");
+            let assertion = vector["finding"].as_str().expect("finding");
+            let assertions = report.assertions.as_ref().expect("the findings are reported");
+            assert!(
+                assertions
+                    .iter()
+                    .any(|entry| entry.assertion == assertion && entry.outcome == expect),
+                "{set}/{file}: `{assertion}` is not reported as `{expect}`: {assertions:?}"
+            );
+        }
+        vectors.len()
     }
 
     #[test]
@@ -1308,6 +1389,32 @@ mod tests {
             report.policy_overlays
         );
         assert!(!report.to_text().contains("receipt result:"), "nothing to disambiguate");
+    }
+
+    #[test]
+    fn the_second_toy_log_conforms_under_its_own_policy_and_its_own_profile() {
+        // The ATL-shaped set is a SECOND corpus: its own genesis anchor — a trust policy names
+        // one (I-D §7.5.1 4a) — and its own profile document, held under a different id at a
+        // different path, declaring a capability the main profile does not. Running it is what
+        // shows the CLI's profile plumbing resolves A profile rather than THE profile: three of
+        // its negative vectors fail on `adaptor-profile` alone, which is the pinning path and
+        // nothing else.
+        let checked = assert_set_conforms(ATL_SET);
+        assert!(checked >= 10, "the ATL set carries 10+ receipts, got {checked}");
+
+        // The two sets are anchored to different logs, and neither policy verifies the other's
+        // receipts: an anchor is a property of local configuration, not of the artifact.
+        let main_anchor = index_of(MAIN_SET)["policy"]["genesis_entry_id"].clone();
+        let atl_anchor = index_of(ATL_SET)["policy"]["genesis_entry_id"].clone();
+        assert_ne!(main_anchor, atl_anchor, "a second log means a second anchor");
+        let crossed =
+            verify_vector_of(ATL_SET, "statement-anchored-atl-leaf.ahl", &corpus_policy(true));
+        assert_eq!(
+            crossed.status,
+            Some("unverifiable"),
+            "another corpus's receipt is not disproved, it is unanchored here: {}",
+            crossed.reason
+        );
     }
 
     #[test]
