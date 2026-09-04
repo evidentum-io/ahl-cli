@@ -352,6 +352,7 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         eprintln!("  SKIPPED {name}: {reason}");
     }
     assert_pristine(&before);
+    assert_committed_graph(&pilot);
     assert!(
         failures.is_empty(),
         "the live stack diverged from the corpus:\n{}",
@@ -402,6 +403,29 @@ fn the_live_stack_starts_and_binds_to_the_log_the_harness_derived() {
     assert!(policy.contains(&pilot.profile_hash), "the policy does not pin the digest it computed");
     assert!(policy.contains("PILOT-ONLY"), "the pilot-only pin is not stated in the policy");
     assert_pristine(&before);
+    assert_committed_graph(&pilot);
+}
+
+/// Refuse to call a run a pass when it did not build the committed dependency graph.
+///
+/// The `--offline` fallback resolves a stale lock against whatever the local cargo cache
+/// happens to hold, which is a different graph from the one the repository committed and is not
+/// the same for two machines. That is useful for diagnosing a stack mid-migration and is not
+/// evidence about the stack. `AHL_E2E_ALLOW_OFFLINE=1` says the operator wants the diagnostic
+/// run anyway.
+fn assert_committed_graph(pilot: &Pilot) {
+    if pilot.stack.stale_locks.is_empty()
+        || std::env::var("AHL_E2E_ALLOW_OFFLINE").ok().as_deref() == Some("1")
+    {
+        return;
+    }
+    panic!(
+        "this was a DIAGNOSTIC run, not a pass: {} committed a Cargo.lock that does not resolve \
+         against its path dependencies, so the pilot built it offline against whatever this \
+         machine's cargo cache holds rather than the graph the repository committed. Regenerate \
+         that lock, or set AHL_E2E_ALLOW_OFFLINE=1 to accept a diagnostic run.",
+        pilot.stack.stale_locks.join(", ")
+    );
 }
 
 /// Every checkout the pilot reads must be exactly as it was found.

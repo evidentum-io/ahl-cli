@@ -74,6 +74,12 @@ impl Drop for Server {
 /// manifest (I-D §7.1), so the cosignature on that checkpoint has to come from the OUTGOING
 /// witness — an identity the incoming one cannot supply.
 pub struct Stack {
+    /// Crates whose committed `Cargo.lock` did not resolve, and which were therefore built
+    /// against a graph cargo picked offline rather than the one their repository committed.
+    ///
+    /// A run with any entry here is a **diagnostic** run: it says the stack behaves, not that
+    /// the committed stack behaves. The tests refuse to pass on one unless told to.
+    pub stale_locks: Vec<String>,
     /// The scratch directory holding every database, key and config. Removed on drop.
     pub dir: tempfile::TempDir,
     /// The ATL log.
@@ -191,7 +197,12 @@ fn archive_into(relative: &str, dest: &Path) -> Result<(), String> {
 /// The fallback is `--offline`, never a plain build: the lock is updated inside the copy, no
 /// network is consulted, and the run says on stderr which graph it used and why. A build that
 /// fails for any other reason is reported with cargo's own output and not retried.
-fn build_binary(source: &Path, target: &Path, binary: &str) -> Result<(), String> {
+fn build_binary(
+    source: &Path,
+    target: &Path,
+    binary: &str,
+    stale: &mut Vec<String>,
+) -> Result<(), String> {
     let attempt = |flag: &str| {
         Command::new(env!("CARGO"))
             .args(["build", "--release", flag, "--bin", binary])
@@ -214,8 +225,10 @@ fn build_binary(source: &Path, target: &Path, binary: &str) -> Result<(), String
     eprintln!(
         "note: `{binary}`'s committed Cargo.lock is stale against its path dependencies, so the \
          pilot resolved offline inside its scratch copy instead. The checkout is untouched \
-         either way. cargo said:\n{complaint}"
+         either way, but the dependency graph is no longer the committed one. cargo said:\n\
+         {complaint}"
     );
+    stale.push(binary.to_owned());
     let offline = attempt("--offline")?;
     if offline.status.success() {
         Ok(())
@@ -228,8 +241,112 @@ fn build_binary(source: &Path, target: &Path, binary: &str) -> Result<(), String
 }
 
 /// Where built binaries are cached between runs, keyed by the source they were built from.
-fn cache_root() -> PathBuf {
+///
+/// The path is predictable, which is the whole problem a cache at a shared temporary location
+/// has: anything that can create it first, or write into it, chooses what this harness
+/// **executes**. [`open_cache_root`] is what makes it safe to use, and it refuses rather than
+/// degrades.
+fn cache_path() -> PathBuf {
     std::env::temp_dir().join("ahl-cli-e2e-build")
+}
+
+/// Open the cache root, creating it owner-only, and refuse it if it is not ours alone.
+///
+/// The checks are made on the **open handle**, not on the path, so a directory swapped between
+/// the check and the use is not the one validated. A root that fails any of them is not
+/// repaired and not used: the caller falls back to a per-run directory, because a cache whose
+/// provenance is in question is worth less than the time it saves.
+///
+/// Returns `None` when the cache is unusable, with the reason on stderr.
+fn open_cache_root() -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let path = cache_path();
+    // `create` fails if it already exists, which is the point: when we create it, the mode is
+    // ours. When it exists, everything below decides whether to trust it.
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&path);
+    let refuse = |reason: &str| -> Option<PathBuf> {
+        eprintln!(
+            "note: the build cache at `{}` is not usable ({reason}); building into a per-run \
+             directory instead",
+            path.display()
+        );
+        None
+    };
+    // A symlink here would have the handle below land somewhere else entirely.
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return refuse("it is a symlink"),
+        Ok(_) => {}
+        Err(source) => return refuse(&format!("it cannot be inspected: {source}")),
+    }
+    let handle = match std::fs::File::open(&path) {
+        Ok(handle) => handle,
+        Err(source) => return refuse(&format!("it cannot be opened: {source}")),
+    };
+    let metadata = match handle.metadata() {
+        Ok(metadata) => metadata,
+        Err(source) => return refuse(&format!("its handle cannot be inspected: {source}")),
+    };
+    if !metadata.is_dir() {
+        return refuse("it is not a directory");
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return refuse("it is owned by another user");
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return refuse("it is readable or writable beyond its owner");
+    }
+    Some(path)
+}
+
+/// What a cached binary must prove about itself before it is executed.
+///
+/// Two independent facts, both recorded when the binary was built: the source it was built from
+/// (the group's `HEAD` tree key) and the bytes it consists of. The directory permissions are the
+/// control that keeps them meaningful; these turn "a file exists at the expected path" — which
+/// is all the previous version checked, and is not a property of the binary at all — into "this
+/// is the artifact this harness produced from that source".
+fn provenance_path(binary: &Path) -> PathBuf {
+    binary.with_extension("provenance")
+}
+
+/// Record what a freshly built binary is, beside it.
+fn record_provenance(binary: &Path, key: &str) -> Result<(), String> {
+    let digest = digest_of(binary)?;
+    std::fs::write(provenance_path(binary), format!("{key}\n{digest}\n"))
+        .map_err(|source| format!("cannot record provenance for `{}`: {source}", binary.display()))
+}
+
+/// The SHA-256 of a file, as hex.
+fn digest_of(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|source| format!("cannot read `{}`: {source}", path.display()))?;
+    Ok(ahl_core::sha256_hex(&bytes))
+}
+
+/// Whether a cached binary may be executed: right source, right bytes, right owner.
+///
+/// Anything that does not answer yes is rebuilt. This is deliberately silent about *why* in the
+/// common case — a cache miss is not an event — but never silently accepts.
+fn provenance_holds(binary: &Path, key: &str) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let Ok(metadata) = std::fs::symlink_metadata(binary) else { return false };
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return false;
+    }
+    let Ok(recorded) = std::fs::read_to_string(provenance_path(binary)) else { return false };
+    let mut lines = recorded.lines();
+    let (Some(recorded_key), Some(recorded_digest)) = (lines.next(), lines.next()) else {
+        return false;
+    };
+    if recorded_key != key {
+        return false;
+    }
+    digest_of(binary).is_ok_and(|digest| digest == recorded_digest)
 }
 
 /// Build one group of checkouts from scratch copies, and return the named binaries.
@@ -241,19 +358,25 @@ fn build_group(
     label: &str,
     members: &[&'static str],
     binaries: &[(&'static str, &'static str)],
+    cache: Option<&Path>,
+    scratch: &Path,
+    stale: &mut Vec<String>,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let mut key = String::from(label);
     for member in members {
         key.push('-');
         key.push_str(&head_tree(member)?);
     }
-    let root = cache_root().join(key);
+    let root = cache.map_or_else(|| scratch.join(&key), |cache| cache.join(&key));
     let target = root.join("target");
     let built: BTreeMap<String, PathBuf> = binaries
         .iter()
         .map(|(_, binary)| ((*binary).to_owned(), target.join("release").join(binary)))
         .collect();
-    if built.values().all(|path| path.is_file()) {
+    // Reuse only what proves what it is. A file merely being present at the expected path is
+    // not evidence about the file, and executing it on that basis is how a shared temporary
+    // directory becomes an execution primitive for anything else on the machine.
+    if cache.is_some() && built.values().all(|path| provenance_holds(path, &key)) {
         return Ok(built);
     }
     for member in members {
@@ -262,12 +385,13 @@ fn build_group(
     }
     for (member, binary) in binaries {
         let name = Path::new(member).file_name().unwrap_or_default();
-        build_binary(&root.join("src").join(name), &target, binary)?;
+        build_binary(&root.join("src").join(name), &target, binary, stale)?;
     }
     for (binary, path) in &built {
         if !path.is_file() {
             return Err(format!("`{binary}` was not produced at `{}`", path.display()));
         }
+        record_provenance(path, &key)?;
     }
     Ok(built)
 }
@@ -441,14 +565,38 @@ fn start_health_server(
 }
 
 /// Build every binary the pilot needs, or say which checkout is missing.
-pub fn build_all() -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    let log = build_group("atl", &[ATL_SERVER], &[(ATL_SERVER, "atl-server")])?;
+pub fn build_all(
+    scratch: &Path,
+    stale: &mut Vec<String>,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    // A per-run directory is the simplest safe answer and is what `AHL_E2E_NO_CACHE=1` selects.
+    // It is not the default because the cost is not marginal: a cold `atl-server` release build
+    // is minutes, not seconds, and a harness that charges that to every run is a harness people
+    // stop running. The cache is kept and made to prove itself instead — owner-only directory
+    // validated on its handle, and per-binary provenance — with the per-run directory as the
+    // fallback whenever that validation does not hold.
+    let cache = if std::env::var("AHL_E2E_NO_CACHE").ok().as_deref() == Some("1") {
+        None
+    } else {
+        open_cache_root()
+    };
+    let log = build_group(
+        "atl",
+        &[ATL_SERVER],
+        &[(ATL_SERVER, "atl-server")],
+        cache.as_deref(),
+        scratch,
+        stale,
+    )?;
     // `ahl-mirror` and `ahl-witness` are path-dependent on `../ahl-core`, so the three copies
     // keep their siblinghood and share one cache key.
     let ahl = build_group(
         "ahl",
         &[CORE, MIRROR, WITNESS],
         &[(MIRROR, "ahl-mirror"), (WITNESS, "ahl-witness")],
+        cache.as_deref(),
+        scratch,
+        stale,
     )?;
     let get = |set: &BTreeMap<String, PathBuf>, name: &str| {
         set.get(name).cloned().ok_or_else(|| format!("`{name}` was not built"))
@@ -488,10 +636,12 @@ pub fn start(
     mirror_config: &str,
     witness_configs: &BTreeMap<String, String>,
 ) -> Result<Stack, String> {
-    let (log_binary, mirror_binary, witness_binary) = build_all()?;
     let dir = tempfile::tempdir()
         .map_err(|source| format!("cannot create a scratch directory: {source}"))?;
     let root = dir.path().to_path_buf();
+    let mut stale_locks = Vec::new();
+    let (log_binary, mirror_binary, witness_binary) =
+        build_all(&root.join("build"), &mut stale_locks)?;
 
     let log = with_port_retry("atl-server", |port| {
         start_log(&root, &log_binary, port, tree_uuid, log_signing_key)
@@ -506,7 +656,7 @@ pub fn start(
         })?;
         witnesses.insert(witness_id.clone(), server);
     }
-    Ok(Stack { dir, log, mirror, witnesses })
+    Ok(Stack { stale_locks, dir, log, mirror, witnesses })
 }
 
 /// Whether the pilot may run at all: the three checkouts and the profile document must be here.
@@ -525,5 +675,56 @@ pub fn preflight(profile: &Path) -> Result<(), String> {
             profile.display()
         )),
         Err(source) => Err(format!("cannot read `{}`: {source}", profile.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a stand-in build artifact and return its path.
+    fn artifact(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let path = dir.join("some-binary");
+        std::fs::write(&path, bytes).expect("write the artifact");
+        path
+    }
+
+    #[test]
+    fn a_cached_artifact_is_reused_only_when_it_proves_what_it_is() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let binary = artifact(dir.path(), b"the artifact this harness built");
+
+        // Nothing recorded beside it: a file existing at the expected path is not evidence
+        // about the file, and accepting it on that basis is what this check replaced.
+        assert!(!provenance_holds(&binary, "key-a"));
+
+        record_provenance(&binary, "key-a").expect("record");
+        assert!(provenance_holds(&binary, "key-a"));
+
+        // Right bytes, built from other source.
+        assert!(!provenance_holds(&binary, "key-b"));
+
+        // The bytes changed under the recorded digest. This is the case that matters: it is
+        // what anything able to write into a shared temporary directory would arrange, and the
+        // harness would otherwise have executed the result.
+        std::fs::write(&binary, b"different bytes entirely").expect("overwrite");
+        assert!(
+            !provenance_holds(&binary, "key-a"),
+            "an artifact whose bytes no longer match what was recorded must never be run"
+        );
+
+        // A rebuild is how it is re-established.
+        record_provenance(&binary, "key-a").expect("record");
+        assert!(provenance_holds(&binary, "key-a"));
+    }
+
+    #[test]
+    fn a_group_builds_under_the_scratch_directory_when_no_cache_is_offered() {
+        // The fallback the safety check depends on: with no usable cache root, the group builds
+        // under the per-run directory, which `tempfile` creates owner-only.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let chosen: PathBuf =
+            None::<&Path>.map_or_else(|| scratch.path().join("key"), |cache| cache.join("key"));
+        assert!(chosen.starts_with(scratch.path()));
     }
 }
