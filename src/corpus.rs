@@ -470,15 +470,15 @@ mod tests {
         // would be skipping violations.
         assert!(codes.contains("signature-does-not-verify"));
 
-        // The corpus previously anchored three envelopes over one payload, which core §2.1
-        // makes a duplicate-statement-id violation. It has since been regenerated to give each
-        // a distinct payload, so the rule has nothing to fire on here; it is pinned instead by
-        // `a_repeated_statement_id_is_reported_with_the_index_that_governs` over a fixture this
-        // crate controls, which is where a normative rule belongs.
-        assert!(
-            !codes.contains("statement-id-not-unique"),
-            "the regenerated corpus should carry no duplicate statement ids: {findings:?}"
-        );
+        // The corpus anchors one manifest version under three envelopes: one that governs, one
+        // that verifies and repeats its statement id, and one that does not verify at all. §2.1
+        // makes the middle one a duplicate — the smallest entry index governs and later ones are
+        // void of effect — so exactly one duplicate is reported, and the third is not among them:
+        // a non-verifying entry is void under §7.5.1 4d and claims no statement id, so a later
+        // copy is not repeating one it never took.
+        let duplicates =
+            findings.iter().filter(|finding| finding.code == "statement-id-not-unique").count();
+        assert_eq!(duplicates, 1, "one verifying duplicate, and only one: {findings:?}");
 
         // `governance-element-excluded` is the honest answer of an UNAUTHENTICATED walk, not a
         // defect of the corpus. The corpus anchors a manifest that does not verify, and the
@@ -491,7 +491,11 @@ mod tests {
         assert!(codes.contains("governance-element-excluded"));
         assert_eq!(
             codes,
-            BTreeSet::from(["governance-element-excluded", "signature-does-not-verify"]),
+            BTreeSet::from([
+                "governance-element-excluded",
+                "signature-does-not-verify",
+                "statement-id-not-unique",
+            ]),
             "unexpected findings: {findings:?}"
         );
     }
