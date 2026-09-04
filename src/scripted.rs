@@ -75,8 +75,12 @@ pub const RECORD_2: &str =
 
 /// Entry index of the ingestion the default subject is.
 pub const INGESTION: u64 = 1;
+/// Entry index of the derivation.
+pub const DERIVATION: u64 = 2;
 /// Entry index of the trigger.
 pub const TRIGGER: u64 = 3;
+/// Entry index of the propagation.
+pub const PROPAGATION: u64 = 4;
 /// Entry index of the entry a fresh run anchors.
 pub const APPENDED: u64 = 5;
 
@@ -221,6 +225,8 @@ pub fn cosignature() -> Value {
 pub enum Discrepancy {
     /// None: every answer agrees with every other.
     None,
+    /// The log serves an inclusion path the enumerated prefix does not recompute to.
+    CrookedPath,
     /// The log names one index when it accepts the entry and another when asked afterwards.
     MovedIndex,
 }
@@ -259,6 +265,20 @@ impl Stack {
         }
     }
 
+    /// The same deployment, about another entry.
+    #[must_use]
+    pub const fn about(mut self, index: u64) -> Self {
+        self.subject_index = index;
+        self
+    }
+
+    /// The log serves an inclusion path the enumeration does not recompute to.
+    #[must_use]
+    pub const fn with_crooked_path(mut self) -> Self {
+        self.discrepancy = Discrepancy::CrookedPath;
+        self
+    }
+
     /// The mirror already holds every entry, so a run finds the subject anchored.
     #[must_use]
     pub const fn already_published(mut self) -> Self {
@@ -290,6 +310,12 @@ impl Stack {
     #[must_use]
     pub fn size(&self) -> u64 {
         u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The canonical bytes of the entry at `index` — what a producer holds in a file.
+    #[must_use]
+    pub fn entry_bytes(&self, index: u64) -> Vec<u8> {
+        jcs(&self.envelope_at(index))
     }
 
     /// The entry at `index`, as the mirror serves it.
@@ -358,7 +384,11 @@ impl Stack {
     /// The ATL Evidence Receipt the log answers with, for the subject entry.
     #[must_use]
     pub fn atl_receipt(&self, leaf_index: u64) -> Value {
-        let path = self.inclusion_path(self.subject_index);
+        let path = if self.discrepancy == Discrepancy::CrookedPath {
+            vec![format!("sha256:{}", "ab".repeat(32))]
+        } else {
+            self.inclusion_path(self.subject_index)
+        };
         json!({
             "entry": {
                 "id": ATL_ENTRY_ID,

@@ -2141,6 +2141,9 @@ mod tests {
         assert_eq!(enumerated.keys().collect::<Vec<_>>(), vec!["sha256:p2"]);
         let declared = governance.producer_keys_at(4, false).unwrap();
         assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["sha256:p1"]);
+        // A transition anchored after the index asked about has not happened yet there.
+        let earlier = governance.producer_keys_at(2, true).unwrap();
+        assert_eq!(earlier.keys().collect::<Vec<_>>(), vec!["sha256:p1", "sha256:p2"]);
         // Index 0 has no manifest strictly below it, so the snapshot falls back to genesis.
         assert_eq!(governance.snapshot_at(0).expect("genesis").0, 0);
 
