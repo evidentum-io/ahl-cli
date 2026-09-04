@@ -1181,12 +1181,7 @@ pub struct ContentBinding {
 /// [`CliError::EvidenceMissing`] where the material the claim needs is not in the prefix, and
 /// [`CliError::Usage`] where the caller asked for a claim type this build does not assemble.
 #[allow(clippy::too_many_lines)] // One receipt, member by member; splitting it hides the order.
-pub fn assemble(
-    assembly: &Assembly,
-    subject_index: u64,
-    claim: &Claim,
-    adaptor_hash_from_manifest: bool,
-) -> CliResult<Value> {
+pub fn assemble(assembly: &Assembly, subject_index: u64, claim: &Claim) -> CliResult<Value> {
     let shape = claim_shape(&claim.claim_type)?;
     let enumerated = shape.governance == "enumerated";
     let size = assembly.size()?;
@@ -1235,16 +1230,15 @@ pub fn assemble(
     }
 
     // `anchoring.adaptor` names the pair the ACTIVE manifest's own `log.adaptor` pins, so a
-    // receipt anchored under a checkpoint one version governs carries that version's pin.
-    let adaptor = if adaptor_hash_from_manifest {
-        active.pointer("/log/adaptor").cloned().ok_or_else(|| {
-            CliError::EvidenceMissing(
-                "the active manifest's `log` object pins no adaptor profile".to_owned(),
-            )
-        })?
-    } else {
-        json!({ "id": ATL_PROFILE, "hash": Value::Null })
-    };
+    // receipt anchored under a checkpoint one version governs carries that version's pin. It is
+    // never assembled from a constant here: the pin is a governance fact, and a receipt that
+    // named a profile its own corpus had not adopted would be claiming verification rules the
+    // issuing corpus never declared (adaptor §14).
+    let adaptor = active.pointer("/log/adaptor").cloned().ok_or_else(|| {
+        CliError::EvidenceMissing(
+            "the active manifest's `log` object pins no adaptor profile".to_owned(),
+        )
+    })?;
 
     let mut assurance = json!({
         "governance": shape.governance,

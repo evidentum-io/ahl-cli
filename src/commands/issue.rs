@@ -332,7 +332,7 @@ pub fn run<F: Fetcher>(
         }),
     };
 
-    let receipt = producer::assemble(&assembly, position.entry_index, &claim, true)?;
+    let receipt = producer::assemble(&assembly, position.entry_index, &claim)?;
     let canonical = jcs(&receipt);
     install::install(&options.out, &canonical, if options.force { Force::Yes } else { Force::No })?;
 
