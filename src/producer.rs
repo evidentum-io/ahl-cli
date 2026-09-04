@@ -929,27 +929,77 @@ impl<'a> Governance<'a> {
         Ok(keys)
     }
 
-    /// Entry indices of the manifest versions that rotate the log or witness key set relative
-    /// to their predecessor in the chain, each paired with the index of that predecessor.
+    /// The manifest versions in the carried chain that rotate the log or witness key set.
     ///
     /// I-D §7.1 requires one `governance.rotation_proofs[]` element per such version, in
     /// ascending order, and requires the member to be ABSENT where the chain rotates neither
     /// set — never present as an empty array.
     #[must_use]
-    pub fn rotations(&self, carried: &[u64]) -> Vec<(u64, u64)> {
+    pub fn rotations(&self, carried: &[u64]) -> Vec<Rotation> {
         let mut rotations = Vec::new();
         let mut previous: Option<(u64, &Value)> = None;
         for (index, manifest) in &self.manifests {
-            if let Some((outgoing_index, outgoing)) = previous {
-                let changed = outgoing.pointer("/log/keys") != manifest.pointer("/log/keys")
-                    || outgoing.get("witnesses") != manifest.get("witnesses");
-                if changed && carried.contains(index) {
-                    rotations.push((*index, outgoing_index));
+            if let Some((outgoing_entry_index, outgoing)) = previous {
+                let log_keys_changed =
+                    outgoing.pointer("/log/keys") != manifest.pointer("/log/keys");
+                let witnesses_changed = outgoing.get("witnesses") != manifest.get("witnesses");
+                if (log_keys_changed || witnesses_changed) && carried.contains(index) {
+                    rotations.push(Rotation {
+                        manifest_entry_index: *index,
+                        outgoing_entry_index,
+                        log_keys_changed,
+                    });
                 }
             }
             previous = Some((*index, manifest));
         }
         rotations
+    }
+}
+
+/// A governance-key rotation the carried chain contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rotation {
+    /// Entry index of the manifest version that rotates.
+    pub manifest_entry_index: u64,
+    /// Entry index of the version active immediately before it — the outgoing state.
+    pub outgoing_entry_index: u64,
+    /// Whether the LOG checkpoint-signing key set changed, as opposed to the witness set alone.
+    pub log_keys_changed: bool,
+}
+
+impl Rotation {
+    /// Whether this build can assemble a rotation proof for it.
+    ///
+    /// I-D §7.1 requires a rotation proof's checkpoint to verify under the **outgoing** key set.
+    /// Where only the witness set rotated, the log key is unchanged and the receipt's own
+    /// anchoring checkpoint satisfies that; what differs is which witness cosigned it, and both
+    /// cosignatures are obtainable.
+    ///
+    /// Where the LOG key set rotated, the proof needs a checkpoint signed by the **retired** key
+    /// over a tree size the **incoming** manifest version governs. Nothing in this stack can
+    /// supply one: `ahl-mirror` and `ahl-witness` both resolve a checkpoint's log key from the
+    /// governance state at the end of its committed prefix, which is the incoming version, so
+    /// both refuse such a checkpoint — and the published `atl-server` reads its signing key once
+    /// at start-up and has no rotation path at all. Rather than emit a proof built from the
+    /// anchoring checkpoint, which is signed by the *incoming* key and would fail verification
+    /// for a reason that names the wrong thing, this build says what it cannot do.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::ProfileLimitation`] naming the rotation and why it is not assembled here.
+    pub fn check_supported(&self) -> CliResult<()> {
+        if !self.log_keys_changed {
+            return Ok(());
+        }
+        Err(CliError::ProfileLimitation(format!(
+            "the manifest version at entry {} rotates the LOG checkpoint-signing key set, and \
+             this build assembles no rotation proof for that: I-D §7.1 requires the proof's \
+             checkpoint to verify under the OUTGOING key set, and no interface in this \
+             deployment serves a checkpoint signed by a retired log key over a tree size the \
+             incoming manifest version governs",
+            self.manifest_entry_index
+        )))
     }
 }
 
@@ -1267,10 +1317,13 @@ pub fn assemble(
     let rotations = governance.rotations(&carried);
     if !rotations.is_empty() {
         let mut proofs = Vec::with_capacity(rotations.len());
-        for (index, outgoing_index) in &rotations {
-            let outgoing_manifest = governance.manifest_at(*outgoing_index)?;
+        for rotation in &rotations {
+            rotation.check_supported()?;
+            let index = &rotation.manifest_entry_index;
+            let outgoing_index = rotation.outgoing_entry_index;
+            let outgoing_manifest = governance.manifest_at(outgoing_index)?;
             let (outgoing_log, outgoing_witness) =
-                manifest_key_entries(outgoing_manifest, *outgoing_index);
+                manifest_key_entries(outgoing_manifest, outgoing_index);
             for entry in outgoing_log {
                 push_key(&mut log_keys, entry);
             }
@@ -1486,10 +1539,41 @@ mod tests {
         ];
         let governance = Governance::read(&entries);
         assert_eq!(governance.manifest_indices(), vec![0, 2, 3]);
-        assert_eq!(governance.rotations(&[0, 2, 3]), vec![(3, 2)]);
+        assert_eq!(
+            governance.rotations(&[0, 2, 3]),
+            vec![Rotation {
+                manifest_entry_index: 3,
+                outgoing_entry_index: 2,
+                log_keys_changed: false,
+            }]
+        );
         // A rotation whose manifest the chain does not carry produces no element, because the
         // receipt's own chain is what §7.1 conditions the member on.
         assert!(governance.rotations(&[0, 2]).is_empty());
+    }
+
+    #[test]
+    fn a_log_key_rotation_is_refused_rather_than_assembled_from_the_wrong_checkpoint() {
+        let entries = vec![
+            envelope(&manifest("sha256:l1", "w1", "sha256:k1")),
+            envelope(&manifest("sha256:l2", "w1", "sha256:k1")),
+        ];
+        let governance = Governance::read(&entries);
+        let rotations = governance.rotations(&[0, 1]);
+        assert_eq!(
+            rotations,
+            vec![Rotation {
+                manifest_entry_index: 1,
+                outgoing_entry_index: 0,
+                log_keys_changed: true,
+            }]
+        );
+        let error = rotations[0].check_supported().expect_err("no proof is assembled for it");
+        assert!(error.to_string().contains("OUTGOING key set"), "{error}");
+        // A witness-set rotation over an unchanged log key is assembled as before.
+        Rotation { manifest_entry_index: 1, outgoing_entry_index: 0, log_keys_changed: false }
+            .check_supported()
+            .expect("a witness rotation needs no retired log key");
     }
 
     #[test]
