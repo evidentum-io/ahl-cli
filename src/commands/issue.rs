@@ -65,10 +65,6 @@ pub struct Options {
     pub target_index: Option<u64>,
     /// The receipt's informative note.
     pub note: Option<String>,
-    /// Base URL of the log accepting submissions.
-    pub log: String,
-    /// Extra witness base URLs, beyond the configured one.
-    pub witness_endpoints: Vec<String>,
     /// Permit plain HTTP to a loopback peer.
     pub allow_insecure_loopback: bool,
     /// Where to install the receipt.

@@ -464,8 +464,6 @@ fn run_issue(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             tree_material: tree_material.clone(),
             target_index: *target_index,
             note: note.clone(),
-            log: log.clone(),
-            witness_endpoints: witness_endpoint.clone(),
             allow_insecure_loopback: *allow_insecure_loopback,
             out: out.clone(),
             force: *force,
