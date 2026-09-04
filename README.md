@@ -15,8 +15,8 @@ and tree material `closure` and `reconstruct` walk, and every mirror and witness
 the client parses under a selected checkpoint. Malformed, hostile or simply absurd input is
 reported as a verdict, a finding or a named local failure, and the process leaves through
 `main`'s `ExitCode` — never through an abort, which would deny a pipeline even the exit code
-the §6 outcome table promises it. The mechanism is the crate-level lints in `Cargo.toml` and
-`lib.rs` (`clippy::unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`,
+the §6 outcome table promises it. The mechanism is the crate-level lints in `Cargo.toml`
+(`clippy::unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`,
 `panic`, `unreachable`, `todo`, `unimplemented`, `missing_panics_doc`, all denied and satisfied
 in library and binary code rather than allowed at a site); the evidence is the four libFuzzer
 targets in [`fuzz/`](fuzz/README.md). The boundary: an I/O failure, an unreadable file, an
