@@ -1,0 +1,27 @@
+{
+  "entry_id": "sha256:b4b4fcf339503400ade1b381d0233e19e9e40750779f40102b51c11994e7cca3",
+  "entry_index": 53,
+  "envelope": {
+    "payload": {
+      "action": "add",
+      "ahl_version": "0.5",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "key": {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "pubkey": "base64:gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=",
+        "valid_from": "2026-08-16T12:00:00Z"
+      },
+      "manifest": "sha256:6e176e6746177b8559a7952c2d9af920dc7f4485543b629386617c16fd38388d",
+      "producer": "producer-1",
+      "type": "key",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:GW8P/XT/pHcsH7HYyYXF4uxoZvkYUxIqjIrQ8B7quf926lQtyIgPyFWLgLmWBHm4gKXV5GXjRYEasYqLpRT5AQ=="
+      }
+    ]
+  },
+  "statement_id": "sha256:789575399878a2cce1356f56d35d27a92c02647855608f17254df7a7863cacd0"
+}

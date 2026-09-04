@@ -1,0 +1,96 @@
+{
+  "entry_id": "sha256:fb3b6c426950fda4a24822fe3030510907d8d9ce5219454d74403c5f2ec1d0f2",
+  "entry_index": 55,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "datasets": {
+        "customers": {
+          "authority": {
+            "key_ids": [
+              "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+            ],
+            "producer": "producer-1"
+          },
+          "canonicalization": "jcs",
+          "commitment_mode": "keyed",
+          "key_access": "authorized-verifiers-only"
+        },
+        "scores": {
+          "canonicalization": "jcs",
+          "commitment_mode": "plain",
+          "key_access": "not-applicable"
+        }
+      },
+      "issued_at": "2026-08-16T12:00:00Z",
+      "keys": [
+        {
+          "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "pubkey": "base64:iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w="
+        },
+        {
+          "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+          "pubkey": "base64:gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q="
+        }
+      ],
+      "level": "L3",
+      "log": {
+        "adaptor": {
+          "hash": "sha256:ea4e9a7d9f4c2286fe2a0a292e939ef6c2261c8567b3d91cd7375c5490525961",
+          "id": "ahl-test-log-v1"
+        },
+        "cadence_epoch": "2026-08-16T11:30:00Z",
+        "checkpoint_cadence": "PT1H",
+        "keys": [
+          {
+            "key_id": "sha256:fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff552263889",
+            "pubkey": "base64:6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+            "valid_from_index": 55
+          }
+        ],
+        "log_id": "sha256:f96bab99f35b3ca221f3f233369835c3ee222f4b2e6c00f84b3a24f840f017a0",
+        "operator": "log-operator-1",
+        "witness_grace_period": "PT15M"
+      },
+      "pipelines": {
+        "exclude": [],
+        "include": [
+          "scoring-v1"
+        ]
+      },
+      "predecessor": "sha256:87a0a226a666652a06ddab10b0b34562d2522b592e045897dcbb798f75b4b6e6",
+      "producer": "producer-1",
+      "properties": {
+        "reproducible_reconstruction": false
+      },
+      "retention": {
+        "statements": "P10Y"
+      },
+      "type": "manifest",
+      "valid_time": "2026-08-16T12:00:00Z",
+      "windows": {
+        "anchoring": "PT24H",
+        "propagation": "P30D"
+      },
+      "witnesses": [
+        {
+          "keys": [
+            {
+              "key_id": "sha256:72456720412037a6b339f884ce6d91bb4cc163a7dc3e4c58c658e6c2097b92a2",
+              "pubkey": "base64:iodf/x6zhFFXes1a/uQFRWVo3XyJ4JCGOgVXvHr0nxc=",
+              "valid_from_index": 25
+            }
+          ],
+          "witness_id": "witness-2"
+        }
+      ]
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:A/TTk99no2S6iwD0T2bTiSTro7GsmVRtbSSMAiqC0KiYT8wkw/BtP6IOdfwAs4ZkoOSf8IUfm/4jBHS1Gmu9Aw=="
+      }
+    ]
+  },
+  "statement_id": "sha256:75bcb6ddced07ebe2b0d01d1f438c827e4685b294c9e52692951e67a0457f5f6"
+}

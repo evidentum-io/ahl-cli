@@ -266,7 +266,11 @@ impl Dir {
             return None;
         }
         let mut buffer = Vec::new();
-        let read = File::from(fd).take(cap as u64 + 1).read_to_end(&mut buffer).ok()?;
+        // `cap + 1` so an exactly-`cap`-byte entry is accepted and a longer one is not. `cap`
+        // reaches here from the policy file, so the increment saturates rather than wrapping a
+        // `usize::MAX` budget round to a one-byte one.
+        let limit = (cap as u64).saturating_add(1);
+        let read = File::from(fd).take(limit).read_to_end(&mut buffer).ok()?;
         (read <= cap).then_some(buffer)
     }
 

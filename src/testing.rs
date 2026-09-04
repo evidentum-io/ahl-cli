@@ -69,11 +69,22 @@ pub struct MirrorFixture {
     entries: Vec<Vec<u8>>,
     /// The corpus log-signing key.
     /// The log's checkpoint-signing keys, in the order the corpus adopts them.
-    log_keys: Vec<TestKey>,
+    ///
+    /// A fixed pair rather than a vector: the corpus adopts exactly two, and every read of the
+    /// first one is then in range by type rather than by convention.
+    log_keys: [TestKey; 2],
     /// Sign every checkpoint with the outgoing key, ignoring the rotation.
     outgoing_log_key: bool,
     /// A key the corpus manifests never declare, for the "foreign key" fixture.
     foreign_key: TestKey,
+    /// The producer key the corpus publishes, which signs every statement the builders append.
+    producer: TestKey,
+    /// The attacker and mis-filed keys the forged key-transition fixture stages, and the
+    /// attacker key the forged-manifest fixture signs with. Resolved once, at construction, so
+    /// a builder never has to decide what to do about a key it cannot build.
+    forged_transition: (TestKey, TestKey),
+    /// The attacker key the forged-manifest fixture signs with.
+    forged_manifest_key: TestKey,
     /// Witness keys by name.
     witness_keys: BTreeMap<&'static str, TestKey>,
     /// Publish a second, diverging checkpoint at this size.
@@ -102,22 +113,20 @@ pub struct MirrorFixture {
     recorded: Mutex<Vec<Recorded>>,
 }
 
-fn seed(path: &Path, name: &'static str) -> TestKey {
-    let hex = std::fs::read_to_string(path.join("keys").join(format!("{name}.seed")))
-        .unwrap_or_else(|_| "00".repeat(32));
-    TestKey::from_seed_hex(name, hex.trim()).unwrap_or_else(|_| {
-        TestKey::from_seed_hex(name, &"00".repeat(32)).unwrap_or_else(|_| {
-            // Unreachable for a 32-byte constant; the fallback keeps this helper total.
-            TestKey::from_seed_hex(name, &"01".repeat(32)).unwrap_or_else(|_| unreachable())
-        })
-    })
+/// A published test key seed, read from the corpus.
+///
+/// `None` where the seed file is absent or is not 64 hex digits. The absence is reported to
+/// the caller rather than papered over with a substitute key: a fixture signing with a key the
+/// corpus never published would make every signature test pass against the wrong material.
+fn seed(path: &Path, name: &'static str) -> Option<TestKey> {
+    let hex = std::fs::read_to_string(path.join("keys").join(format!("{name}.seed"))).ok()?;
+    TestKey::from_seed_hex(name, hex.trim()).ok()
 }
 
-fn unreachable() -> TestKey {
-    // `TestKey::from_seed_hex` accepts any 64 hex digits, so this is genuinely unreachable;
-    // the crate denies `panic!`, so the total function returns a fixed key instead.
-    #[allow(clippy::expect_used)]
-    TestKey::from_seed_hex("fallback", &"02".repeat(32)).expect("64 hex digits")
+/// A key built from a constant seed byte, for the roles the corpus deliberately does not
+/// publish: an attacker's key, and a key no manifest version declares.
+fn synthetic(name: &'static str, byte: &str) -> Option<TestKey> {
+    TestKey::from_seed_hex(name, &byte.repeat(32)).ok()
 }
 
 impl MirrorFixture {
@@ -129,14 +138,22 @@ impl MirrorFixture {
     }
 
     /// Build the fixture from the conformance corpus.
+    ///
+    /// `None` where the corpus does not publish the key seeds the fixture signs with; see
+    /// [`Self::from_corpus`].
     #[must_use]
-    pub fn conformance() -> Self {
+    pub fn conformance() -> Option<Self> {
         Self::from_corpus(&Self::corpus_root())
     }
 
     /// Build the fixture from a corpus at `root`.
+    ///
+    /// `None` where a key seed the fixture needs is absent or unusable. Every signature this
+    /// fixture produces is made with a published corpus key, so a missing seed is reported
+    /// rather than substituted: a fixture that quietly signed with something else would make
+    /// the tests grounded on it assert against material no corpus published.
     #[must_use]
-    pub fn from_corpus(root: &Path) -> Self {
+    pub fn from_corpus(root: &Path) -> Option<Self> {
         let mut statements: Vec<(u64, Vec<u8>)> = Vec::new();
         if let Ok(dir) = std::fs::read_dir(root.join("vectors/statements")) {
             let mut files: Vec<PathBuf> = dir
@@ -158,16 +175,18 @@ impl MirrorFixture {
         statements.sort_by_key(|(index, _)| *index);
         let entries = statements.into_iter().map(|(_, bytes)| bytes).collect();
 
-        Self {
+        Some(Self {
             policy: corpus_policy(root),
             entries,
-            log_keys: vec![seed(root, "log-1"), seed(root, "log-2")],
+            log_keys: [seed(root, "log-1")?, seed(root, "log-2")?],
             outgoing_log_key: false,
-            foreign_key: TestKey::from_seed_hex("foreign", &"7f".repeat(32))
-                .unwrap_or_else(|_| unreachable()),
+            foreign_key: synthetic("foreign", "7f")?,
+            producer: seed(root, "producer-1")?,
+            forged_transition: (synthetic("attacker", "7d")?, synthetic("fake", "7c")?),
+            forged_manifest_key: synthetic("attacker", "7e")?,
             witness_keys: BTreeMap::from([
-                ("witness-1", seed(root, "witness-1")),
-                ("witness-2", seed(root, "witness-2")),
+                ("witness-1", seed(root, "witness-1")?),
+                ("witness-2", seed(root, "witness-2")?),
             ]),
             equivocate_at: None,
             equivocate_first: false,
@@ -179,7 +198,7 @@ impl MirrorFixture {
             foreign_key_at: None,
             tampered: None,
             recorded: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Publish a second, diverging checkpoint at `tree_size`.
@@ -220,7 +239,7 @@ impl MirrorFixture {
     /// object an AHL statement; what a verifier cannot do is read what it means.
     #[must_use]
     pub fn with_unknown_statement_type(mut self) -> Self {
-        let producer = seed(&Self::corpus_root(), "producer-1");
+        let producer = self.producer.clone();
         let manifest = self
             .entries
             .iter()
@@ -283,11 +302,8 @@ impl MirrorFixture {
     /// the id is recomputed from the key and the mismatch refused, at step 1.
     #[must_use]
     pub fn with_forged_key_transition(mut self) -> Self {
-        let producer = seed(&Self::corpus_root(), "producer-1");
-        let attacker =
-            TestKey::from_seed_hex("attacker", &"7d".repeat(32)).unwrap_or_else(|_| unreachable());
-        let fake =
-            TestKey::from_seed_hex("fake", &"7c".repeat(32)).unwrap_or_else(|_| unreachable());
+        let producer = self.producer.clone();
+        let (attacker, fake) = self.forged_transition.clone();
 
         // 1. The forged binding, signed by a key genuinely in force.
         let transition = ahl_core::envelope(
@@ -350,7 +366,7 @@ impl MirrorFixture {
     /// in force at its entry index, so every test of adaptor §7.4.1 passes: what the fixture
     /// varies is the `log` object itself.
     fn with_appended_manifest(mut self, alter: impl FnOnce(&mut Value)) -> Self {
-        let producer = seed(&Self::corpus_root(), "producer-1");
+        let producer = self.producer.clone();
         let predecessor = self.governing_manifest_entry_id();
         let mut log = json!({
             "log_id": self.log_id(),
@@ -418,7 +434,7 @@ impl MirrorFixture {
     #[must_use]
     pub fn with_moved_cadence_epoch(mut self) -> Self {
         let key = self.foreign_key.key_object(0);
-        self.foreign_key_at = Some(self.appended_tree_size() + 1);
+        self.foreign_key_at = Some(self.appended_tree_size().saturating_add(1));
         self.with_appended_manifest(move |log| {
             log["cadence_epoch"] = json!("2026-08-16T12:30:00Z");
             log["keys"] = json!([key]);
@@ -481,8 +497,7 @@ impl MirrorFixture {
     /// attacker and a checkpoint that authenticates is test 2, the producer signature.
     #[must_use]
     pub fn with_forged_manifest(mut self) -> Self {
-        let attacker =
-            TestKey::from_seed_hex("attacker", &"7e".repeat(32)).unwrap_or_else(|_| unreachable());
+        let attacker = self.forged_manifest_key.clone();
         let predecessor = self
             .entries
             .iter()
@@ -1266,7 +1281,8 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
             .count();
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         assert!(published >= 30, "the corpus should carry 30+ statements, got {published}");
         assert_eq!(fixture.entries.len(), published, "every published statement is loaded");
         assert!(fixture.log_id().starts_with("sha256:"));
@@ -1279,12 +1295,22 @@ mod tests {
 
     #[test]
     fn the_published_series_is_deterministic() {
-        let first = MirrorFixture::conformance().series();
-        let second = MirrorFixture::conformance().series();
+        let first = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .series();
+        let second = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .series();
         assert_eq!(first, second);
         // The constant sizes that fit the corpus, plus the corpus's own size where it is not
         // already one of them.
-        let total = u64::try_from(MirrorFixture::conformance().entries.len()).expect("small");
+        let total = u64::try_from(
+            MirrorFixture::conformance()
+                .expect("the conformance corpus publishes the key seeds the fixture signs with")
+                .entries
+                .len(),
+        )
+        .expect("small");
         let mut expected: Vec<u64> =
             CHECKPOINT_SIZES.into_iter().filter(|size| *size <= total).collect();
         if !expected.contains(&total) {
@@ -1295,13 +1321,17 @@ mod tests {
 
     #[test]
     fn an_equivocating_fixture_publishes_two_roots_at_one_size() {
-        let series = MirrorFixture::conformance().with_equivocation_at(13).series();
+        let series = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(13)
+            .series();
         assert_eq!(crate::checkpoint::equivocation_floor(&series), Some(13));
     }
 
     #[test]
     fn the_fixture_records_a_replayable_transcript() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let _ = fixture.establish(8).expect("established");
         let transcript = fixture.transcript();
         let replay = crate::transcript::TranscriptFetcher::from_slice(
@@ -1313,7 +1343,8 @@ mod tests {
 
     #[test]
     fn the_named_corpus_records_resolve() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         for (dataset, record) in [fixture.record_a(), fixture.record_b(), fixture.record_f()] {
             assert_eq!(dataset, "customers");
             assert!(record.starts_with("hmac-sha256:"), "{record}");
@@ -1322,7 +1353,8 @@ mod tests {
 
     #[test]
     fn unknown_routes_answer_with_a_status_rather_than_inventing_a_body() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let response =
             fixture.fetch(&Request::get(format!("{MIRROR}/v1/nothing"))).expect("fixture answers");
         assert_eq!(response.status, 404);
@@ -1330,7 +1362,8 @@ mod tests {
 
     #[test]
     fn the_witness_key_rotates_with_the_manifest_version_governing_the_checkpoint() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         assert_eq!(fixture.witness_for(20).0, "witness-1");
         assert_eq!(fixture.witness_for(26).0, "witness-2");
         assert!(fixture.cosigned(26)["witness_id"] == json!("witness-2"));
@@ -1338,8 +1371,11 @@ mod tests {
 
     #[test]
     fn a_tampered_entry_changes_the_served_bytes_but_never_the_committed_root() {
-        let clean = MirrorFixture::conformance();
-        let tampered = MirrorFixture::conformance().with_tampered_entry(3);
+        let clean = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
+        let tampered = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_tampered_entry(3);
         // The log signed one tree; the mirror serves another. That mismatch is the whole
         // scenario, so the committed root must stay put while the bytes change.
         assert_eq!(clean.root_at(8), tampered.root_at(8));
@@ -1349,7 +1385,8 @@ mod tests {
 
     #[test]
     fn entry_retrieval_is_content_addressed_and_absence_is_a_status() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let entry_id = ahl_core::sha256_hex(&fixture.entry_bytes(1));
         let response = fixture.entry(&entry_id);
         assert_eq!(response.status, 200);
@@ -1366,6 +1403,15 @@ mod tests {
             Some(1)
         );
         assert_eq!(policy.trust.dataset_keys["customers"].len(), 32);
-        assert_eq!(identity_at(&MirrorFixture::conformance(), 8).tree_size, 8);
+        assert_eq!(
+            identity_at(
+                &MirrorFixture::conformance().expect(
+                    "the conformance corpus publishes the key seeds the fixture signs with"
+                ),
+                8
+            )
+            .tree_size,
+            8
+        );
     }
 }

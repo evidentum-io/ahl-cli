@@ -1,0 +1,28 @@
+{
+  "entry_id": "sha256:03e6d491e88268c3922859d95d92cd8b00f04f465a4a5143c1828b11e6142b70",
+  "entry_index": 23,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "dataset": "customers",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "manifest": "sha256:437053c55efe84c0b4c774140206689576bea846e08ec1381b3df0dfc12ba588",
+      "producer": "producer-1",
+      "reason_code": "other",
+      "record": "hmac-sha256:07f75f98ef1ea9112dcb04f392c062bc7344306c755c3c192656a0a521e1ed17",
+      "scope": {
+        "effective_from": "2026-08-16T12:00:00Z",
+        "retroactive": true
+      },
+      "type": "retraction",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "sig": "base64:F1gW/WwtK/P8MHcc56a8xepHNWkpB8aa8W2VZk67BqQHfsSN7wOcJRLM+8V5XNx1b3+nvp05/Eg5MbmBdw+5Dg=="
+      }
+    ]
+  },
+  "statement_id": "sha256:57022d9c4d498986e4a9d7870fb6f8f6bc78f894f74e48ecec18f96462468236"
+}

@@ -7,6 +7,31 @@ reconstruction against a log served by `atl-server` + `ahl-mirror` + `ahl-witnes
 It holds no log, serves no interface, and is not a conformance target of its own. It exercises
 the verifier side of L1–L3.
 
+## No panic
+
+`ahl-cli` reaches no panicking construct on any input to its parsers — the trust policy file
+(`policy::load`), the Evidence Receipt the `verify` and `inspect` paths read, the local corpus
+and tree material `closure` and `reconstruct` walk, and every mirror and witness response body
+the client parses under a selected checkpoint. Malformed, hostile or simply absurd input is
+reported as a verdict, a finding or a named local failure, and the process leaves through
+`main`'s `ExitCode` — never through an abort, which would deny a pipeline even the exit code
+the §6 outcome table promises it. The mechanism is the crate-level lints in `Cargo.toml`
+(`clippy::unwrap_used`, `expect_used`, `indexing_slicing`, `arithmetic_side_effects`,
+`panic`, `unreachable`, `todo`, `unimplemented`, `missing_panics_doc`, all denied and satisfied
+in library and binary code rather than allowed at a site); the evidence is the four libFuzzer
+targets in [`fuzz/`](fuzz/README.md). The boundary: an I/O failure, an unreadable file, an
+unreachable endpoint and a server that answers with nonsense are all results — exit `2` or `3`
+per the outcome table — and never panics; allocation failure and stack exhaustion are out of
+scope, since neither is a panic and neither is something a client can decline; nesting depth is
+bounded by `serde_json`, which refuses a document nested deeper than 128 levels with an error
+rather than recursing, so a `Value` obtained by parsing bytes is already bounded when this
+crate sees it, while a `Value` built programmatically to arbitrary depth is not and is outside
+the claim; total work over a receipt is bounded by the I-D §7.8 decoded-size budget and over
+the network by the design note §7 limits, both configured in the policy file; and `ahl-core`
+and `atl-core` — the siblings that perform canonicalization, receipt verification, node hashing
+and proof verification — are not covered, because the claim is about this crate's own code.
+`ahl-core` states the same claim over its own.
+
 ## Commands
 
 | Command | Input | Output | Network |
@@ -587,7 +612,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 RUSTDOCFLAGS=-D warnings cargo doc --no-deps --all-features
 cargo llvm-cov --all-features --ignore-filename-regex 'src/bin/' --fail-under-lines 90
+cargo +nightly fuzz build
 ```
+
+The fuzz targets are built on every pull request and run on demand; `fuzz/README.md` gives the
+run commands and says what each target covers.
 
 The recorded network transcripts under `tests/fixtures/` are generated from the committed
 `ahl-core` conformance corpus, with no clock read and no randomness:

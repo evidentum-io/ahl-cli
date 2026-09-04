@@ -317,10 +317,28 @@ pub fn load(path: &Path) -> CliResult<LoadedPolicy> {
     let bytes = secure::read_secret("trust policy", path, POLICY_FILE_CAP)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| CliError::Policy("policy file is not valid UTF-8".to_owned()))?;
-    let file: PolicyFile = toml::from_str(&text)
-        .map_err(|source| CliError::Policy(format!("cannot parse policy: {source}")))?;
-
     let base = path.parent().unwrap_or_else(|| Path::new("."));
+    parse(&text, base)
+}
+
+/// The parse-and-validate half of [`load`], over policy text already in hand.
+///
+/// A seam for the fuzz harness in `fuzz/`, and nothing else: it is the TOML parser and the
+/// ordered validation behind it, reached without the handle checks [`load`] performs on the
+/// file. Off by default; the API it adds carries no stability promise.
+///
+/// # Errors
+///
+/// [`CliError::Policy`] if the text does not parse or is internally inconsistent;
+/// [`CliError::Open`] if a dataset key the text names by `file` cannot be read.
+#[cfg(feature = "fuzzing")]
+pub fn from_toml_str(text: &str, base: &Path) -> CliResult<LoadedPolicy> {
+    parse(text, base)
+}
+
+fn parse(text: &str, base: &Path) -> CliResult<LoadedPolicy> {
+    let file: PolicyFile = toml::from_str(text)
+        .map_err(|source| CliError::Policy(format!("cannot parse policy: {source}")))?;
     from_parsed(file, base)
 }
 

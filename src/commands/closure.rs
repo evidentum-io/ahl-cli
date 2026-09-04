@@ -391,7 +391,9 @@ mod tests {
     }
 
     fn policy() -> LoadedPolicy {
-        MirrorFixture::conformance().policy
+        MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .policy
     }
 
     fn run_topology(options: &Options) -> Report {
@@ -419,7 +421,8 @@ mod tests {
         assert!(topology.to_json().expect("serializes").contains("\"status\": null"));
         assert!(!topology.to_text().contains("status:"), "{}", topology.to_text());
 
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let authenticated =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(authenticated.outcome, "valid", "{}", authenticated.reason);
@@ -567,7 +570,8 @@ mod tests {
 
     #[test]
     fn an_authenticated_closure_is_valid_and_labelled_run_observed() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(report.outcome, "valid", "{}", report.reason);
@@ -595,7 +599,8 @@ mod tests {
                 record: item["record"].as_str().unwrap_or_default().to_owned(),
             })
             .collect();
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(report.affected.as_deref(), Some(expected.as_slice()));
@@ -606,7 +611,8 @@ mod tests {
         // Entry 6 corrects record A; entry 12 corrects it again and supersedes entry 6. At a
         // checkpoint committing both, entry 6 no longer governs, and the CLI refuses rather
         // than computing a closure from the older trigger.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 13));
         assert_eq!(report.outcome, "unverifiable");
@@ -624,7 +630,8 @@ mod tests {
     #[test]
     fn a_challenge_never_governs_and_is_surfaced() {
         // Entry 23 retracts record F under a key that is not the dataset authority.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(23), 32));
         assert_eq!(report.outcome, "unverifiable");
@@ -633,14 +640,16 @@ mod tests {
 
     #[test]
     fn authenticated_mode_needs_an_explicit_checkpoint_and_a_mirror() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let mut options = authenticated_options(TriggerRef::EntryIndex(6), 8);
         options.checkpoint = None;
         let report = run_authenticated(&fixture, &options);
         assert_eq!(report.outcome, "error");
         assert!(report.reason.contains("never inferred"), "{}", report.reason);
 
-        let mut fixture = MirrorFixture::conformance();
+        let mut fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         fixture.policy.endpoints.mirror = None;
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
@@ -649,7 +658,9 @@ mod tests {
 
     #[test]
     fn an_equivocating_series_at_the_checkpoint_is_invalid_not_unverifiable() {
-        let fixture = MirrorFixture::conformance().with_equivocation_at(8);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(8);
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(report.outcome, "invalid");
@@ -658,7 +669,9 @@ mod tests {
 
     #[test]
     fn a_divergence_above_the_grounding_checkpoint_is_carried_as_a_finding() {
-        let fixture = MirrorFixture::conformance().with_equivocation_at(20);
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with")
+            .with_equivocation_at(20);
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(6), 8));
         assert_eq!(report.outcome, "valid", "{}", report.reason);
@@ -667,7 +680,8 @@ mod tests {
 
     #[test]
     fn an_entry_that_is_not_a_statement_is_excluded_and_reported() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(29), 32));
         assert_eq!(report.outcome, "valid", "{}", report.reason);
@@ -682,7 +696,8 @@ mod tests {
         // still answers, with the void entry reported beside the answer rather than in place of
         // it. Anything else would let one anchored envelope disable every closure over that log
         // from its index on.
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         // Entry 18 is the retraction that governs its record at tree_size 32, which is where
         // the corpus's first non-verifying entry is already committed.
         let report =
@@ -712,7 +727,8 @@ mod tests {
 
     #[test]
     fn an_entry_that_is_not_a_trigger_is_refused_by_name() {
-        let fixture = MirrorFixture::conformance();
+        let fixture = MirrorFixture::conformance()
+            .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let report =
             run_authenticated(&fixture, &authenticated_options(TriggerRef::EntryIndex(1), 8));
         assert_eq!(report.outcome, "unverifiable");

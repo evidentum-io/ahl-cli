@@ -9,9 +9,12 @@
 //! generated deterministically from the committed conformance corpus by
 //! `cargo run --bin gen_fixtures`.
 
+// Test code: an assertion, an index or an overflow that fires IS the failure report here.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::missing_panics_doc,
     clippy::multiple_crate_versions

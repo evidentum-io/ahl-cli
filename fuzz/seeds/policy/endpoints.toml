@@ -1,0 +1,7 @@
+[policy]
+genesis_entry_id = "sha256:d102ca149c3d23bb7efdcf9df4a5dc41e4026bf200fe68f15ce1d99455e6bfd2"
+genesis_key_ids = ["sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"]
+
+[endpoints]
+mirror = "https://mirror.example"
+witness = "https://witness.example"

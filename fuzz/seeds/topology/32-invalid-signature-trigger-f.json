@@ -1,0 +1,29 @@
+{
+  "entry_id": "sha256:7c5ff0d0c7e88ccdaa5f7b32debeb44244ae4b4cd547ebbfd04240faf2e0a407",
+  "entry_index": 32,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "dataset": "customers",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "manifest": "sha256:6dedcc481094b4f3cb3eb1e13bf4bad4c4c91fc0f7f3f5c17ec5945e3d4e4740",
+      "producer": "producer-1",
+      "reason_code": "fraud",
+      "record": "hmac-sha256:07f75f98ef1ea9112dcb04f392c062bc7344306c755c3c192656a0a521e1ed17",
+      "scope": {
+        "effective_from": "2026-08-16T12:00:00Z",
+        "retroactive": true
+      },
+      "type": "retraction",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg=="
+      }
+    ]
+  },
+  "note": "INTENTIONALLY NON-VERIFYING: `signatures[0].sig` does not verify against `signatures[0].key_id`'s real public key. See trigger-effective-void-candidate.ahl.",
+  "statement_id": "sha256:1d0b563abcb784b23544b9b9d53bb94fdd2cb0b41dec8a3b59d9d86428087986"
+}

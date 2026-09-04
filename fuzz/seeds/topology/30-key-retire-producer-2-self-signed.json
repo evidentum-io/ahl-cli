@@ -1,0 +1,27 @@
+{
+  "entry_id": "sha256:1d46dcec9f8c19379feab56e51265dcc4e42b1ad5952af785f56d0ab4b75e00d",
+  "entry_index": 30,
+  "envelope": {
+    "payload": {
+      "action": "retire",
+      "ahl_version": "0.4",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "key": {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "pubkey": "base64:gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=",
+        "valid_from": "2026-08-16T12:00:00Z"
+      },
+      "manifest": "sha256:6dedcc481094b4f3cb3eb1e13bf4bad4c4c91fc0f7f3f5c17ec5945e3d4e4740",
+      "producer": "producer-1",
+      "type": "key",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "sig": "base64:BjVJVCushEfk3iBY4h1RcshetkGu3UywFT8uKnZCbgqrZe5hZPMVwGFsQngmuTZNYuL+HJtK48QkXle4Mv1+DA=="
+      }
+    ]
+  },
+  "statement_id": "sha256:36b9084b60d048c74b5c16f02ab646e54e0ab72fa9f1a1081c6e871da80f3a0a"
+}

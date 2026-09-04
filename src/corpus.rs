@@ -111,6 +111,29 @@ pub fn load(path: &Path, limits: LocalLimits) -> CliResult<Corpus> {
         }
     }
 
+    from_values(raw, limits)
+}
+
+/// The structural half of [`load`], over corpus elements already parsed.
+///
+/// A seam for the fuzz harness in `fuzz/`, and nothing else: it is the entry-index and
+/// envelope structure walk `closure --topology` runs, reached without the directory traversal
+/// and the per-file handle checks [`load`] performs. Off by default; the API it adds carries
+/// no stability promise.
+///
+/// # Errors
+///
+/// [`CliError::LimitExhausted`] when the element count exceeds `limits.max_corpus_entries`.
+#[cfg(feature = "fuzzing")]
+pub fn from_json_bytes(bytes: &[u8], limits: LocalLimits) -> CliResult<Corpus> {
+    let raw = match parse("corpus", "<fuzz input>", bytes)? {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+    from_values(raw, limits)
+}
+
+fn from_values(raw: Vec<Value>, limits: LocalLimits) -> CliResult<Corpus> {
     if raw.len() > limits.max_corpus_entries {
         return Err(CliError::LimitExhausted(format!(
             "the corpus holds {} entries, beyond the configured maximum of {}",

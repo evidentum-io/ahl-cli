@@ -127,7 +127,8 @@ impl<'a, F: Fetcher> Enumerator<'a, F> {
                 selected.tree_size
             )));
         }
-        let width = to - from;
+        // `from < to` holds: the empty-range guard above returned otherwise.
+        let width = to.saturating_sub(from);
         if width > self.limits.max_entries {
             return Err(CliError::LimitExhausted(format!(
                 "enumerating {width} entries exceeds the configured maximum of {}",
@@ -171,7 +172,9 @@ impl<'a, F: Fetcher> Enumerator<'a, F> {
             )));
         }
         for (offset, (index, _)) in collected.iter().enumerate() {
-            let expected = from + offset as u64;
+            // `offset < collected.len() == width` and `from + width == to`, so the sum is at
+            // most `to` and stays in range.
+            let expected = from.saturating_add(offset as u64);
             if *index != expected {
                 return Err(CliError::EvidenceMissing(format!(
                     "the subranges do not tile [{from}, {to}): position {offset} carries entry \
@@ -307,7 +310,11 @@ pub fn verify_range_response(
         .get("entries")
         .and_then(Value::as_array)
         .ok_or_else(|| missing("range response carries no `entries` array".to_owned()))?;
-    let width = to - from;
+    // `from` and `to` are this function's arguments, and it is public: an inverted pair is a
+    // caller error, reported as one rather than allowed to underflow.
+    let Some(width) = to.checked_sub(from) else {
+        return Err(missing(format!("range [{from}, {to}) is inverted")));
+    };
     if entries.len() as u64 != width {
         return Err(missing(format!(
             "the range response carries {} entries for a range {width} wide",
@@ -318,7 +325,9 @@ pub fn verify_range_response(
     let mut collected = Vec::with_capacity(entries.len());
     for (offset, entry) in entries.iter().enumerate() {
         let claimed = entry.get("entry_index").and_then(Value::as_u64);
-        let expected = from + offset as u64;
+        // `offset < entries.len() == width` and `from + width == to`, so the sum is at most
+        // `to` and stays in range.
+        let expected = from.saturating_add(offset as u64);
         if claimed != Some(expected) {
             return Err(missing(format!(
                 "entry {offset} claims index {claimed:?}, expected {expected}"

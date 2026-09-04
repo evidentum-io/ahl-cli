@@ -1,0 +1,56 @@
+{
+  "entry_id": "sha256:81e856d0b3aa602dc6185368866fdb8da48b09903c0c26bebeb17acf3cef85c3",
+  "entry_index": 7,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "inputs": [
+        {
+          "dataset": "customers",
+          "record": "hmac-sha256:b3b4a463cabcc1fa963aa793097fb67ef3de110c1920539df7ba52ca68c597c7",
+          "role": "feature",
+          "statement": "sha256:efa1a26e88c08d46bf87d422e63a9dd6163ee76a63d1e2695aec615bb4767b64"
+        },
+        {
+          "dataset": "customers",
+          "record": "hmac-sha256:4f561671377c6cb318881c5abda7ced5db0c59ae40b482e50c8402b8892617ad",
+          "role": "reference",
+          "statement": "sha256:50d643a9aa570237956c31a5b8fad1e7aed5cb86f98e8dea69bd57cea776245c"
+        }
+      ],
+      "issued_at": "2026-08-16T12:00:00Z",
+      "manifest": "sha256:437053c55efe84c0b4c774140206689576bea846e08ec1381b3df0dfc12ba588",
+      "outputs": [
+        {
+          "dataset": "scores",
+          "locator": "urn:ahl-test:scores/S1-prime",
+          "record": "sha256:e4fccbcb05345bc70f1327bb001a1bb09f85df01de4e35b3778089aed70f24c4"
+        }
+      ],
+      "pipeline": "scoring-v1",
+      "producer": "producer-1",
+      "transform": {
+        "code": {
+          "digest": "sha256:6020efb5f77f23aeb11dd4a99623e6fdd09bb16167cb04d51e41614661a57305",
+          "type": "git_commit"
+        },
+        "model": {
+          "digest": "sha256:4010a9f46dbc15f9525f0e43bd55b2498b85a667e59e783270dca2ae97c62dfa",
+          "version": "risk-v4.2"
+        },
+        "params": {
+          "digest": "sha256:82328ce226d48bfd85b70be5918fdc3cd9759478a2e0c107925ac997bbf18a1e"
+        }
+      },
+      "type": "derivation",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:pY4D8TtyrhcW3Z0ekFFBZrliPL/owBo2/7XvQLRvPff569QDW2eUZRt05hB7mKq9NjDtuswbC4Lp1IAxXzwfDA=="
+      }
+    ]
+  },
+  "statement_id": "sha256:3eb41212109891b464877d8041103362ac36e8ad87a459cdae19f7ec552816e6"
+}

@@ -112,7 +112,12 @@ pub struct Options {
 /// exit-code contract requires a report on every path.
 #[must_use]
 pub fn run(policy: &LoadedPolicy, evaluation: &EvaluationTime, options: &Options) -> Report {
-    match verify(policy, evaluation, options) {
+    report_or_error(verify(policy, evaluation, options), evaluation)
+}
+
+/// Render a run that stopped early as the report the exit-code contract still requires.
+fn report_or_error(result: CliResult<Report>, evaluation: &EvaluationTime) -> Report {
+    match result {
         Ok(report) => report,
         Err(error) => {
             let mut report = Report::over_receipt(
@@ -164,6 +169,22 @@ const fn settled_before_the_core(error: &CliError) -> Option<Assertion> {
     }
 }
 
+/// Verify receipt bytes already in hand, against locally configured policy.
+///
+/// A seam for the fuzz harness in `fuzz/`, and nothing else: it is [`run`] without the file
+/// read, so arbitrary bytes reach the same version read, canonicality check, profile
+/// resolution and core run. Off by default; the API it adds carries no stability promise.
+#[cfg(feature = "fuzzing")]
+#[must_use]
+pub fn run_bytes(
+    policy: &LoadedPolicy,
+    evaluation: &EvaluationTime,
+    bytes: &[u8],
+    options: &Options,
+) -> Report {
+    report_or_error(verify_bytes(policy, evaluation, bytes, options), evaluation)
+}
+
 fn verify(
     policy: &LoadedPolicy,
     evaluation: &EvaluationTime,
@@ -171,10 +192,18 @@ fn verify(
 ) -> CliResult<Report> {
     // Unreadable, absent, or not a regular file: the CLI could not begin (exit 2).
     let bytes = secure::read_regular("receipt", &options.receipt, policy.local.max_file_bytes)?;
+    verify_bytes(policy, evaluation, &bytes, options)
+}
 
+fn verify_bytes(
+    policy: &LoadedPolicy,
+    evaluation: &EvaluationTime,
+    bytes: &[u8],
+    options: &Options,
+) -> CliResult<Report> {
     // Bytes present but malformed, non-canonical or structurally invalid: a rule fired against
     // the artifact (exit 1).
-    let receipt: Value = serde_json::from_slice(&bytes).map_err(|source| CliError::Malformed {
+    let receipt: Value = serde_json::from_slice(bytes).map_err(|source| CliError::Malformed {
         what: "receipt",
         detail: format!("not JSON: {source}"),
     })?;
@@ -648,7 +677,9 @@ fn freshness(
         governance.cadence_and_grace_for(tree_size).map_err(|error| error.to_string())?;
 
     let age = evaluation.nanos_since(instant);
-    let threshold = u128::from(cadence) + u128::from(grace);
+    // Both operands are `u64` widened to `u128`, so the sum is at most `2 * u64::MAX` and
+    // cannot leave the range; the checked form states that rather than relying on it.
+    let threshold = u128::from(cadence).saturating_add(u128::from(grace));
     if age > threshold {
         Ok(Some(Finding::new(
             "witness-stale",

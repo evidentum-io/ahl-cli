@@ -61,11 +61,19 @@ impl EvaluationTime {
     /// Nanoseconds elapsed since `earlier`, saturating at zero for a future instant.
     #[must_use]
     pub fn nanos_since(&self, earlier: OffsetDateTime) -> u128 {
-        let delta = self.instant - earlier;
+        // `earlier` is parsed out of an artifact, so it is attacker-chosen within the range
+        // `OffsetDateTime` accepts. Subtracting two `OffsetDateTime`s goes through a `Sub` that
+        // panics when the difference leaves `Duration`'s range; the two nanosecond timestamps
+        // are differenced instead, and an overflow reports zero elapsed rather than aborting.
+        let delta = self
+            .instant
+            .unix_timestamp_nanos()
+            .checked_sub(earlier.unix_timestamp_nanos())
+            .unwrap_or(0);
         if delta.is_negative() {
             0
         } else {
-            delta.whole_nanoseconds().unsigned_abs()
+            delta.unsigned_abs()
         }
     }
 }

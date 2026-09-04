@@ -1,0 +1,28 @@
+{
+  "entry_id": "sha256:b98f69ab5b440822ddcb4bd86979acdb4fbb01e3e3f0d1d80895f297bbe7f53f",
+  "entry_index": 38,
+  "envelope": {
+    "payload": {
+      "action": "add",
+      "ahl_version": "0.4",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "key": {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "pubkey": "base64:gTl3Dqh9F19Wo1Rmw0x+zMuNipG07jeiXfYPW4/Js5Q=",
+        "valid_from": "2026-08-17T00:00:00Z"
+      },
+      "manifest": "sha256:6dedcc481094b4f3cb3eb1e13bf4bad4c4c91fc0f7f3f5c17ec5945e3d4e4740",
+      "producer": "producer-1",
+      "type": "key",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg=="
+      }
+    ]
+  },
+  "note": "INTENTIONALLY NON-VERIFYING: `signatures[0].sig` does not verify against `signatures[0].key_id`'s real public key. A purported governance statement that does not verify is VOID (I-D §2.1, §7.5.1 4b and 4d): not inducted, no effect on the key state, reported as an informative item. See governance-state-void-governance-entries.ahl.",
+  "statement_id": "sha256:3676a257b0bd13e3547d4d312db0bb4fd13e4ac100109ddc0f0c28f93afa682e"
+}

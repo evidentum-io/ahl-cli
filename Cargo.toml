@@ -1,6 +1,6 @@
 [package]
 name = "ahl-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -20,14 +20,32 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
+# No-panic policy: library and binary code reaches no panicking construct on any input. Every
+# one of these is a way the client could abort mid-verification instead of rendering a verdict
+# and exiting with a code, so they are denied crate-wide and satisfied in code rather than
+# allowed at a site. The `#[cfg(test)]` modules and the integration tests allow them back at
+# module or crate level: an assertion that fires IS the failure report there.
 unwrap_used = "deny"
 expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
 panic = "deny"
+unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
+missing_panics_doc = "deny"
 # See ahl-core Cargo.toml for the rationale: thiserror 1.x (pulled in via the pinned atl-core
 # revision) resolves against both syn 2.x and syn 3.x transitively.
 multiple_crate_versions = "allow"
+
+[features]
+default = []
+# A seam for the fuzz harness in `fuzz/`, and nothing else: it exposes the parse-and-validate
+# half of three entry points the CLI otherwise reaches only through a file it opens under the
+# design note §4 handle checks — the policy TOML, the corpus JSON and the receipt bytes. A fuzz
+# target cannot go through those without writing a file per input, and the handle checks are
+# not what is under test. Off by default; the API it adds carries no stability promise.
+fuzzing = []
 
 [[bin]]
 name = "ahl-cli"
