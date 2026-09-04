@@ -179,6 +179,54 @@ fn archive_into(relative: &str, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// Build one binary from a scratch copy, preferring the committed dependency graph.
+///
+/// `--locked` first, because a pilot should run against the graph the repositories committed.
+/// It is not the guarantee that keeps a checkout pristine, though — the scratch copy is — so a
+/// lock that merely needs regenerating is not a reason to refuse to run. That happens routinely
+/// here: `ahl-mirror` and `ahl-witness` depend on `../ahl-core` by path, so a version bump in
+/// `ahl-core` makes both their committed locks stale until someone regenerates them, and the
+/// harness would otherwise be unusable for the whole of that window.
+///
+/// The fallback is `--offline`, never a plain build: the lock is updated inside the copy, no
+/// network is consulted, and the run says on stderr which graph it used and why. A build that
+/// fails for any other reason is reported with cargo's own output and not retried.
+fn build_binary(source: &Path, target: &Path, binary: &str) -> Result<(), String> {
+    let attempt = |flag: &str| {
+        Command::new(env!("CARGO"))
+            .args(["build", "--release", flag, "--bin", binary])
+            .current_dir(source)
+            .env("CARGO_TARGET_DIR", target)
+            .stdout(Stdio::null())
+            .output()
+            .map_err(|source| format!("cannot run cargo for `{binary}`: {source}"))
+    };
+    let locked = attempt("--locked")?;
+    if locked.status.success() {
+        return Ok(());
+    }
+    let complaint = String::from_utf8_lossy(&locked.stderr).into_owned();
+    if !complaint.contains("--locked was passed") && !complaint.contains("cannot update the lock") {
+        return Err(format!(
+            "`cargo build --release --locked` failed for `{binary}`:\n{complaint}"
+        ));
+    }
+    eprintln!(
+        "note: `{binary}`'s committed Cargo.lock is stale against its path dependencies, so the \
+         pilot resolved offline inside its scratch copy instead. The checkout is untouched \
+         either way. cargo said:\n{complaint}"
+    );
+    let offline = attempt("--offline")?;
+    if offline.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`cargo build --release --offline` failed for `{binary}`:\n{}",
+            String::from_utf8_lossy(&offline.stderr)
+        ))
+    }
+}
+
 /// Where built binaries are cached between runs, keyed by the source they were built from.
 fn cache_root() -> PathBuf {
     std::env::temp_dir().join("ahl-cli-e2e-build")
@@ -214,17 +262,7 @@ fn build_group(
     }
     for (member, binary) in binaries {
         let name = Path::new(member).file_name().unwrap_or_default();
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "--release", "--locked", "--bin", binary])
-            .current_dir(root.join("src").join(name))
-            .env("CARGO_TARGET_DIR", &target)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|source| format!("cannot run cargo for `{binary}`: {source}"))?;
-        if !status.success() {
-            return Err(format!("`cargo build --release --locked` failed for `{binary}`"));
-        }
+        build_binary(&root.join("src").join(name), &target, binary)?;
     }
     for (binary, path) in &built {
         if !path.is_file() {
