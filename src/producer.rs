@@ -537,11 +537,21 @@ fn leaves(entries: &[Value]) -> CliResult<Vec<Vec<u8>>> {
 
 /// The material one receipt is assembled from, after the prefix has been checked against the
 /// checkpoint it is served under.
+///
+/// # Why the checkpoint is carried exactly as cosigned
+///
+/// Adaptor §6.4 permits `anchoring.checkpoint.raw`, and §11.1 makes the cosigned bytes
+/// `JCS({"checkpoint": <the signed checkpoint object>, "witness_id": ...})`. Those two clauses
+/// interact and neither says so: a witness that was shown the six mapped members of §6.2
+/// cosigned *those* bytes, so a producer that then adds `raw` has changed the preimage and the
+/// cosignature no longer verifies over the object the receipt carries. The published
+/// `ahl-witness` wire form takes `raw` as a sibling of `checkpoint` rather than a member of it,
+/// so a producer cannot have the framing cosigned even if it wanted to. This build therefore
+/// carries the checkpoint object exactly as it was cosigned and omits the optional framing; the
+/// interaction is reported rather than papered over.
 pub struct Assembly {
-    /// The checkpoint the receipt is anchored under.
+    /// The checkpoint the receipt is anchored under, exactly as the witnesses cosigned it.
     checkpoint: Value,
-    /// Its 98-byte framing.
-    raw: String,
     /// Cosignatures the governing manifest's witness set accounts for.
     cosignatures: Vec<Value>,
     /// Cosignatures by witnesses an earlier manifest version declared, for rotation proofs.
@@ -568,7 +578,6 @@ impl Assembly {
     /// where the root it recomputes to is not the one the checkpoint commits.
     pub fn new(
         checkpoint: Value,
-        raw: String,
         prefix: Prefix,
         cosignatures: Vec<Value>,
         outgoing_cosignatures: BTreeMap<String, Value>,
@@ -594,7 +603,6 @@ impl Assembly {
         }
         Ok(Self {
             checkpoint,
-            raw,
             cosignatures,
             outgoing_cosignatures,
             entries: prefix.entries,
@@ -956,10 +964,12 @@ pub fn claim_shape(claim_type: &str) -> CliResult<ClaimShape> {
             shape("declared", "not-checked", true)
         }
         "trigger-effective" => shape("enumerated", "enumerated", true),
-        "disposition-effective" | "propagation-complete" => {
-            shape("enumerated", "not-checked", true)
-        }
-        "governance-state" => shape("enumerated", "not-checked", false),
+        "disposition-effective" => shape("enumerated", "not-checked", true),
+        // Receipt format §3 subject rule: `record_subject` is REQUIRED for `record-*`,
+        // `trigger-*` and `disposition-*` types only, and MUST be absent for the other two. A
+        // `propagation-complete` receipt is about an affected SET rather than one record, and
+        // `governance-state` targets an index through `claim_material.target_index`.
+        "propagation-complete" | "governance-state" => shape("enumerated", "not-checked", false),
         other => Err(CliError::Usage(format!(
             "`{other}` is not a claim type this build assembles; receipt format §3 registers \
              `statement-anchored`, `record-ingested`, `record-derived`, `trigger-declared`, \
@@ -1094,6 +1104,13 @@ pub fn assemble(
             claim.claim_type
         )));
     }
+    if claim.record_subject.is_some() && !shape.record_subject {
+        return Err(CliError::Usage(format!(
+            "claim type `{}` carries no record subject (receipt format §3 subject rule); a \
+             subject here would narrow a claim the type does not narrow",
+            claim.claim_type
+        )));
+    }
 
     let mut material = claim.material.clone();
     if let Some(content) = &claim.content {
@@ -1121,7 +1138,7 @@ pub fn assemble(
         "envelope": subject,
         "anchoring": {
             "adaptor": adaptor,
-            "checkpoint": checkpoint_with_raw(&assembly.checkpoint, &assembly.raw),
+            "checkpoint": assembly.checkpoint.clone(),
             "inclusion_path": assembly.inclusion_path(subject_index)?,
             "witnesses": assembly.cosignatures,
         },
@@ -1162,7 +1179,7 @@ pub fn assemble(
             }
             proofs.push(json!({
                 "manifest_entry_index": index,
-                "checkpoint": checkpoint_with_raw(&assembly.checkpoint, &assembly.raw),
+                "checkpoint": assembly.checkpoint.clone(),
                 "inclusion_path": assembly.inclusion_path(*index)?,
                 "witnesses": witnesses,
             }));
@@ -1175,15 +1192,6 @@ pub fn assemble(
     set(&mut keys, "witness", json!(witness_keys))?;
     set(&mut receipt, "keys", keys)?;
     Ok(receipt)
-}
-
-/// A checkpoint object carrying its adaptor binary framing (§6.4).
-fn checkpoint_with_raw(checkpoint: &Value, raw: &str) -> Value {
-    let mut carried = checkpoint.clone();
-    if let Some(map) = carried.as_object_mut() {
-        map.insert("raw".to_owned(), json!(raw));
-    }
-    carried
 }
 
 /// Keep only the cosignatures a manifest version's witness set accounts for, and index the rest
@@ -1212,6 +1220,106 @@ pub fn split_cosignatures(
         }
     }
     (carried, others)
+}
+
+/// Leaves of the committed tree with this root, from the producer's tree material.
+///
+/// The material is shaped as the receipt member it becomes: `{ "<root>": { "leaves": [ ... ] } }`.
+fn tree_leaves<'a>(trees: &'a Value, root: &str) -> CliResult<&'a Vec<Value>> {
+    trees.get(root).and_then(|tree| tree.get("leaves")).and_then(Value::as_array).ok_or_else(|| {
+        CliError::Usage(format!(
+            "the tree material holds no leaves for root `{root}`; committed tree material is \
+             corpus material and a claim over it cannot be assembled without it"
+        ))
+    })
+}
+
+/// The index of the leaf naming `record`, and the path opening it.
+///
+/// These trees are AHL constructs, so they use the plain leaf hashing of adaptor §9 —
+/// `SHA-256(0x00 || JCS(leaf))` — and never the two-digest log-leaf construction of §4.2.
+fn leaf_position(leaves: &[Value], record: &str) -> CliResult<(usize, Vec<String>)> {
+    let at = leaves
+        .iter()
+        .position(|leaf| leaf.get("record").and_then(Value::as_str) == Some(record))
+        .ok_or_else(|| CliError::Usage(format!("no committed leaf names record `{record}`")))?;
+    let bytes: Vec<Vec<u8>> = leaves.iter().map(jcs).collect();
+    let proof = inclusion_proof(&bytes, at).map_err(|source| {
+        CliError::EvidenceMissing(format!("no path opens leaf {at}: {source}"))
+    })?;
+    Ok((at, proof_path_hex(&proof)))
+}
+
+/// The claim material a producer's committed trees supply for the leaf-bearing claim types.
+///
+/// `record-derived` opens the batch output tree at the output's leaf and, where that leaf
+/// carries the wide-input form, opens the input-set tree at every member — I-D §7.2 makes
+/// `input_members` prove the listed inputs and **no others**, so a partial list is not a
+/// smaller claim but a false one. `disposition-*` opens the propagation's affected tree.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] where the material does not hold a tree the subject commits, or holds no
+/// leaf for the record the claim is about.
+pub fn leaf_material(
+    claim_type: &str,
+    subject_payload: &Value,
+    trees: &Value,
+    record: &str,
+    dataset: &str,
+) -> CliResult<Value> {
+    match claim_type {
+        "record-derived" => {
+            let Some(root) = subject_payload.get("outputs_root").and_then(Value::as_str) else {
+                // An unbatched derivation commits its outputs inline, so there is no tree to
+                // open and the claim material is the output alone.
+                return Ok(json!({ "output": { "dataset": dataset, "record": record } }));
+            };
+            let leaves = tree_leaves(trees, root)?;
+            let (at, path) = leaf_position(leaves, record)?;
+            let leaf = leaves.get(at).cloned().unwrap_or(Value::Null);
+            let mut material = json!({
+                "output": { "dataset": dataset, "record": record },
+                "batch_leaf": leaf,
+                "leaf_index": at,
+                "leaf_path": path,
+            });
+            let inputs = leaves.get(at).and_then(|leaf| leaf.get("inputs"));
+            if let Some(input_root) =
+                inputs.and_then(|inputs| inputs.get("input_set_root")).and_then(Value::as_str)
+            {
+                let input_leaves = tree_leaves(trees, input_root)?;
+                let bytes: Vec<Vec<u8>> = input_leaves.iter().map(jcs).collect();
+                let mut members = Vec::with_capacity(input_leaves.len());
+                for (at, input) in input_leaves.iter().enumerate() {
+                    let proof = inclusion_proof(&bytes, at).map_err(|source| {
+                        CliError::EvidenceMissing(format!("no path opens input {at}: {source}"))
+                    })?;
+                    members.push(json!({
+                        "input": input,
+                        "input_index": at,
+                        "input_path": proof_path_hex(&proof),
+                    }));
+                }
+                set(&mut material, "input_members", json!(members))?;
+            }
+            Ok(material)
+        }
+        "disposition-declared" | "disposition-effective" => {
+            let root =
+                subject_payload.get("affected_root").and_then(Value::as_str).ok_or_else(|| {
+                    CliError::Usage("the subject propagation commits no affected tree".to_owned())
+                })?;
+            let leaves = tree_leaves(trees, root)?;
+            let (at, path) = leaf_position(leaves, record)?;
+            Ok(json!({
+                "disposition_leaf": leaves.get(at).cloned().unwrap_or(Value::Null),
+                "leaf_index": at,
+                "leaf_path": path,
+            }))
+        }
+        _ => Ok(json!({})),
+    }
 }
 
 #[cfg(test)]

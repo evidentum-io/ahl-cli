@@ -286,13 +286,7 @@ pub fn run<F: Fetcher>(
         .map(ToOwned::to_owned)
         .collect();
 
-    let assembly = Assembly::new(
-        position.checkpoint.clone(),
-        position.raw.clone(),
-        prefix,
-        carried,
-        outgoing,
-    )?;
+    let assembly = Assembly::new(position.checkpoint.clone(), prefix, carried, outgoing)?;
 
     let content = content_binding(options, limits)?;
     let record_subject = record_subject(options)?;
@@ -306,6 +300,7 @@ pub fn run<F: Fetcher>(
             &assembly,
             position.entry_index,
             &options.claim,
+            options,
             material(options, limits)?,
         )?,
         note: options.note.clone().unwrap_or_else(|| {
@@ -425,9 +420,27 @@ fn complete_material<F: Fetcher>(
     assembly: &Assembly,
     subject_index: u64,
     claim_type: &str,
+    options: &Options,
     mut material: Value,
 ) -> CliResult<Value> {
     let size = assembly.size()?;
+    // What the producer's committed trees supply: the batch output leaf a `record-derived`
+    // claim opens, and the disposition leaf a `disposition-*` claim opens. Both are keyed by
+    // the record subject, so no flag names a leaf index a caller could get wrong.
+    if let (Some(trees), Some((dataset, record))) =
+        (material.get("trees").cloned(), record_subject(options)?)
+    {
+        let subject = assembly.entry(subject_index)?.clone();
+        let payload = subject.get("payload").cloned().unwrap_or(Value::Null);
+        let mut derived = producer::leaf_material(claim_type, &payload, &trees, &record, &dataset)?;
+        let members: Vec<(String, Value)> = producer::object_mut(&mut derived)?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (member, value) in members {
+            set(&mut material, &member, value)?;
+        }
+    }
     match claim_type {
         "trigger-effective" => {
             set(&mut material, "checkpoint_C", assembly.checkpoint().clone())?;

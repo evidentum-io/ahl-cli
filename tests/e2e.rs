@@ -42,6 +42,8 @@
 
 // `tests/e2e.rs` is the crate root of this test binary, so its child modules would otherwise
 // resolve beside it in `tests/`. The harness lives in its own directory instead.
+#[path = "e2e/pilot.rs"]
+mod pilot;
 #[path = "e2e/scenario.rs"]
 mod scenario;
 #[path = "e2e/stack.rs"]
@@ -147,6 +149,160 @@ pub fn start() -> Result<Pilot, String> {
     }
 
     Ok(Pilot { stack, keys, genesis, policy, profile_hash, key_files, work })
+}
+
+/// The negative twins, each expected to fail for the reason the corpus names.
+fn negatives(pilot: &Pilot, replay: &pilot::Replay) -> Vec<String> {
+    let mut failures = Vec::new();
+    // A declared-mode receipt whose subject is signed by a key a `key` statement added: I-D
+    // §7.4 puts producer-key transitions in enumeration material alone, so declared-mode
+    // governance holds no transition for it and the result is `unverifiable`, never `invalid`.
+    // The corpus says the same in `statement-anchored-uncarried-key-transition-must-fail.ahl`.
+    let (code, report) =
+        pilot::verify(&pilot.policy, replay.get("record-ingested-second-key"), &[]);
+    eprintln!("  uncarried-key-transition: exit {code}, outcome {}", report["outcome"]);
+    if code != 3 {
+        failures.push(format!("uncarried key transition: exit {code}, expected 3 (unverifiable)"));
+    }
+
+    // Negative twins the corpus has, produced here from live material.
+    let (code, report) =
+        pilot::verify(&pilot.policy, replay.get("statement-anchored-bad-signature"), &[]);
+    eprintln!(
+        "  negative non-verifying-envelope: exit {code}, status {}, reason {}",
+        report["status"], report["reason"]
+    );
+    if code != 1 {
+        failures.push(format!("non-verifying envelope: exit {code}, expected 1 (invalid)"));
+    }
+    let reason = report["reason"].as_str().unwrap_or_default().to_owned();
+    if !reason.contains("signature") {
+        failures
+            .push(format!("non-verifying envelope: rejected for `{reason}`, not the signature"));
+    }
+
+    let (code, report) =
+        pilot::verify(&pilot.policy, replay.get("trigger-effective-unauthorised"), &[]);
+    eprintln!(
+        "  negative unauthorised-trigger: exit {code}, status {}, reason {}",
+        report["status"], report["reason"]
+    );
+    if code != 1 {
+        failures.push(format!("unauthorised trigger: exit {code}, expected 1 (invalid)"));
+    }
+    let reason = report["reason"].as_str().unwrap_or_default().to_owned();
+    if !reason.contains("authority") && !reason.contains("govern") {
+        failures.push(format!("unauthorised trigger: rejected for `{reason}`, not authority"));
+    }
+
+    // A cosignature older than cadence + grace is a finding; `--require-fresh` promotes it.
+    let (code, report) = pilot::verify(
+        &pilot.policy,
+        replay.get("record-ingested"),
+        &["--require-fresh", "--evaluation-time", "2030-01-01T00:00:00Z"],
+    );
+    eprintln!(
+        "  negative stale-cosignature: exit {code}, status {}, outcome {}, reason {}",
+        report["status"], report["outcome"], report["reason"]
+    );
+    if code != 3 {
+        failures.push(format!("stale cosignature: exit {code}, expected 3 (unverifiable)"));
+    }
+    // The receipt itself is untouched: §7.7 still reads `valid`, and only the CLI overlay moved
+    // the run's outcome. Conflating the two would report a policy decision as a receipt result.
+    if report["status"] != serde_json::json!("valid") {
+        failures.push(format!(
+            "stale cosignature: the receipt's own status became {}, but staleness is a policy \
+             overlay and never rewrites the §7.7 result",
+            report["status"]
+        ));
+    }
+
+    failures
+}
+
+#[test]
+fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracle() {
+    if !enabled() {
+        eprintln!("skipped: set AHL_E2E=1 to run the end-to-end pilot");
+        return;
+    }
+    let pilot = match start() {
+        Ok(pilot) => pilot,
+        Err(reason) => panic!("the pilot could not start: {reason}"),
+    };
+    let replay = pilot::replay(&pilot);
+
+    // Positives: one per claim type the brief names, plus the two extra ingestion receipts the
+    // embedded introductions need. The corpus's `receipts/index.json` says `verified` for the
+    // valid vector of every one of these types; the live stack must agree.
+    let positives = [
+        "key-anchored",
+        "record-ingested",
+        "record-ingested-after-rotation",
+        "record-derived",
+        "manifest-anchored",
+        "retraction-anchored",
+        "trigger-declared",
+        "trigger-effective",
+        "disposition-declared",
+        "disposition-effective",
+        "propagation-complete",
+        "governance-state",
+    ];
+    let mut failures = Vec::new();
+    for name in positives {
+        let (code, report) = pilot::verify(&pilot.policy, replay.get(name), &[]);
+        eprintln!(
+            "  {name}: exit {code}, status {}, outcome {}, reason {}",
+            report["status"], report["outcome"], report["reason_code"]
+        );
+        if code != 0 {
+            failures.push(format!(
+                "{name}: exit {code}, status {}, reason {} — {}",
+                report["status"], report["reason_code"], report["reason"]
+            ));
+        }
+    }
+
+    // The rotation is genuinely exercised rather than skipped: a receipt anchored under a
+    // checkpoint manifest version 2 governs carries a rotation proof for it, cosigned by the
+    // OUTGOING witness, while its own assurance rests on the incoming one.
+    let rotated: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(replay.get("propagation-complete")).expect("the receipt"),
+    )
+    .expect("JSON");
+    let proofs = rotated["governance"]["rotation_proofs"].as_array();
+    assert_eq!(
+        proofs.map(Vec::len),
+        Some(1),
+        "the witness rotation at entry 5 produced no rotation proof"
+    );
+    assert_eq!(
+        rotated["governance"]["rotation_proofs"][0]["manifest_entry_index"],
+        serde_json::json!(5)
+    );
+    assert_eq!(
+        rotated["governance"]["rotation_proofs"][0]["witnesses"][0]["witness_id"],
+        serde_json::json!(scenario::WITNESS_1),
+        "a rotation proof is cosigned by the witness the OUTGOING version declares"
+    );
+    assert_eq!(
+        rotated["anchoring"]["witnesses"][0]["witness_id"],
+        serde_json::json!(scenario::WITNESS_2),
+        "assurance after the rotation rests on the incoming witness"
+    );
+
+    failures.extend(negatives(&pilot, &replay));
+
+    for (name, reason) in &replay.skipped {
+        eprintln!("  SKIPPED {name}: {reason}");
+    }
+    assert!(
+        failures.is_empty(),
+        "the live stack diverged from the corpus:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
