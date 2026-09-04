@@ -1,0 +1,9 @@
+[policy]
+genesis_entry_id = "sha256:d102ca149c3d23bb7efdcf9df4a5dc41e4026bf200fe68f15ce1d99455e6bfd2"
+genesis_key_ids = ["sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"]
+
+[policy.adaptor_profiles.ahl-test-log-v1]
+hash = "sha256:ea4e9a7d9f4c2286fe2a0a292e939ef6c2261c8567b3d91cd7375c5490525961"
+path = "adaptor/ahl-test-log-v1.md"
+checkpoint_raw = false
+consistency_proofs = true

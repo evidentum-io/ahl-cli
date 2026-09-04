@@ -38,6 +38,15 @@ missing_panics_doc = "deny"
 # revision) resolves against both syn 2.x and syn 3.x transitively.
 multiple_crate_versions = "allow"
 
+[features]
+default = []
+# A seam for the fuzz harness in `fuzz/`, and nothing else: it exposes the parse-and-validate
+# half of three entry points the CLI otherwise reaches only through a file it opens under the
+# design note §4 handle checks — the policy TOML, the corpus JSON and the receipt bytes. A fuzz
+# target cannot go through those without writing a file per input, and the handle checks are
+# not what is under test. Off by default; the API it adds carries no stability promise.
+fuzzing = []
+
 [[bin]]
 name = "ahl-cli"
 path = "src/bin/ahl-cli.rs"

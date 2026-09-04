@@ -1,0 +1,38 @@
+{
+  "entry_id": "sha256:d4b773a0841648849911cda4d74a6b25bc7df63195c36ab3f4c1a5b08cbeec85",
+  "entry_index": 4,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "leaf_format": "ahl-leaf-v2",
+      "manifest": "sha256:437053c55efe84c0b4c774140206689576bea846e08ec1381b3df0dfc12ba588",
+      "outputs_count": 3,
+      "outputs_root": "sha256:5e6104bf68d3f6f90132b9578bffb5bdd3707422dffa7db2472dfb0f6f9d2ae7",
+      "pipeline": "scoring-v1",
+      "producer": "producer-1",
+      "transform": {
+        "code": {
+          "digest": "sha256:6020efb5f77f23aeb11dd4a99623e6fdd09bb16167cb04d51e41614661a57305",
+          "type": "git_commit"
+        },
+        "model": {
+          "digest": "sha256:4010a9f46dbc15f9525f0e43bd55b2498b85a667e59e783270dca2ae97c62dfa",
+          "version": "risk-v4.2"
+        },
+        "params": {
+          "digest": "sha256:82328ce226d48bfd85b70be5918fdc3cd9759478a2e0c107925ac997bbf18a1e"
+        }
+      },
+      "type": "derivation",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:jCeQCps3K+CnkVy0Qvi8DXJowd+Ny0OUC3ijwCzaKObbulKx1vlgaoGvRyzS2dGAT4zL4TLv2GLjx8/Qb2maCA=="
+      }
+    ]
+  },
+  "statement_id": "sha256:1ec9ec0100b0a595fd0936170d921f79bdf5f840e37cca8f49326df1b9dd1dde"
+}

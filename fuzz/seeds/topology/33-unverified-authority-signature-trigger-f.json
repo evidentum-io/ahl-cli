@@ -1,0 +1,33 @@
+{
+  "entry_id": "sha256:cf7bada16206c64904cc5274c331e4e04335206d20b243f95d9fccdcd5f7d0e1",
+  "entry_index": 33,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "dataset": "customers",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "manifest": "sha256:6dedcc481094b4f3cb3eb1e13bf4bad4c4c91fc0f7f3f5c17ec5945e3d4e4740",
+      "producer": "producer-1",
+      "reason_code": "error",
+      "record": "hmac-sha256:07f75f98ef1ea9112dcb04f392c062bc7344306c755c3c192656a0a521e1ed17",
+      "scope": {
+        "effective_from": "2026-08-16T12:00:00Z",
+        "retroactive": true
+      },
+      "type": "retraction",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "sig": "base64:fomxtiJYi5KZe7WpJeU8+gd8qmnz/3BLreLzDf5GmI9ilXmXkdpu3kOX3hX7ggOWJjo4kOQ7mt7CeB6b4J8jAw=="
+      },
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg=="
+      }
+    ]
+  },
+  "note": "INTENTIONALLY NON-VERIFYING: `signatures[1].sig` (the entry naming the dataset authority's real key_id) does not verify against that key_id's real public key, even though `signatures[0]` is a genuine signature from a non-authority producer key. See trigger-effective-unverified-authority-signature-must-fail.ahl.",
+  "statement_id": "sha256:d708fc37b84966c685539b01e26539832b4f7aa87c9f7e9c92f93721aad53c08"
+}

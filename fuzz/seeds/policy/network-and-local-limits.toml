@@ -1,0 +1,14 @@
+[policy]
+genesis_entry_id = "sha256:d102ca149c3d23bb7efdcf9df4a5dc41e4026bf200fe68f15ce1d99455e6bfd2"
+genesis_key_ids = ["sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"]
+
+[limits.network]
+max_response_bytes = 33554432
+max_total_bytes = 268435456
+max_subrange_requests = 256
+max_entries = 1048576
+wall_clock_seconds = 300
+
+[limits.local]
+max_file_bytes = 33554432
+max_corpus_entries = 1048576

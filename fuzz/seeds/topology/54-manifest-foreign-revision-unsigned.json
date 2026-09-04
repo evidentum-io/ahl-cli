@@ -1,0 +1,93 @@
+{
+  "entry_id": "sha256:145b53af49b0b591eb98e2d645e050865a73a441613ee8ebe287c23e9e57d4da",
+  "entry_index": 54,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.5",
+      "datasets": {
+        "customers": {
+          "authority": {
+            "key_ids": [
+              "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e"
+            ],
+            "producer": "producer-1"
+          },
+          "canonicalization": "jcs",
+          "commitment_mode": "keyed",
+          "key_access": "authorized-verifiers-only"
+        },
+        "scores": {
+          "canonicalization": "jcs",
+          "commitment_mode": "plain",
+          "key_access": "not-applicable"
+        }
+      },
+      "issued_at": "2026-08-16T12:00:00Z",
+      "keys": [
+        {
+          "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+          "pubkey": "base64:iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w="
+        }
+      ],
+      "level": "L3",
+      "log": {
+        "adaptor": {
+          "hash": "sha256:ea4e9a7d9f4c2286fe2a0a292e939ef6c2261c8567b3d91cd7375c5490525961",
+          "id": "ahl-test-log-v1"
+        },
+        "cadence_epoch": "2026-08-16T11:30:00Z",
+        "checkpoint_cadence": "PT1H",
+        "keys": [
+          {
+            "key_id": "sha256:b62e867fa2f33afe62d5d6b1642e1621d543307846b2a57b897e710919b76709",
+            "pubkey": "base64:7UkoxijRwsbq6QM4kFmVYSlZJzpcY/k2NsFGFKyHN9E=",
+            "valid_from_index": 0
+          }
+        ],
+        "log_id": "sha256:f96bab99f35b3ca221f3f233369835c3ee222f4b2e6c00f84b3a24f840f017a0",
+        "operator": "log-operator-1",
+        "witness_grace_period": "PT15M"
+      },
+      "pipelines": {
+        "exclude": [],
+        "include": [
+          "scoring-v1"
+        ]
+      },
+      "predecessor": "sha256:a90a849f737efda966e76addf1218903898f476b7a683c0a4cdacf1de682d972",
+      "producer": "producer-1",
+      "properties": {
+        "reproducible_reconstruction": false
+      },
+      "retention": {
+        "statements": "P10Y"
+      },
+      "type": "manifest",
+      "valid_time": "2026-08-16T12:00:00Z",
+      "windows": {
+        "anchoring": "PT24H",
+        "propagation": "P30D"
+      },
+      "witnesses": [
+        {
+          "keys": [
+            {
+              "key_id": "sha256:72456720412037a6b339f884ce6d91bb4cc163a7dc3e4c58c658e6c2097b92a2",
+              "pubkey": "base64:iodf/x6zhFFXes1a/uQFRWVo3XyJ4JCGOgVXvHr0nxc=",
+              "valid_from_index": 54
+            }
+          ],
+          "witness_id": "witness-2"
+        }
+      ]
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+        "sig": "base64:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg=="
+      }
+    ]
+  },
+  "note": "INTENTIONALLY NON-VERIFYING: `signatures[0].sig` does not verify against `signatures[0].key_id`'s real public key, and the payload declares `ahl_version: \"0.5\"` besides. As a `governance.chain[]` element this is `invalid` on the signature (I-D §7.5.1 4b), not `unverifiable` on the revision. See statement-anchored-broken-foreign-revision-chain-hop-must-fail.ahl.",
+  "statement_id": "sha256:43cfddb1f61820708084e4cb386b2bca8a1ff1c50bec589510532aa1d15f0857"
+}

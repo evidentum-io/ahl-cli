@@ -1,0 +1,6 @@
+# Anchored to this directory: an unanchored `corpus` would also match `seeds/corpus`, which is
+# committed material and not a working directory.
+/target
+/corpus
+/artifacts
+/coverage

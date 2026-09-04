@@ -1,0 +1,28 @@
+{
+  "entry_id": "sha256:80a4818a739bf628ce19eb88166fe53f48da6ac5f645c513f1ed452155ccc03b",
+  "entry_index": 19,
+  "envelope": {
+    "payload": {
+      "ahl_version": "0.4",
+      "dataset": "scores",
+      "issued_at": "2026-08-16T12:00:00Z",
+      "manifest": "sha256:437053c55efe84c0b4c774140206689576bea846e08ec1381b3df0dfc12ba588",
+      "producer": "producer-1",
+      "reason_code": "superseded",
+      "record": "sha256:e4fccbcb05345bc70f1327bb001a1bb09f85df01de4e35b3778089aed70f24c4",
+      "scope": {
+        "effective_from": "2026-08-16T12:00:00Z",
+        "retroactive": true
+      },
+      "type": "retraction",
+      "valid_time": "2026-08-16T12:00:00Z"
+    },
+    "signatures": [
+      {
+        "key_id": "sha256:6a3803d5f059902a1c6dafbc9ba4729212f7caac08634cc3ae76b27529f03827",
+        "sig": "base64:WQXotR5bebILFbMpNXvCbK+rrf27+v7OSPZQf3QytbxnToCeEt/szEZ6SoM0ESFAMcV9Ikt39aWw5u+og0LoAw=="
+      }
+    ]
+  },
+  "statement_id": "sha256:8582c49307b24db6844992029a7aa1d5b74ce0af21c2c4883efb2b44001121ce"
+}
