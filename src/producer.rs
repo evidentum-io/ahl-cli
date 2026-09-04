@@ -631,14 +631,18 @@ fn leaves(entries: &[Value]) -> CliResult<Vec<Vec<u8>>> {
 /// # Why the checkpoint is carried exactly as cosigned
 ///
 /// Adaptor §6.4 permits `anchoring.checkpoint.raw`, and §11.1 makes the cosigned bytes
-/// `JCS({"checkpoint": <the signed checkpoint object>, "witness_id": ...})`. Those two clauses
-/// interact and neither says so: a witness that was shown the six mapped members of §6.2
-/// cosigned *those* bytes, so a producer that then adds `raw` has changed the preimage and the
-/// cosignature no longer verifies over the object the receipt carries. The published
-/// `ahl-witness` wire form takes `raw` as a sibling of `checkpoint` rather than a member of it,
-/// so a producer cannot have the framing cosigned even if it wanted to. This build therefore
-/// carries the checkpoint object exactly as it was cosigned and omits the optional framing; the
-/// interaction is reported rather than papered over.
+/// `JCS({"checkpoint": <the signed checkpoint object>, "witness_id": ...})`. Read literally
+/// those two clauses interact and neither says so: a witness shown the six mapped members of
+/// §6.2 cosigned *those* bytes, so a producer that afterwards added `raw` changed the preimage
+/// and the cosignature stopped verifying over the object the receipt carried. That is not a
+/// hypothetical — it is what this pilot hit first, on every receipt it issued.
+///
+/// `ahl_core::CosignedCheckpoint::project` now settles it in the direction §11.1 should have
+/// stated all along: the preimage is the six members, and `raw` is dropped rather than signed.
+/// Carrying the framing is therefore possible again. This build still does not, for one reason
+/// only — a receipt is safest when its checkpoint object is byte-identical to the one a witness
+/// was actually shown, and nothing in this pilot needs the convenience §6.4 offers. Revisiting
+/// that is a decision to take deliberately, not a default to drift into.
 pub struct Assembly {
     /// The checkpoint the receipt is anchored under, exactly as the witnesses cosigned it.
     checkpoint: Value,
