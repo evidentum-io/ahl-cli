@@ -1712,4 +1712,856 @@ mod tests {
         let error = claim_shape("record-invented").expect_err("not a registry id");
         assert!(error.to_string().contains("statement-anchored"), "{error}");
     }
+
+    // ------------------------------------------------------------------
+    // The scripted deployment: assembly against a log, mirror and witness
+    // that answer from an in-memory tree rather than from a socket.
+    // ------------------------------------------------------------------
+
+    use crate::scripted;
+
+    /// An assembly over a scripted deployment's own tree, with the cosignatures it obtained.
+    fn assembly_over(
+        stack: &scripted::Stack,
+        cosignatures: Vec<Value>,
+        outgoing: BTreeMap<String, Value>,
+    ) -> Assembly {
+        let size = stack.size();
+        Assembly::new(
+            stack.checkpoint(),
+            Prefix {
+                material: json!({ "range": { "from_index": 0, "to_index": size } }),
+                entries: stack.entries.clone(),
+            },
+            cosignatures,
+            outgoing,
+        )
+        .expect("the enumerated prefix recomputes the root the checkpoint commits")
+    }
+
+    /// The default scripted assembly, carrying the one cosignature its witness issues.
+    fn scripted_assembly() -> Assembly {
+        let stack = scripted::Stack::new();
+        assembly_over(&stack, vec![scripted::cosignature()], BTreeMap::new())
+    }
+
+    fn claim_of(claim_type: &str, record_subject: Option<(&str, &str)>) -> Claim {
+        Claim {
+            claim_type: claim_type.to_owned(),
+            record_subject: record_subject
+                .map(|(dataset, record)| (dataset.to_owned(), record.to_owned())),
+            content: None,
+            material: json!({}),
+            note: "assembled by a scripted deployment".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_log_is_asked_twice_and_the_two_answers_must_place_the_entry_together() {
+        let stack = scripted::Stack::new();
+        let envelope = stack.envelope_at(scripted::APPENDED);
+        let position = anchor(&stack, scripted::LOG, &envelope).expect("a scripted anchor");
+        assert_eq!(position.entry_index, scripted::APPENDED);
+        assert_eq!(position.atl_entry_id.as_deref(), Some(scripted::ATL_ENTRY_ID));
+        assert_eq!(position.inclusion_path, stack.inclusion_path(scripted::APPENDED));
+        assert_eq!(position.checkpoint.get("log_id"), Some(&json!(scripted::log_id())));
+        // `raw` reassembles from the mapped object, which is the §6.4 framing.
+        assert!(position.raw.starts_with("base64:"));
+
+        let contradicting = scripted::Stack::new().with_disagreeing_index();
+        let error = anchor(&contradicting, scripted::LOG, &envelope)
+            .expect_err("a log that contradicts itself about where an entry landed");
+        assert!(error.to_string().contains("when it accepted it"), "{error}");
+    }
+
+    #[test]
+    fn a_submission_the_log_refuses_or_answers_unusably_is_reported_as_such() {
+        let envelope = scripted::envelope(scripted::statement("ingestion", json!({})));
+        let entry = entry_id(&envelope);
+
+        let refused = scripted::Canned::raw(503, "unavailable");
+        let error = submit(&refused, scripted::LOG, &envelope, &entry).expect_err("a refusal");
+        assert!(error.to_string().contains("answered 503 to a submission"), "{error}");
+
+        let garbage = scripted::Canned::raw(201, "not json");
+        let error = submit(&garbage, scripted::LOG, &envelope, &entry).expect_err("not JSON");
+        assert!(error.to_string().contains("did not answer JSON"), "{error}");
+
+        let other_entry = scripted::Canned::json(
+            201,
+            &json!({ "entry": { "payload_hash": "sha256:00", "metadata_hash": "sha256:00" } }),
+        );
+        let error =
+            submit(&other_entry, scripted::LOG, &envelope, &entry).expect_err("another entry");
+        assert!(error.to_string().contains("names payload hash"), "{error}");
+
+        let other_metadata = scripted::Canned::json(
+            201,
+            &json!({ "entry": { "payload_hash": entry, "metadata_hash": "sha256:00" } }),
+        );
+        let error = submit(&other_metadata, scripted::LOG, &envelope, &entry)
+            .expect_err("metadata outside the profile");
+        assert!(error.to_string().contains("recorded ATL metadata digest"), "{error}");
+
+        let entry_block =
+            json!({ "payload_hash": entry, "metadata_hash": scripted::metadata_hash() });
+        let no_id = scripted::Canned::json(201, &json!({ "entry": entry_block }));
+        let error = submit(&no_id, scripted::LOG, &envelope, &entry).expect_err("no `entry.id`");
+        assert!(error.to_string().contains("carries no `entry.id`"), "{error}");
+
+        let no_index = scripted::Canned::json(
+            201,
+            &json!({ "entry": { "id": "x", "payload_hash": entry,
+                                "metadata_hash": scripted::metadata_hash() } }),
+        );
+        let error =
+            submit(&no_index, scripted::LOG, &envelope, &entry).expect_err("no `leaf_index`");
+        assert!(error.to_string().contains("carries no `leaf_index`"), "{error}");
+    }
+
+    /// An ATL Evidence Receipt about `entry`, with `proof` replaced by the caller's.
+    fn atl_receipt_with(entry: &str, proof: &Value) -> Value {
+        json!({
+            "entry": {
+                "id": scripted::ATL_ENTRY_ID,
+                "payload_hash": entry,
+                "metadata_hash": scripted::metadata_hash(),
+            },
+            "proof": proof,
+        })
+    }
+
+    #[test]
+    fn an_evidence_receipt_missing_what_a_position_is_made_of_is_refused() {
+        let envelope = scripted::envelope(scripted::statement("ingestion", json!({})));
+        let entry = entry_id(&envelope);
+        let fetch = |receipt: Value| {
+            retrieve(
+                &scripted::Canned::json(200, &receipt),
+                scripted::LOG,
+                scripted::ATL_ENTRY_ID,
+                &entry,
+            )
+        };
+
+        let error = retrieve(
+            &scripted::Canned::raw(404, "absent"),
+            scripted::LOG,
+            scripted::ATL_ENTRY_ID,
+            &entry,
+        )
+        .expect_err("a 404");
+        assert!(error.to_string().contains("answered 404 for the Evidence Receipt"), "{error}");
+
+        let no_proof = json!({
+            "entry": { "id": scripted::ATL_ENTRY_ID, "payload_hash": entry,
+                       "metadata_hash": scripted::metadata_hash() },
+        });
+        let error = fetch(no_proof).expect_err("no proof");
+        assert!(error.to_string().contains("carries no `proof`"), "{error}");
+
+        let error = fetch(atl_receipt_with(&entry, &json!({}))).expect_err("no leaf index");
+        assert!(error.to_string().contains("carries no `leaf_index`"), "{error}");
+
+        let error = fetch(atl_receipt_with(&entry, &json!({ "leaf_index": 0 })))
+            .expect_err("no checkpoint at all");
+        assert!(error.to_string().contains("nanosecond `timestamp`"), "{error}");
+
+        let error = fetch(atl_receipt_with(
+            &entry,
+            &json!({ "leaf_index": 0, "checkpoint": { "timestamp": 1_u64 } }),
+        ))
+        .expect_err("a checkpoint the §6.2 mapping cannot be built from");
+        assert!(error.to_string().contains("carries no `origin`"), "{error}");
+    }
+
+    #[test]
+    fn an_inclusion_path_outside_the_family_string_grammar_is_unusable() {
+        let envelope = scripted::envelope(scripted::statement("ingestion", json!({})));
+        let entry = entry_id(&envelope);
+        let stack = scripted::Stack::new();
+        let checkpoint = stack.atl_checkpoint(1);
+        let fetch = |path: Value| {
+            retrieve(
+                &scripted::Canned::json(
+                    200,
+                    &atl_receipt_with(
+                        &entry,
+                        &json!({ "leaf_index": 0, "checkpoint": checkpoint,
+                                 "inclusion_path": path }),
+                    ),
+                ),
+                scripted::LOG,
+                scripted::ATL_ENTRY_ID,
+                &entry,
+            )
+        };
+
+        let error = fetch(json!("not an array")).expect_err("not an array");
+        assert!(error.to_string().contains("is not an array of family strings"), "{error}");
+        let error = fetch(json!([7])).expect_err("not a string");
+        assert!(error.to_string().contains("is not a string"), "{error}");
+        let error = fetch(json!(["sha256:zz"])).expect_err("not a family string");
+        assert!(error.to_string().contains("family string"), "{error}");
+        // The grammar admits exactly this, and the position it describes comes back intact.
+        let good = format!("sha256:{}", "11".repeat(32));
+        let position = fetch(json!([good])).expect("a well-formed path");
+        assert_eq!(position.inclusion_path, vec![good]);
+    }
+
+    #[test]
+    fn retrieval_is_content_addressed_and_says_so_when_the_bytes_do_not_match() {
+        let published = scripted::Stack::new().already_published();
+        let entry = entry_id(&published.envelope_at(scripted::TRIGGER));
+        assert_eq!(
+            published_index(&published, scripted::MIRROR, &entry).expect("a published entry"),
+            Some(scripted::TRIGGER)
+        );
+        // Absence is unavailability, never a negative result.
+        let absent = scripted::Stack::new();
+        assert_eq!(published_index(&absent, scripted::MIRROR, &entry).expect("a miss"), None);
+
+        let broken = scripted::Canned::raw(500, "");
+        let error = published_index(&broken, scripted::MIRROR, &entry).expect_err("a 500");
+        assert!(error.to_string().contains("answered 500 for entry"), "{error}");
+
+        let no_member = scripted::Canned::json(200, &json!({ "entry_index": 0 }));
+        let error = published_index(&no_member, scripted::MIRROR, &entry).expect_err("no member");
+        assert!(error.to_string().contains("served no `envelope` member"), "{error}");
+
+        let unprefixed = scripted::Canned::json(200, &json!({ "envelope": "raw" }));
+        let error = published_index(&unprefixed, scripted::MIRROR, &entry).expect_err("no prefix");
+        assert!(error.to_string().contains("is not a `base64:` family string"), "{error}");
+
+        let unusable = scripted::Canned::json(200, &json!({ "envelope": "base64:!!!" }));
+        let error = published_index(&unusable, scripted::MIRROR, &entry).expect_err("bad base64");
+        assert!(error.to_string().contains("is unusable"), "{error}");
+
+        let substituted =
+            scripted::Canned::json(200, &json!({ "envelope": "base64:c29tZXRoaW5nIGVsc2U=" }));
+        let error =
+            published_index(&substituted, scripted::MIRROR, &entry).expect_err("other bytes");
+        assert!(error.to_string().contains("do not digest to it"), "{error}");
+    }
+
+    #[test]
+    fn a_transport_failure_becomes_the_outcome_carrying_error_rather_than_a_verdict() {
+        let error = published_index(&scripted::Unreachable, scripted::MIRROR, "sha256:00")
+            .expect_err("nothing answered");
+        assert!(error.to_string().contains("answers nothing"), "{error}");
+    }
+
+    #[test]
+    fn staging_and_promotion_are_accepted_on_the_statuses_the_mirror_uses() {
+        let stack = scripted::Stack::new();
+        let envelope = stack.envelope_at(scripted::APPENDED);
+        stage(&stack, scripted::MIRROR, &envelope).expect("the mirror accepts the bytes");
+        stage(&scripted::Canned::json(200, &json!({})), scripted::MIRROR, &envelope)
+            .expect("200 is an accepted stage too");
+        let error =
+            stage(&scripted::Canned::raw(422, "no"), scripted::MIRROR, &envelope).expect_err("422");
+        assert!(error.to_string().contains("to a stage request"), "{error}");
+
+        let position = anchor(&stack, scripted::LOG, &envelope).expect("a position");
+        let entry = entry_id(&envelope);
+        ingest_checkpoint(&stack, scripted::MIRROR, &position, &entry).expect("promotion");
+        let error = ingest_checkpoint(
+            &scripted::Canned::raw(409, "no"),
+            scripted::MIRROR,
+            &position,
+            &entry,
+        )
+        .expect_err("409");
+        assert!(error.to_string().contains("to a checkpoint ingest"), "{error}");
+    }
+
+    #[test]
+    fn a_witness_refusal_comes_back_to_the_caller_rather_than_being_swallowed() {
+        let stack = scripted::Stack::new();
+        let envelope = stack.envelope_at(scripted::APPENDED);
+        let position = anchor(&stack, scripted::LOG, &envelope).expect("a position");
+        let answer =
+            cosign(&stack, scripted::WITNESS, &scripted::log_id(), &position, &stack.entries)
+                .expect("a cosignature");
+        assert_eq!(answer.get("witness_id"), Some(&json!(scripted::WITNESS_ID)));
+
+        let refusing = scripted::Stack::new().with_refusing_witness();
+        let refusal =
+            cosign(&refusing, scripted::WITNESS, &scripted::log_id(), &position, &refusing.entries)
+                .expect("a 409 is an answer, not a transport failure");
+        assert_eq!(refusal.get("status"), Some(&json!("refused")));
+
+        let error = cosign(
+            &scripted::Canned::raw(500, "boom"),
+            scripted::WITNESS,
+            &scripted::log_id(),
+            &position,
+            &[],
+        )
+        .expect_err("a 500");
+        assert!(error.to_string().contains("the witness answered 500"), "{error}");
+    }
+
+    #[test]
+    fn the_newest_published_checkpoint_is_selected_by_size_and_stripped_of_server_labels() {
+        let stack = scripted::Stack::new();
+        let newest = newest_checkpoint(&stack, scripted::MIRROR).expect("a series");
+        assert_eq!(newest.get("tree_size"), Some(&json!(stack.size())));
+        assert!(newest.get("state").is_none(), "a server's view of its own member is not signed");
+
+        let at_three = signed_checkpoint_at(&stack, scripted::MIRROR, 3).expect("a member");
+        assert_eq!(at_three.get("tree_size"), Some(&json!(3)));
+
+        let error = newest_checkpoint(&scripted::Canned::raw(500, ""), scripted::MIRROR)
+            .expect_err("a 500");
+        assert!(error.to_string().contains("for its checkpoint series"), "{error}");
+        let error = newest_checkpoint(&scripted::Canned::json(200, &json!({})), scripted::MIRROR)
+            .expect_err("not an array");
+        assert!(error.to_string().contains("is not an array"), "{error}");
+        let error = newest_checkpoint(&scripted::Canned::json(200, &json!([])), scripted::MIRROR)
+            .expect_err("empty");
+        assert!(error.to_string().contains("publishes no checkpoint"), "{error}");
+        let error = signed_checkpoint_at(&scripted::Canned::raw(404, ""), scripted::MIRROR, 9)
+            .expect_err("no member at that size");
+        assert!(error.to_string().contains("for the checkpoint at tree size 9"), "{error}");
+    }
+
+    #[test]
+    fn a_checkpoint_that_does_not_reassemble_into_the_binary_framing_is_refused() {
+        let stack = scripted::Stack::new();
+        checkpoint_raw(&stack.checkpoint()).expect("the mapped object reassembles");
+        let error = checkpoint_raw(&json!({ "tree_size": 1 })).expect_err("nothing to frame");
+        assert!(error.to_string().contains("does not reassemble"), "{error}");
+    }
+
+    #[test]
+    fn an_enumeration_is_taken_only_where_it_is_the_range_that_was_asked_for() {
+        let stack = scripted::Stack::new();
+        let size = stack.size();
+        let prefix = enumerate(&stack, scripted::MIRROR, size, size).expect("the whole prefix");
+        assert_eq!(prefix.entries.len(), stack.entries.len());
+        assert_eq!(prefix.material.pointer("/range/to_index"), Some(&json!(size)));
+
+        let error = enumerate(&scripted::Canned::raw(500, "no"), scripted::MIRROR, 1, 1)
+            .expect_err("a 500");
+        assert!(error.to_string().contains("to a range request"), "{error}");
+        let error = enumerate(&scripted::Canned::json(200, &json!({})), scripted::MIRROR, 1, 1)
+            .expect_err("no entries");
+        assert!(error.to_string().contains("carries no `entries` array"), "{error}");
+        let out_of_order = scripted::Canned::json(
+            200,
+            &json!({ "entries": [ { "entry_index": 3, "envelope": {} } ] }),
+        );
+        let error =
+            enumerate(&out_of_order, scripted::MIRROR, 1, 1).expect_err("indices out of order");
+        assert!(error.to_string().contains("in order"), "{error}");
+        let no_envelope =
+            scripted::Canned::json(200, &json!({ "entries": [ { "entry_index": 0 } ] }));
+        let error = enumerate(&no_envelope, scripted::MIRROR, 1, 1).expect_err("no envelope");
+        assert!(error.to_string().contains("carries no `envelope`"), "{error}");
+        // A response carrying none of the three enumeration members still yields a prefix; the
+        // members are what the receipt would carry, and their absence is the verifier's finding.
+        let bare = enumerate(
+            &scripted::Canned::json(200, &json!({ "entries": [] })),
+            scripted::MIRROR,
+            0,
+            0,
+        )
+        .expect("an empty prefix");
+        assert_eq!(bare.material.get("range_proof"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn an_assembly_is_refused_where_the_prefix_is_not_the_tree_the_checkpoint_describes() {
+        let stack = scripted::Stack::new();
+        let prefix = || Prefix { material: json!({}), entries: stack.entries.clone() };
+        // The assembly itself is never wanted here, only whether one was refused.
+        let build = |checkpoint: Value| {
+            Assembly::new(checkpoint, prefix(), Vec::new(), BTreeMap::new()).map(|_| ())
+        };
+
+        let error = build(json!({ "root_hash": "sha256:00" })).expect_err("no tree size");
+        assert!(error.to_string().contains("carries no `tree_size`"), "{error}");
+        let error = build(json!({ "tree_size": 99, "root_hash": "sha256:00" }))
+            .expect_err("a size the enumeration does not cover");
+        assert!(error.to_string().contains("the checkpoint commits 99"), "{error}");
+        let error =
+            build(json!({ "tree_size": stack.size() })).expect_err("nothing to compare against");
+        assert!(error.to_string().contains("carries no `root_hash`"), "{error}");
+        let error = build(json!({ "tree_size": stack.size(), "root_hash": "sha256:00" }))
+            .expect_err("another tree");
+        assert!(error.to_string().contains("a tree this material is not"), "{error}");
+    }
+
+    #[test]
+    fn an_assembly_exposes_the_geometry_it_checked_and_refuses_what_is_outside_it() {
+        let assembly = scripted_assembly();
+        let stack = scripted::Stack::new();
+        assert_eq!(assembly.size().expect("a size"), stack.size());
+        assert_eq!(assembly.checkpoint().get("log_id"), Some(&json!(scripted::log_id())));
+        assert_eq!(
+            assembly.inclusion_path(scripted::TRIGGER).expect("a path"),
+            stack.inclusion_path(scripted::TRIGGER)
+        );
+        assert!(assembly.leaf(0).is_some());
+        assert!(assembly.leaf(99).is_none(), "a leaf outside the prefix is not invented");
+        let error = assembly.inclusion_path(99).expect_err("outside the tree");
+        assert!(error.to_string().contains("no inclusion path for entry 99"), "{error}");
+        let error = assembly.entry(99).expect_err("outside the prefix");
+        assert!(error.to_string().contains("does not reach entry 99"), "{error}");
+    }
+
+    #[test]
+    fn governance_is_read_out_of_the_prefix_and_never_invented_where_it_is_absent() {
+        let entries = vec![
+            envelope(&manifest("sha256:l1", "w1", "sha256:k1")),
+            envelope(&json!({
+                "type": "key",
+                "action": "add",
+                "key": { "key_id": "sha256:p2", "pubkey": "base64:p2" },
+            })),
+            // Neither a key id nor a pubkey: nothing to bind, so nothing is bound.
+            envelope(&json!({ "type": "key", "action": "add", "key": {} })),
+            envelope(&json!({
+                "type": "key",
+                "action": "remove",
+                "key": { "key_id": "sha256:p1", "pubkey": "base64:p1" },
+            })),
+            envelope(&json!({ "type": "ingestion" })),
+        ];
+        let governance = Governance::read(&entries);
+        governance.manifest_at(0).expect("the genesis manifest");
+        let error = governance.manifest_at(4).expect_err("no manifest there");
+        assert!(error.to_string().contains("no manifest at entry 4"), "{error}");
+        let error = governance.active_for_checkpoint(0).expect_err("nothing below size 0");
+        assert!(error.to_string().contains("below tree size 0"), "{error}");
+        assert_eq!(governance.active_for_checkpoint(5).expect("the genesis version").0, 0);
+        // A removal at entry 3 is seen in enumerated mode and not in declared mode.
+        let enumerated = governance.producer_keys_at(4, true).unwrap();
+        assert_eq!(enumerated.keys().collect::<Vec<_>>(), vec!["sha256:p2"]);
+        let declared = governance.producer_keys_at(4, false).unwrap();
+        assert_eq!(declared.keys().collect::<Vec<_>>(), vec!["sha256:p1"]);
+        // Index 0 has no manifest strictly below it, so the snapshot falls back to genesis.
+        assert_eq!(governance.snapshot_at(0).expect("genesis").0, 0);
+
+        let nothing = Governance::read(&[]);
+        let error = nothing.snapshot_at(3).expect_err("no manifest at all");
+        assert!(error.to_string().contains("carries no manifest"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_key_object_missing_half_of_a_binding_binds_nothing() {
+        let manifest = json!({
+            "type": "manifest",
+            "keys": [ { "key_id": "sha256:p1" } ],
+            "log": { "keys": [ { "pubkey": "base64:l" } ] },
+            "witnesses": [ { "keys": [ { "key_id": "sha256:k1", "pubkey": "base64:w" } ] } ],
+        });
+        let entries = vec![envelope(&manifest)];
+        let governance = Governance::read(&entries);
+        assert!(governance.producer_keys_at(0, false).unwrap().is_empty());
+        let (log, witness) = manifest_key_entries(&manifest, 0);
+        assert!(log.is_empty(), "a log key object with no id binds nothing");
+        assert_eq!(witness.len(), 1);
+        assert!(
+            witness[0].get("witness_id").is_none(),
+            "the key is listed; the identity it belongs to is the manifest's to state"
+        );
+        assert!(
+            declared_witnesses(&manifest).is_empty(),
+            "and an unnamed witness accounts for no cosignature"
+        );
+    }
+
+    #[test]
+    fn a_witness_answer_missing_a_member_is_not_folded_into_a_receipt_either() {
+        let error = cosignature_entry(&json!({ "witness_id": "w1" }))
+            .expect_err("an answer that carries no key id");
+        assert!(error.to_string().contains("carries no `key_id`"), "{error}");
+        let entry = cosignature_entry(&json!({
+            "witness_id": "w1",
+            "key_id": "sha256:k1",
+            "cosignature": "base64:c",
+            "cosigned_at": "2026-08-16T12:00:00Z",
+        }))
+        .expect("a complete answer");
+        assert_eq!(entry.get("witness_id"), Some(&json!("w1")));
+    }
+
+    #[test]
+    fn a_json_edit_on_something_that_is_not_an_object_is_an_internal_error_not_a_panic() {
+        let mut scalar = json!(7);
+        let error = set(&mut scalar, "member", json!(1)).expect_err("not an object");
+        assert!(error.to_string().contains("a JSON object was expected"), "{error}");
+        assert!(object_mut(&mut scalar).is_err());
+    }
+
+    #[test]
+    fn every_registered_claim_type_declares_the_governance_mode_its_row_fixes() {
+        for declared in
+            ["record-ingested", "record-derived", "trigger-declared", "disposition-declared"]
+        {
+            let shape = claim_shape(declared).expect("a registered type");
+            assert_eq!(shape.governance, "declared");
+            assert!(shape.record_subject);
+        }
+        assert_eq!(claim_shape("statement-anchored").unwrap().governance, "declared");
+        assert!(!claim_shape("statement-anchored").unwrap().record_subject);
+        let effective = claim_shape("trigger-effective").unwrap();
+        assert_eq!(effective.governance, "enumerated");
+        assert_eq!(effective.competing_triggers, "enumerated");
+        assert_eq!(claim_shape("disposition-effective").unwrap().competing_triggers, "not-checked");
+        for setwide in ["propagation-complete", "governance-state"] {
+            let shape = claim_shape(setwide).expect("a registered type");
+            assert_eq!(shape.governance, "enumerated");
+            assert!(!shape.record_subject, "these two narrow to no single record");
+        }
+    }
+
+    #[test]
+    fn a_declared_mode_receipt_carries_the_chain_and_no_enumeration_material() {
+        let assembly = scripted_assembly();
+        let receipt =
+            assemble(&assembly, scripted::APPENDED, &claim_of("statement-anchored", None))
+                .expect("a statement-anchored receipt");
+
+        assert_eq!(receipt.get("ahl_receipt_version"), Some(&json!("2")));
+        assert_eq!(receipt.get("spec_version"), Some(&json!("0.4.0")));
+        assert_eq!(receipt.pointer("/claim/assurance/governance"), Some(&json!("declared")));
+        assert_eq!(receipt.pointer("/claim/assurance/witnessed"), Some(&json!(true)));
+        assert_eq!(receipt.pointer("/claim/assurance/content_binding"), Some(&json!("none")));
+        assert!(
+            receipt.pointer("/claim/assurance/canonicalization_namespace").is_none(),
+            "the member is absent exactly where there is no content binding"
+        );
+        assert_eq!(receipt.pointer("/governance/currency/mode"), Some(&json!("declared")));
+        assert_eq!(receipt.pointer("/governance/currency/material"), Some(&json!({})));
+        assert!(
+            receipt.pointer("/governance/rotation_proofs").is_none(),
+            "the member is absent where the chain rotates nothing"
+        );
+        assert_eq!(receipt.pointer("/subject/entry_index"), Some(&json!(scripted::APPENDED)));
+        assert_eq!(receipt.pointer("/subject/manifest"), Some(&json!(scripted::MANIFEST_VERSION)));
+        assert_eq!(
+            receipt.pointer("/anchoring/adaptor/id"),
+            Some(&json!(crate::checkpoint::ATL_PROFILE)),
+            "the pin is a governance fact, taken from the active manifest version"
+        );
+        assert_eq!(
+            receipt.pointer("/anchoring/witnesses").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(receipt.pointer("/keys/log/0/key_id"), Some(&json!(scripted::LOG_KEY)));
+        assert_eq!(
+            receipt.pointer("/keys/witness/0/witness_id"),
+            Some(&json!(scripted::WITNESS_ID))
+        );
+        assert_eq!(
+            receipt.pointer("/keys/producer/0/key_id"),
+            Some(&json!(scripted::PRODUCER_KEY))
+        );
+        assert_eq!(receipt.pointer("/governance/chain/0/entry_index"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn an_enumerated_mode_receipt_carries_the_material_the_currency_mode_names() {
+        let assembly = scripted_assembly();
+        let receipt = assemble(&assembly, scripted::APPENDED, &claim_of("governance-state", None))
+            .expect("a governance-state receipt");
+        assert_eq!(receipt.pointer("/claim/assurance/governance"), Some(&json!("enumerated")));
+        assert_eq!(
+            receipt.pointer("/governance/currency/material/range/to_index"),
+            Some(&json!(6))
+        );
+
+        let trigger = assemble(
+            &assembly,
+            scripted::TRIGGER,
+            &claim_of("trigger-effective", Some((scripted::DATASET, scripted::RECORD))),
+        )
+        .expect("a trigger-effective receipt");
+        assert_eq!(
+            trigger.pointer("/claim/assurance/competing_triggers"),
+            Some(&json!("enumerated"))
+        );
+        assert_eq!(trigger.pointer("/claim/record_subject/record"), Some(&json!(scripted::RECORD)));
+    }
+
+    #[test]
+    fn the_subject_rule_of_the_registry_is_enforced_in_both_directions() {
+        let assembly = scripted_assembly();
+        let error = assemble(&assembly, scripted::INGESTION, &claim_of("record-ingested", None))
+            .expect_err("a type that requires a record subject");
+        assert!(error.to_string().contains("requires a record subject"), "{error}");
+
+        let error = assemble(
+            &assembly,
+            scripted::APPENDED,
+            &claim_of("statement-anchored", Some((scripted::DATASET, scripted::RECORD))),
+        )
+        .expect_err("a type that carries none");
+        assert!(error.to_string().contains("carries no record subject"), "{error}");
+
+        let error = assemble(&assembly, scripted::APPENDED, &claim_of("record-invented", None))
+            .expect_err("not a registry id");
+        assert!(error.to_string().contains("is not a claim type this build assembles"), "{error}");
+    }
+
+    #[test]
+    fn content_binding_evidence_travels_with_the_descriptor_that_interprets_it() {
+        let assembly = scripted_assembly();
+        let with_content = |canonicalization: &str| Claim {
+            content: Some(ContentBinding {
+                bytes: b"{\"a\":1}".to_vec(),
+                canonicalization: canonicalization.to_owned(),
+                media_type: Some("application/json".to_owned()),
+                binding: "plain-verified",
+            }),
+            ..claim_of("record-ingested", Some((scripted::DATASET, scripted::RECORD)))
+        };
+
+        let public =
+            assemble(&assembly, scripted::INGESTION, &with_content("jcs")).expect("public");
+        assert_eq!(
+            public.pointer("/claim/assurance/content_binding"),
+            Some(&json!("plain-verified"))
+        );
+        assert_eq!(
+            public.pointer("/claim/assurance/canonicalization_namespace"),
+            Some(&json!("public"))
+        );
+        assert_eq!(public.pointer("/claim_material/media_type"), Some(&json!("application/json")));
+        assert_eq!(
+            public.pointer("/claim_material/record_bytes"),
+            Some(&json!("base64:eyJhIjoxfQ=="))
+        );
+
+        let private = assemble(&assembly, scripted::INGESTION, &with_content("x-house-style"))
+            .expect("private use");
+        assert_eq!(
+            private.pointer("/claim/assurance/canonicalization_namespace"),
+            Some(&json!("private-use"))
+        );
+    }
+
+    #[test]
+    fn a_manifest_subject_declares_no_manifest_version_and_every_other_subject_must() {
+        let assembly = scripted_assembly();
+        let receipt = assemble(&assembly, 0, &claim_of("statement-anchored", None))
+            .expect("a manifest is anchorable like anything else");
+        assert!(
+            receipt.pointer("/subject/manifest").is_none(),
+            "a manifest statement declares no manifest version"
+        );
+
+        let mut undeclared = scripted::corpus();
+        undeclared.push(scripted::envelope(json!({ "type": "ingestion" })));
+        let stack = scripted::Stack::over(undeclared, 6);
+        let assembly = assembly_over(&stack, Vec::new(), BTreeMap::new());
+        let error = assemble(&assembly, 6, &claim_of("statement-anchored", None))
+            .expect_err("no manifest version declared");
+        assert!(error.to_string().contains("declares no `manifest` version"), "{error}");
+    }
+
+    #[test]
+    fn an_entry_that_is_not_an_envelope_cannot_be_a_subject() {
+        let entries = vec![scripted::genesis(), json!({ "payload": "not an object" })];
+        let stack = scripted::Stack::over(entries, 1);
+        let assembly = assembly_over(&stack, Vec::new(), BTreeMap::new());
+        let error = assemble(&assembly, 1, &claim_of("statement-anchored", None))
+            .expect_err("not an envelope");
+        assert!(error.to_string().contains("is not an envelope"), "{error}");
+    }
+
+    #[test]
+    fn a_manifest_version_pinning_no_adaptor_profile_assembles_nothing() {
+        let mut without_pin =
+            scripted::manifest(scripted::WITNESS_ID, scripted::WITNESS_KEY, scripted::LOG_KEY);
+        if let Some(log) = without_pin.get_mut("log").and_then(Value::as_object_mut) {
+            log.remove("adaptor");
+        }
+        let entries = vec![
+            scripted::envelope(without_pin),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+        ];
+        let stack = scripted::Stack::over(entries, 1);
+        let assembly = assembly_over(&stack, Vec::new(), BTreeMap::new());
+        let error = assemble(&assembly, 1, &claim_of("statement-anchored", None))
+            .expect_err("no adaptor pin");
+        assert!(error.to_string().contains("pins no adaptor profile"), "{error}");
+    }
+
+    /// A corpus whose second manifest version rotates the named key set.
+    fn rotating_corpus(log_key: &str, witness_id: &str, witness_key: &str) -> Vec<Value> {
+        vec![
+            scripted::genesis(),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+            scripted::envelope(scripted::manifest(witness_id, witness_key, log_key)),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+        ]
+    }
+
+    #[test]
+    fn a_witness_set_rotation_carries_a_proof_cosigned_by_the_outgoing_version() {
+        let entries =
+            rotating_corpus(scripted::LOG_KEY, scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2);
+        let stack = scripted::Stack::over(entries, 3);
+        let incoming = json!({
+            "witness_id": scripted::WITNESS_ID_2,
+            "key_id": scripted::WITNESS_KEY_2,
+            "cosignature": "base64:aW4=",
+            "cosigned_at": scripted::TIME,
+        });
+        let outgoing: BTreeMap<String, Value> =
+            std::iter::once((scripted::WITNESS_ID.to_owned(), scripted::cosignature())).collect();
+
+        let assembly = assembly_over(&stack, vec![incoming], outgoing);
+        let receipt = assemble(&assembly, 3, &claim_of("statement-anchored", None))
+            .expect("a rotation this build can prove");
+        let proofs = receipt
+            .pointer("/governance/rotation_proofs")
+            .and_then(Value::as_array)
+            .expect("one element per rotation");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].get("manifest_entry_index"), Some(&json!(2)));
+        assert_eq!(
+            proofs[0].pointer("/witnesses/0/witness_id"),
+            Some(&json!(scripted::WITNESS_ID)),
+            "the proof's checkpoint verifies under the outgoing key set"
+        );
+        // Both versions' witness keys are listed, each bound to the version that declared it.
+        let witness_keys = receipt.pointer("/keys/witness").and_then(Value::as_array).unwrap();
+        assert_eq!(witness_keys.len(), 2);
+
+        // The same rotation with no outgoing cosignature obtained.
+        let assembly = assembly_over(&stack, Vec::new(), BTreeMap::new());
+        let error = assemble(&assembly, 3, &claim_of("statement-anchored", None))
+            .expect_err("nothing the outgoing version declares cosigned it");
+        assert!(error.to_string().contains("and none was obtained"), "{error}");
+    }
+
+    #[test]
+    fn a_log_key_rotation_stops_assembly_rather_than_emitting_a_proof_that_names_the_wrong_key() {
+        let rotated_log_key =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let entries = rotating_corpus(rotated_log_key, scripted::WITNESS_ID, scripted::WITNESS_KEY);
+        let stack = scripted::Stack::over(entries, 3);
+        let assembly = assembly_over(&stack, vec![scripted::cosignature()], BTreeMap::new());
+        let error = assemble(&assembly, 3, &claim_of("statement-anchored", None))
+            .expect_err("no interface in this deployment serves the checkpoint it would need");
+        assert!(
+            error.to_string().contains("rotates the LOG checkpoint-signing key set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_cosignature_is_split_by_what_the_governing_version_declares() {
+        let active =
+            scripted::manifest(scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2, scripted::LOG_KEY);
+        let incoming = json!({
+            "witness_id": scripted::WITNESS_ID_2,
+            "key_id": scripted::WITNESS_KEY_2,
+        });
+        let (carried, others) =
+            split_cosignatures(vec![scripted::cosignature(), incoming], &active);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].get("witness_id"), Some(&json!(scripted::WITNESS_ID_2)));
+        assert!(others.contains_key(scripted::WITNESS_ID));
+    }
+
+    #[test]
+    fn a_batch_derivation_opens_its_output_leaf_and_every_listed_input() {
+        let trees = scripted::tree_material();
+        let subject =
+            scripted::statement("derivation", json!({ "outputs_root": scripted::OUTPUTS_ROOT }));
+        let material =
+            leaf_material("record-derived", &subject, &trees, scripted::RECORD, scripted::DATASET)
+                .expect("the batch tree the subject commits");
+        assert_eq!(material.pointer("/output/record"), Some(&json!(scripted::RECORD)));
+        assert_eq!(material.get("leaf_index"), Some(&json!(1)));
+        assert!(material.get("leaf_path").and_then(Value::as_array).is_some());
+        let members = material.get("input_members").and_then(Value::as_array).expect("the inputs");
+        assert_eq!(members.len(), 2, "§7.2 proves the listed inputs and no others");
+        assert_eq!(members[1].get("input_index"), Some(&json!(1)));
+
+        // A leaf carrying no wide-input form opens no input-set tree.
+        let narrow = leaf_material(
+            "record-derived",
+            &subject,
+            &trees,
+            scripted::RECORD_2,
+            scripted::DATASET,
+        )
+        .expect("a leaf without inputs");
+        assert!(narrow.get("input_members").is_none());
+    }
+
+    #[test]
+    fn an_unbatched_derivation_commits_its_output_inline_and_opens_no_tree() {
+        let material = leaf_material(
+            "record-derived",
+            &scripted::statement("derivation", json!({})),
+            &json!({}),
+            scripted::RECORD,
+            scripted::DATASET,
+        )
+        .expect("no tree to open");
+        assert_eq!(
+            material,
+            json!({ "output": { "dataset": scripted::DATASET, "record": scripted::RECORD } })
+        );
+    }
+
+    #[test]
+    fn a_disposition_opens_the_propagation_s_affected_tree_and_says_so_when_it_cannot() {
+        let trees = scripted::tree_material();
+        let subject =
+            scripted::statement("propagation", json!({ "affected_root": scripted::AFFECTED_ROOT }));
+        for claim_type in ["disposition-declared", "disposition-effective"] {
+            let material =
+                leaf_material(claim_type, &subject, &trees, scripted::RECORD, scripted::DATASET)
+                    .expect("the affected tree");
+            assert_eq!(material.get("leaf_index"), Some(&json!(0)));
+            assert!(material.get("disposition_leaf").is_some());
+        }
+
+        let error = leaf_material(
+            "disposition-declared",
+            &scripted::statement("propagation", json!({})),
+            &trees,
+            scripted::RECORD,
+            scripted::DATASET,
+        )
+        .expect_err("nothing to open");
+        assert!(error.to_string().contains("commits no affected tree"), "{error}");
+
+        let error = leaf_material(
+            "disposition-declared",
+            &subject,
+            &json!({}),
+            scripted::RECORD,
+            scripted::DATASET,
+        )
+        .expect_err("material the producer did not supply");
+        assert!(error.to_string().contains("holds no leaves for root"), "{error}");
+
+        let error =
+            leaf_material("disposition-declared", &subject, &trees, "sha256:ff", scripted::DATASET)
+                .expect_err("no leaf names that record");
+        assert!(error.to_string().contains("no committed leaf names record"), "{error}");
+
+        // A claim type with no leaf-bearing material asks the trees for nothing.
+        assert_eq!(
+            leaf_material(
+                "statement-anchored",
+                &subject,
+                &trees,
+                scripted::RECORD,
+                scripted::DATASET
+            )
+            .expect("nothing to open"),
+            json!({})
+        );
+    }
 }
