@@ -197,12 +197,36 @@ fn archive_into(relative: &str, dest: &Path) -> Result<(), String> {
 /// The fallback is `--offline`, never a plain build: the lock is updated inside the copy, no
 /// network is consulted, and the run says on stderr which graph it used and why. A build that
 /// fails for any other reason is reported with cargo's own output and not retried.
+/// How a binary was resolved: against its committed lock, or offline against the local cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildMode {
+    Locked,
+    Offline,
+}
+
+impl BuildMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Offline => "offline",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "locked" => Some(Self::Locked),
+            "offline" => Some(Self::Offline),
+            _ => None,
+        }
+    }
+}
+
 fn build_binary(
     source: &Path,
     target: &Path,
     binary: &str,
     stale: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<BuildMode, String> {
     let attempt = |flag: &str| {
         Command::new(env!("CARGO"))
             .args(["build", "--release", flag, "--bin", binary])
@@ -214,7 +238,7 @@ fn build_binary(
     };
     let locked = attempt("--locked")?;
     if locked.status.success() {
-        return Ok(());
+        return Ok(BuildMode::Locked);
     }
     let complaint = String::from_utf8_lossy(&locked.stderr).into_owned();
     if !complaint.contains("--locked was passed") && !complaint.contains("cannot update the lock") {
@@ -231,7 +255,7 @@ fn build_binary(
     stale.push(binary.to_owned());
     let offline = attempt("--offline")?;
     if offline.status.success() {
-        Ok(())
+        Ok(BuildMode::Offline)
     } else {
         Err(format!(
             "`cargo build --release --offline` failed for `{binary}`:\n{}",
@@ -310,10 +334,12 @@ fn provenance_path(binary: &Path) -> PathBuf {
     binary.with_extension("provenance")
 }
 
-/// Record what a freshly built binary is, beside it.
-fn record_provenance(binary: &Path, key: &str) -> Result<(), String> {
+/// Record what a freshly built binary is, beside it: its source key, its bytes, and whether it
+/// was resolved against the committed lock or offline. The third line is what lets a later run
+/// know that reusing this artifact would be reusing a diagnostic build.
+fn record_provenance(binary: &Path, key: &str, mode: BuildMode) -> Result<(), String> {
     let digest = digest_of(binary)?;
-    std::fs::write(provenance_path(binary), format!("{key}\n{digest}\n"))
+    std::fs::write(provenance_path(binary), format!("{key}\n{digest}\n{}\n", mode.as_str()))
         .map_err(|source| format!("cannot record provenance for `{}`: {source}", binary.display()))
 }
 
@@ -324,29 +350,37 @@ fn digest_of(path: &Path) -> Result<String, String> {
     Ok(ahl_core::sha256_hex(&bytes))
 }
 
-/// Whether a cached binary may be executed: right source, right bytes, right owner.
+/// Whether a cached binary may be executed, and how it was built: right source, right bytes,
+/// right owner, and a recorded build mode.
 ///
-/// Anything that does not answer yes is rebuilt. This is deliberately silent about *why* in the
-/// common case — a cache miss is not an event — but never silently accepts.
-fn provenance_holds(binary: &Path, key: &str) -> bool {
+/// `None` means rebuild. This is deliberately silent about *why* in the common case — a cache
+/// miss is not an event — but never silently accepts. A `Some(BuildMode::Offline)` answer is a
+/// valid artifact that is nevertheless a DIAGNOSTIC one: the caller decides whether a run may
+/// reuse it, and if it does, the run inherits the stale-lock status the build had.
+fn provenance_holds(binary: &Path, key: &str) -> Option<BuildMode> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let Ok(metadata) = std::fs::symlink_metadata(binary) else { return false };
+    let metadata = std::fs::symlink_metadata(binary).ok()?;
     if !metadata.is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.permissions().mode() & 0o022 != 0
     {
-        return false;
+        return None;
     }
-    let Ok(recorded) = std::fs::read_to_string(provenance_path(binary)) else { return false };
+    let recorded = std::fs::read_to_string(provenance_path(binary)).ok()?;
     let mut lines = recorded.lines();
-    let (Some(recorded_key), Some(recorded_digest)) = (lines.next(), lines.next()) else {
-        return false;
-    };
+    let (recorded_key, recorded_digest, recorded_mode) =
+        (lines.next()?, lines.next()?, lines.next()?);
     if recorded_key != key {
-        return false;
+        return None;
     }
-    digest_of(binary).is_ok_and(|digest| digest == recorded_digest)
+    let mode = BuildMode::parse(recorded_mode)?;
+    (digest_of(binary).ok()? == recorded_digest).then_some(mode)
+}
+
+/// Whether the operator accepts a diagnostic (offline-resolved) run.
+fn offline_allowed() -> bool {
+    std::env::var("AHL_E2E_ALLOW_OFFLINE").ok().as_deref() == Some("1")
 }
 
 /// Build one group of checkouts from scratch copies, and return the named binaries.
@@ -376,22 +410,42 @@ fn build_group(
     // Reuse only what proves what it is. A file merely being present at the expected path is
     // not evidence about the file, and executing it on that basis is how a shared temporary
     // directory becomes an execution primitive for anything else on the machine.
-    if cache.is_some() && built.values().all(|path| provenance_holds(path, &key)) {
-        return Ok(built);
+    if cache.is_some() {
+        let modes: Vec<Option<BuildMode>> =
+            built.values().map(|path| provenance_holds(path, &key)).collect();
+        if modes.iter().all(Option::is_some) {
+            let offline: Vec<&String> = built
+                .keys()
+                .zip(&modes)
+                .filter(|(_, mode)| **mode == Some(BuildMode::Offline))
+                .map(|(binary, _)| binary)
+                .collect();
+            // An offline-built artifact is reusable only for a run the operator has declared
+            // diagnostic; otherwise it is a miss, and the rebuild below tries `--locked` again.
+            // Either way a reused offline build restores the stale-lock status it was built
+            // with, so the run cannot pass as a committed-graph run on the strength of a cache.
+            if offline.is_empty() || offline_allowed() {
+                stale.extend(offline.into_iter().cloned());
+                return Ok(built);
+            }
+        }
     }
     for member in members {
         let name = Path::new(member).file_name().unwrap_or_default();
         archive_into(member, &root.join("src").join(name))?;
     }
+    let mut modes: BTreeMap<String, BuildMode> = BTreeMap::new();
     for (member, binary) in binaries {
         let name = Path::new(member).file_name().unwrap_or_default();
-        build_binary(&root.join("src").join(name), &target, binary, stale)?;
+        let mode = build_binary(&root.join("src").join(name), &target, binary, stale)?;
+        modes.insert((*binary).to_owned(), mode);
     }
     for (binary, path) in &built {
         if !path.is_file() {
             return Err(format!("`{binary}` was not produced at `{}`", path.display()));
         }
-        record_provenance(path, &key)?;
+        let mode = modes.get(binary).copied().unwrap_or(BuildMode::Offline);
+        record_provenance(path, &key, mode)?;
     }
     Ok(built)
 }
@@ -696,26 +750,42 @@ mod tests {
 
         // Nothing recorded beside it: a file existing at the expected path is not evidence
         // about the file, and accepting it on that basis is what this check replaced.
-        assert!(!provenance_holds(&binary, "key-a"));
+        assert_eq!(provenance_holds(&binary, "key-a"), None);
 
-        record_provenance(&binary, "key-a").expect("record");
-        assert!(provenance_holds(&binary, "key-a"));
+        record_provenance(&binary, "key-a", BuildMode::Locked).expect("record");
+        assert_eq!(provenance_holds(&binary, "key-a"), Some(BuildMode::Locked));
 
         // Right bytes, built from other source.
-        assert!(!provenance_holds(&binary, "key-b"));
+        assert_eq!(provenance_holds(&binary, "key-b"), None);
 
         // The bytes changed under the recorded digest. This is the case that matters: it is
         // what anything able to write into a shared temporary directory would arrange, and the
         // harness would otherwise have executed the result.
         std::fs::write(&binary, b"different bytes entirely").expect("overwrite");
-        assert!(
-            !provenance_holds(&binary, "key-a"),
+        assert_eq!(
+            provenance_holds(&binary, "key-a"),
+            None,
             "an artifact whose bytes no longer match what was recorded must never be run"
         );
 
-        // A rebuild is how it is re-established.
-        record_provenance(&binary, "key-a").expect("record");
-        assert!(provenance_holds(&binary, "key-a"));
+        // Re-recording provenance over the new bytes is what a rebuild does last; this only
+        // shows that the record follows the bytes, not that cargo ran — the cache-miss build
+        // path itself is exercised by the group test below.
+        record_provenance(&binary, "key-a", BuildMode::Locked).expect("record");
+        assert_eq!(provenance_holds(&binary, "key-a"), Some(BuildMode::Locked));
+
+        // An offline-built artifact proves what it is, but says so: the caller must not treat
+        // it as a committed-graph build.
+        record_provenance(&binary, "key-a", BuildMode::Offline).expect("record");
+        assert_eq!(provenance_holds(&binary, "key-a"), Some(BuildMode::Offline));
+
+        // A record without a build mode is an old or foreign sidecar and is a miss.
+        std::fs::write(
+            provenance_path(&binary),
+            format!("key-a\n{}\n", digest_of(&binary).expect("digest")),
+        )
+        .expect("write");
+        assert_eq!(provenance_holds(&binary, "key-a"), None);
     }
 
     #[test]
