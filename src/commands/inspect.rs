@@ -272,9 +272,12 @@ fn render_embedded(out: &mut String, embedded: &[EmbeddedDump], depth: usize) {
             item.slot,
             item.declared_claim_type.as_deref().unwrap_or("<absent>"),
             item.declared_entry_index.map_or_else(|| "<absent>".to_owned(), |i| i.to_string()),
-            indent = depth * 2,
+            // Depth follows the embedding nesting of the receipt under inspection, which is
+            // attacker-chosen. Both are saturating: an absurd depth widens the indent no
+            // further instead of wrapping it to zero.
+            indent = depth.saturating_mul(2),
         );
-        render_embedded(out, &item.embedded, depth + 1);
+        render_embedded(out, &item.embedded, depth.saturating_add(1));
     }
 }
 

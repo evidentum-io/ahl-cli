@@ -8,7 +8,15 @@
 
 // Shared by four integration-test binaries, each of which uses a different subset.
 #![allow(dead_code)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::missing_panics_doc)]
+// Test code: an assertion, an index or an overflow that fires IS the failure report here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::panic,
+    clippy::missing_panics_doc
+)]
 
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt as _;

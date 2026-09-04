@@ -9,9 +9,12 @@
 //! for each receipt, and the rule each negative vector must trip. Both are asserted here, so a
 //! drift in either direction fails.
 
+// Test code: an assertion, an index or an overflow that fires IS the failure report here.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
     clippy::panic,
     clippy::missing_panics_doc,
     clippy::multiple_crate_versions

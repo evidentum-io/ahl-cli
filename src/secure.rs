@@ -85,8 +85,13 @@ fn read_bounded(
 ) -> CliResult<Vec<u8>> {
     let mut buffer = Vec::new();
     // `cap + 1` so an exactly-`cap`-byte file is accepted and a `cap + 1`-byte one is not.
-    let read = file.take(cap as u64 + 1).read_to_end(&mut buffer).map_err(|source| {
-        CliError::Open { what, path: path.display().to_string(), detail: source.to_string() }
+    // `cap` reaches here from the policy file, so the increment saturates rather than wrapping
+    // a `usize::MAX` budget round to a one-byte one.
+    let limit = (cap as u64).saturating_add(1);
+    let read = file.take(limit).read_to_end(&mut buffer).map_err(|source| CliError::Open {
+        what,
+        path: path.display().to_string(),
+        detail: source.to_string(),
     })?;
     if read > cap {
         return Err(CliError::LimitExhausted(format!(

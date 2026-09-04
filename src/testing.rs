@@ -69,7 +69,10 @@ pub struct MirrorFixture {
     entries: Vec<Vec<u8>>,
     /// The corpus log-signing key.
     /// The log's checkpoint-signing keys, in the order the corpus adopts them.
-    log_keys: Vec<TestKey>,
+    ///
+    /// A fixed pair rather than a vector: the corpus adopts exactly two, and every read of the
+    /// first one is then in range by type rather than by convention.
+    log_keys: [TestKey; 2],
     /// Sign every checkpoint with the outgoing key, ignoring the rotation.
     outgoing_log_key: bool,
     /// A key the corpus manifests never declare, for the "foreign key" fixture.
@@ -161,7 +164,7 @@ impl MirrorFixture {
         Self {
             policy: corpus_policy(root),
             entries,
-            log_keys: vec![seed(root, "log-1"), seed(root, "log-2")],
+            log_keys: [seed(root, "log-1"), seed(root, "log-2")],
             outgoing_log_key: false,
             foreign_key: TestKey::from_seed_hex("foreign", &"7f".repeat(32))
                 .unwrap_or_else(|_| unreachable()),
@@ -418,7 +421,7 @@ impl MirrorFixture {
     #[must_use]
     pub fn with_moved_cadence_epoch(mut self) -> Self {
         let key = self.foreign_key.key_object(0);
-        self.foreign_key_at = Some(self.appended_tree_size() + 1);
+        self.foreign_key_at = Some(self.appended_tree_size().saturating_add(1));
         self.with_appended_manifest(move |log| {
             log["cadence_epoch"] = json!("2026-08-16T12:30:00Z");
             log["keys"] = json!([key]);

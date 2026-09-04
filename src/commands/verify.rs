@@ -648,7 +648,9 @@ fn freshness(
         governance.cadence_and_grace_for(tree_size).map_err(|error| error.to_string())?;
 
     let age = evaluation.nanos_since(instant);
-    let threshold = u128::from(cadence) + u128::from(grace);
+    // Both operands are `u64` widened to `u128`, so the sum is at most `2 * u64::MAX` and
+    // cannot leave the range; the checked form states that rather than relying on it.
+    let threshold = u128::from(cadence).saturating_add(u128::from(grace));
     if age > threshold {
         Ok(Some(Finding::new(
             "witness-stale",
