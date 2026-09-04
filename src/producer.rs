@@ -259,6 +259,18 @@ fn retrieve<F: Fetcher>(
         )));
     }
     let receipt = json_body(&response, "the log")?;
+    // The receipt must be about the entry that was asked for. Nothing else in the exchange
+    // establishes that: the identifier lives in the URL, and a log that answered with a
+    // different entry's receipt — by defect or by design — would otherwise have its checkpoint,
+    // its index and its inclusion proof taken as evidence about ours. The payload-hash check
+    // below is not a substitute, because it is the same digest a substituted receipt would be
+    // rejected on only if the substitution changed it; this catches the identifier itself.
+    let named = receipt.pointer("/entry/id").and_then(Value::as_str);
+    if named != Some(atl_entry_id) {
+        return Err(CliError::EvidenceMissing(format!(
+            "the Evidence Receipt served for `{atl_entry_id}` is about entry {named:?}"
+        )));
+    }
     check_entry_block(&receipt, entry)?;
     let proof = receipt.get("proof").ok_or_else(|| {
         CliError::EvidenceMissing("the log's Evidence Receipt carries no `proof`".to_owned())
@@ -1633,6 +1645,51 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("the prefix recomputes the root")
+    }
+
+    /// A log that answers every `GET` with one fixed receipt.
+    #[derive(Debug)]
+    struct OneReceipt(Value);
+
+    impl Fetcher for OneReceipt {
+        fn fetch(&self, _request: &Request) -> Result<Response, FetchFailure> {
+            Ok(Response { status: 200, body: serde_json::to_vec(&self.0).unwrap_or_default() })
+        }
+    }
+
+    #[test]
+    fn an_evidence_receipt_about_another_entry_is_refused() {
+        let envelope = envelope(&json!({ "type": "ingestion", "record": "a" }));
+        let entry = entry_id(&envelope);
+        // Impeccable in every respect except the one that matters: it is somebody else's.
+        let receipt = json!({
+            "entry": {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "payload_hash": entry,
+                "metadata_hash": sha256_hex(&jcs(&atl_metadata())),
+            },
+            "proof": {
+                "leaf_index": 0,
+                "inclusion_path": [],
+                "checkpoint": {
+                    "origin": "sha256:00",
+                    "tree_size": 1,
+                    "root_hash": "sha256:00",
+                    "timestamp": 1_786_881_600_123_456_789_u64,
+                    "key_id": "sha256:00",
+                    "signature": "base64:00",
+                },
+            },
+        });
+        let fetcher = OneReceipt(receipt);
+        let error = retrieve(
+            &fetcher,
+            "https://log.example",
+            "22222222-2222-4222-8222-222222222222",
+            &entry,
+        )
+        .expect_err("a receipt about another entry is not evidence about this one");
+        assert!(error.to_string().contains("is about entry"), "{error}");
     }
 
     #[test]
