@@ -654,7 +654,10 @@ mod tests {
         let cosignature = json!({
             "witness_id": "witness-1",
             "key_id": witness_key().key_id(),
-            "cosignature": witness_key().sign(&ahl_core::cosignature_bytes(&value, "witness-1")),
+            "cosignature": witness_key().sign(&ahl_core::cosignature_bytes(
+                &ahl_core::CosignedCheckpoint::project(&value).expect("cosignable"),
+                "witness-1",
+            )),
             "cosigned_at": "2026-08-16T12:00:00Z",
         });
         assert!(cosignature_holds(&cp, &cosignature, &witness_keys()).expect("readable"));

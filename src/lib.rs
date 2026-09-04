@@ -115,8 +115,12 @@ pub mod keys;
 pub mod net;
 pub mod outcome;
 pub mod policy;
+pub mod producer;
 pub mod profile;
 pub mod report;
+/// A scripted log, mirror and witness for the producer-side assembly tests.
+#[cfg(test)]
+mod scripted;
 pub mod secure;
 pub mod testing;
 pub mod transcript;

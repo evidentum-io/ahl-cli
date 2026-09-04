@@ -756,11 +756,18 @@ impl MirrorFixture {
         let checkpoint = self.checkpoint(tree_size, &root, FIXED_TIME, false);
         let (witness_id, key) = self.witness_for(tree_size);
         let value = serde_json::to_value(&checkpoint).unwrap_or(Value::Null);
+        // Adaptor §11.1 cosigns the six members of §6.2; the projection is what keeps the
+        // preimage independent of anything else a checkpoint carries. Every checkpoint this
+        // fixture builds projects; one that did not would yield a cosignature over no bytes,
+        // which fails in the test that uses it rather than aborting the library.
+        let bytes = ahl_core::CosignedCheckpoint::project(&value)
+            .map(|cosigned| ahl_core::cosignature_bytes(&cosigned, witness_id))
+            .unwrap_or_default();
         json!({
             "checkpoint": checkpoint,
             "witness_id": witness_id,
             "key_id": key.key_id(),
-            "cosignature": key.sign(&ahl_core::cosignature_bytes(&value, witness_id)),
+            "cosignature": key.sign(&bytes),
             "cosigned_at": FIXED_TIME,
         })
     }

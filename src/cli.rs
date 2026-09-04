@@ -1,6 +1,7 @@
 //! The command surface, and the single place an outcome becomes an exit code.
 //!
-//! Five verbs, and the network is a flag on exactly two of them:
+//! Six verbs, and the network is a flag on exactly two of them — plus `issue`, for which it is
+//! not a flag but the whole point:
 //!
 //! | Command | Input | Output | Network |
 //! |---|---|---|---|
@@ -9,6 +10,7 @@
 //! | `emit` | statement payload + signing key | signed candidate envelope | never |
 //! | `closure` | corpus or log + trigger reference | affected set + authentication state | optional |
 //! | `reconstruct` | corpus or log + checkpoint + valid time | projection + authentication state | optional |
+//! | `issue` | signed envelope + endpoints | an assembled `.ahl` receipt, **no verdict** | always |
 //!
 //! Retrieval is a flag on `closure` and `reconstruct` only, never a verb of its own: fetching
 //! bytes nobody verifies is not a feature. `verify` is offline by construction — there is no
@@ -24,7 +26,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::cache::Cache;
-use crate::commands::{closure, emit, inspect, reconstruct, verify};
+use crate::commands::{closure, emit, inspect, issue, reconstruct, verify};
 use crate::error::{CliError, CliResult};
 use crate::evaluation::EvaluationTime;
 use crate::keys::KeySource;
@@ -75,7 +77,13 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// The five verbs.
+/// The six verbs.
+//
+// `issue` carries the producer's whole request, which is a dozen optional inputs; the other
+// verbs are small. The enum is parsed once per process and never stored, moved in bulk, or put
+// in a collection, so the size difference costs nothing — and a clap `Args` variant cannot be
+// boxed, because the derive requires the fields in the variant itself.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Verify a `.ahl` Evidence Receipt offline against local policy.
@@ -103,6 +111,64 @@ pub enum Command {
         out: Option<PathBuf>,
         /// Replace an existing destination. Still a no-replace install, never a silent
         /// overwrite.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Assemble an Evidence Receipt from a live log, mirror and witness set. Renders no
+    /// verdict: `verify` is the judge.
+    Issue {
+        /// The signed envelope, as `emit` wrote it.
+        #[arg(long)]
+        envelope: PathBuf,
+        /// The claim type to assemble, from the receipt-format §3 registry.
+        #[arg(long, value_name = "TYPE")]
+        claim: String,
+        /// Base URL of the log accepting submissions. An address, never an authority.
+        #[arg(long, value_name = "URL")]
+        log: String,
+        /// A further witness base URL, repeatable. The configured `--witness` is used too.
+        #[arg(long, value_name = "URL")]
+        witness_endpoint: Vec<String>,
+        /// The subject record's dataset, where the claim type requires a record subject.
+        #[arg(long)]
+        dataset: Option<String>,
+        /// The subject record's commitment.
+        #[arg(long)]
+        record: Option<String>,
+        /// Record bytes to carry as content-binding evidence, AS RECEIVED.
+        #[arg(long, value_name = "FILE")]
+        record_bytes: Option<PathBuf>,
+        /// The dataset's canonicalization identifier, carried beside those bytes.
+        #[arg(long, value_name = "ID")]
+        canonicalization: Option<String>,
+        /// The media type, where the descriptor requires one.
+        #[arg(long, value_name = "TYPE")]
+        media_type: Option<String>,
+        /// An embedded introduction receipt.
+        #[arg(long, value_name = "FILE")]
+        introduction: Option<PathBuf>,
+        /// An embedded introduction receipt for a correction's replacement.
+        #[arg(long, value_name = "FILE")]
+        replacement_introduction: Option<PathBuf>,
+        /// An embedded trigger receipt.
+        #[arg(long, value_name = "FILE")]
+        trigger: Option<PathBuf>,
+        /// Committed tree material, as a root-to-leaves JSON map.
+        #[arg(long, value_name = "FILE")]
+        tree_material: Option<PathBuf>,
+        /// The entry index a `governance-state` claim is about.
+        #[arg(long)]
+        target_index: Option<u64>,
+        /// The receipt's informative note. Never normative.
+        #[arg(long)]
+        note: Option<String>,
+        /// Permit plain HTTP to a loopback peer. Refused for any other peer.
+        #[arg(long)]
+        allow_insecure_loopback: bool,
+        /// Install the receipt here, atomically and without clobbering.
+        #[arg(long)]
+        out: PathBuf,
+        /// Replace an existing destination. Still a no-replace install.
         #[arg(long)]
         force: bool,
     },
@@ -280,6 +346,7 @@ fn dispatch(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             write_out(stdout, &rendered)?;
             Ok(Outcome::Valid)
         }
+        Command::Issue { .. } => run_issue(cli, stdout),
         Command::Closure {
             trigger,
             trigger_index,
@@ -331,6 +398,80 @@ fn dispatch(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             emit_report(cli, stdout, &report)
         }
     }
+}
+
+/// The `issue` arm, extracted so `dispatch` stays a table of verbs.
+///
+/// `issue` is the one verb whose whole purpose is the network, so it takes the same fetch chain
+/// `closure` and `reconstruct` use — cache outermost, budget, transport — and the same policy
+/// for its endpoints and limits. The policy's trust anchors are not read here: assembly
+/// establishes nothing, so there is nothing for them to anchor.
+fn run_issue(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
+    let Command::Issue {
+        envelope,
+        claim,
+        log,
+        witness_endpoint,
+        dataset,
+        record,
+        record_bytes,
+        canonicalization,
+        media_type,
+        introduction,
+        replacement_introduction,
+        trigger,
+        tree_material,
+        target_index,
+        note,
+        allow_insecure_loopback,
+        out,
+        force,
+    } = &cli.command
+    else {
+        return Err(CliError::Internal("the `issue` arm reached another verb".to_owned()));
+    };
+    let policy = load_policy(cli)?;
+    let chain = fetch_chain(cli, &policy)?;
+    let mirror = policy.endpoints.mirror.clone().ok_or_else(|| {
+        CliError::Usage(
+            "`issue` publishes through a mirror; configure `[endpoints] mirror` or pass \
+             `--mirror`"
+                .to_owned(),
+        )
+    })?;
+    let mut witnesses: Vec<String> = policy.endpoints.witness.clone().into_iter().collect();
+    for endpoint in witness_endpoint {
+        if !witnesses.contains(endpoint) {
+            witnesses.push(endpoint.clone());
+        }
+    }
+    let endpoints = crate::producer::Endpoints { log: log.clone(), mirror, witnesses };
+    let issued = issue::run(
+        &chain,
+        policy.local,
+        &endpoints,
+        &issue::Options {
+            envelope: envelope.clone(),
+            claim: claim.clone(),
+            dataset: dataset.clone(),
+            record: record.clone(),
+            record_bytes: record_bytes.clone(),
+            canonicalization: canonicalization.clone(),
+            media_type: media_type.clone(),
+            introduction: introduction.clone(),
+            replacement_introduction: replacement_introduction.clone(),
+            trigger: trigger.clone(),
+            tree_material: tree_material.clone(),
+            target_index: *target_index,
+            note: note.clone(),
+            allow_insecure_loopback: *allow_insecure_loopback,
+            out: out.clone(),
+            force: *force,
+        },
+    )?;
+    let rendered = if cli.json { issued.to_json()? } else { issued.to_text() };
+    write_out(stdout, &rendered)?;
+    Ok(Outcome::Valid)
 }
 
 fn emit_report(
