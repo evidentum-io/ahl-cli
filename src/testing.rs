@@ -1366,7 +1366,7 @@ mod tests {
             .expect("the conformance corpus publishes the key seeds the fixture signs with");
         assert_eq!(fixture.witness_for(20).0, "witness-1");
         assert_eq!(fixture.witness_for(26).0, "witness-2");
-        assert!(fixture.cosigned(26)["witness_id"] == json!("witness-2"));
+        assert_eq!(fixture.cosigned(26)["witness_id"], json!("witness-2"));
     }
 
     #[test]
