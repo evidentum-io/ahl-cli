@@ -283,6 +283,10 @@ pub fn run<F: Fetcher>(
         .collect();
 
     let assembly = Assembly::new(position.checkpoint.clone(), prefix, carried, outgoing)?;
+    // The index came from the mirror. Now that the prefix has been checked against the root the
+    // log signed, the entry at that index must be the one whose bytes were handed over — or the
+    // receipt would be about a different statement.
+    assembly.require_subject(position.entry_index, &entry)?;
 
     let content = content_binding(options, limits)?;
     let record_subject = record_subject(options)?;

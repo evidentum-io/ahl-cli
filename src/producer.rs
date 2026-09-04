@@ -622,6 +622,31 @@ impl Assembly {
         })
     }
 
+    /// Require the entry at `index` to be the one whose bytes the caller handed over.
+    ///
+    /// The index a mirror reports for an entry is a **server label** (design note §2 rule 3) and
+    /// proves nothing; a mirror that answered with a neighbour's index would otherwise have a
+    /// receipt assembled about a different statement, signed and anchored and entirely genuine,
+    /// and about the wrong thing. The enumerated prefix has already been checked against the
+    /// root the log signed, so this comparison is against material the checkpoint commits.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::EvidenceMissing`] where the prefix does not reach the index, or where the
+    /// entry there is a different entry.
+    pub fn require_subject(&self, index: u64, entry: &str) -> CliResult<()> {
+        let found = entry_id(self.entry(index)?);
+        if found == entry {
+            Ok(())
+        } else {
+            Err(CliError::EvidenceMissing(format!(
+                "the mirror places entry `{entry}` at index {index}, but the entry the \
+                 checkpoint commits there is `{found}`; an index is a server label and is never \
+                 evidence of position"
+            )))
+        }
+    }
+
     /// The inclusion path of `index` under this assembly's checkpoint, computed locally.
     ///
     /// # Errors
@@ -1417,6 +1442,40 @@ mod tests {
         let refusal = json!({ "status": "refused", "reason": "size-regression" });
         let error = cosignature_entry(&refusal).expect_err("a refusal is not a cosignature");
         assert!(error.to_string().contains("size-regression"), "{error}");
+    }
+
+    /// A two-entry assembly over a genuine root, for the subject-binding tests.
+    fn assembly_of(entries: Vec<Value>) -> Assembly {
+        let leaf_bytes: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|envelope| log_leaf_bytes_for(envelope, ATL_PROFILE).expect("an envelope"))
+            .collect();
+        let checkpoint = json!({
+            "tree_size": entries.len(),
+            "root_hash": hash_hex(&tree_root(&leaf_bytes)),
+        });
+        Assembly::new(
+            checkpoint,
+            Prefix { material: json!({}), entries },
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .expect("the prefix recomputes the root")
+    }
+
+    #[test]
+    fn a_server_supplied_index_is_never_taken_as_evidence_of_position() {
+        let first = envelope(&json!({ "type": "ingestion", "record": "a" }));
+        let second = envelope(&json!({ "type": "ingestion", "record": "b" }));
+        let wanted = entry_id(&first);
+        let assembly = assembly_of(vec![first, second]);
+
+        assembly.require_subject(0, &wanted).expect("the entry is where the mirror said");
+        // The same entry id, an index the mirror could have answered with instead.
+        let error = assembly.require_subject(1, &wanted).expect_err("a neighbour is not the entry");
+        assert!(error.to_string().contains("never evidence of position"), "{error}");
+        // An index the checkpoint does not commit at all.
+        assert!(assembly.require_subject(9, &wanted).is_err());
     }
 
     #[test]
