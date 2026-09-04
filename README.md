@@ -41,6 +41,7 @@ and proof verification — are not covered, because the claim is about this crat
 | `emit` | statement payload + signing key | signed candidate envelope | never |
 | `closure` | corpus or log + trigger reference | affected set + authentication state | optional |
 | `reconstruct` | corpus or log + checkpoint + valid time | projection + authentication state | optional |
+| `issue` | signed envelope + log, mirror and witness endpoints | an assembled `.ahl` receipt, **no verdict** | always |
 
 `verify` is offline by construction: the receipt format defines verification as receipt +
 locally pinned profile + local policy, so there is **no flag that makes `verify` reach the
@@ -65,6 +66,9 @@ ahl-cli --policy policy.toml reconstruct --dataset customers \
         --record hmac-sha256:<commitment> --valid-time 2026-08-16T12:00:00Z --checkpoint 32
 
 ahl-cli emit statement.json --key-file producer.seed --out statement.ahlentry
+
+ahl-cli --policy policy.toml issue --envelope statement.ahlentry \
+        --claim statement-anchored --log https://log.example --out evidence.ahl
 ```
 
 ## Exit codes
@@ -231,6 +235,25 @@ entry index the log will assign, and trigger authority.
 
 It never adds a field the operator did not supply, never signs an unknown statement type, and
 never defaults a missing required field.
+
+## `issue` assembles, it does not verify
+
+`issue` is the producer's verb: it gets a signed envelope anchored in the log, publishes the
+entry and the resulting checkpoint to a mirror, collects witness cosignatures, and assembles an
+Evidence Receipt from what came back. **It establishes nothing.** It performs exactly the two
+checks assembly needs — that the log anchored the bytes submitted under the fixed adaptor
+metadata, and that the enumerated prefix recomputes the root the checkpoint commits, since a
+path computed in the wrong tree is not a path — and evaluates no claim-type rule, no governance
+walk and no other signature. Its output says so, and the receipt it wrote is not evidence of
+anything until `verify` has read it under a policy.
+
+It is idempotent: an entry a mirror already holds at a proven index is not submitted a second
+time. Retrieval is content-addressed, so that lookup cannot resolve to somebody else's entry,
+and a miss means "submit it" rather than "no such entry was ever anchored".
+
+Plain HTTP needs `--allow-insecure-loopback`, and even then reaches a loopback peer only. The
+transport's resolved-peer rule is what stops such a request from leaving the machine; the flag
+exists so that making one is never an accident.
 
 ## Network behaviour
 

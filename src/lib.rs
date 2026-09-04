@@ -115,6 +115,7 @@ pub mod keys;
 pub mod net;
 pub mod outcome;
 pub mod policy;
+pub mod producer;
 pub mod profile;
 pub mod report;
 pub mod secure;
