@@ -296,6 +296,28 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         }
     }
 
+    // The ATL Evidence Receipt the log publishes agrees with the receipt that was assembled.
+    // The inclusion path deliberately is NOT compared: `GET /v1/anchor/:id` answers relative to
+    // the tree as it stands now, which has grown since, so a producer must take that evidence at
+    // anchoring time — which is what `issue` does. The identity and the position are stable and
+    // are what agree here.
+    let assembled: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(replay.get("record-derived")).expect("the receipt"))
+            .expect("JSON");
+    let atl_entry_id = replay.report("04-derivation")["atl_entry_id"]
+        .as_str()
+        .expect("`issue` reports the ATL identifier it submitted under")
+        .to_owned();
+    let published = pilot::atl_receipt(&pilot.stack, &atl_entry_id);
+    assert_eq!(
+        published["entry"]["payload_hash"], assembled["subject"]["entry_id"],
+        "the log's Evidence Receipt names a different entry from the one the receipt is about"
+    );
+    assert_eq!(
+        published["proof"]["leaf_index"], assembled["subject"]["entry_index"],
+        "the log's Evidence Receipt places the entry at a different index"
+    );
+
     // The rotation is genuinely exercised rather than skipped: a receipt anchored under a
     // checkpoint manifest version 2 governs carries a rotation proof for it, cosigned by the
     // OUTGOING witness, while its own assurance rests on the incoming one.

@@ -128,6 +128,8 @@ pub struct Issue<'a> {
     log: String,
     extra_witness: String,
     work: PathBuf,
+    /// The `--json` report of every successful run, by receipt name.
+    reports: std::cell::RefCell<Vec<(String, Value)>>,
 }
 
 impl<'a> Issue<'a> {
@@ -137,6 +139,7 @@ impl<'a> Issue<'a> {
             log: stack.log.base.clone(),
             extra_witness: stack.witness(WITNESS_2).to_owned(),
             work: work.to_path_buf(),
+            reports: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -170,6 +173,7 @@ impl<'a> Issue<'a> {
     fn must(&self, name: &str, envelope: &Path, claim: &str, extra: &[&str]) -> PathBuf {
         let (out, run) = self.run(name, envelope, claim, extra);
         assert_eq!(run.code, 0, "issue `{name}` ({claim}) failed:\n{}", run.output());
+        self.reports.borrow_mut().push((name.to_owned(), run.json()));
         out
     }
 }
@@ -196,9 +200,19 @@ pub struct Replay {
     pub receipts: Vec<(String, PathBuf)>,
     /// Reasons a case the corpus has could not be produced here.
     pub skipped: Vec<(String, String)>,
+    /// The `issue` report of each run, by the name given to `issue`.
+    pub reports: Vec<(String, Value)>,
 }
 
 impl Replay {
+    /// The `issue` report of the run under this name.
+    pub fn report(&self, name: &str) -> &Value {
+        self.reports
+            .iter()
+            .find(|(id, _)| id == name)
+            .map_or_else(|| panic!("no `issue` run named `{name}`"), |(_, report)| report)
+    }
+
     /// The receipt with this name.
     pub fn get(&self, name: &str) -> &Path {
         self.receipts.iter().find(|(id, _)| id == name).map_or_else(
@@ -670,7 +684,15 @@ pub fn replay(pilot: &crate::Pilot) -> Replay {
             .to_owned(),
     ));
 
-    Replay { receipts, skipped }
+    Replay { receipts, skipped, reports: issue.reports.take() }
+}
+
+/// The ATL Evidence Receipt the log publishes for one of its own entry identifiers.
+pub fn atl_receipt(stack: &Stack, atl_entry_id: &str) -> Value {
+    let path = format!("/v1/anchor/{atl_entry_id}");
+    let (status, body) = http(&stack.log.base, "GET", &path, None).expect("the log answers");
+    assert_eq!(status, 200, "the log serves no Evidence Receipt for `{atl_entry_id}`");
+    serde_json::from_slice(&body).expect("JSON")
 }
 
 /// The signed checkpoint the mirror publishes at a tree size.

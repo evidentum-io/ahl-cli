@@ -67,6 +67,14 @@ pub struct Endpoints {
 /// An entry's position in the log and the checkpoint the log served with it.
 #[derive(Debug, Clone)]
 pub struct LogPosition {
+    /// The ATL identifier the log assigned, where this run submitted the entry.
+    ///
+    /// It is the log's own retrieval key and is not an AHL identifier: adaptor §10.1.1 is
+    /// explicit that resolving an AHL entry id to an ATL identifier and fetching the ATL
+    /// receipt yields a digest of the envelope and no envelope. It is carried so the ATL
+    /// Evidence Receipt can be fetched again and reconciled, never as a substitute for the
+    /// entry id.
+    pub atl_entry_id: Option<String>,
     /// The AHL entry index — the ATL leaf index of adaptor §5.1.
     pub entry_index: u64,
     /// The AHL checkpoint object of adaptor §6.2, signed by the log.
@@ -164,8 +172,35 @@ fn ahl_checkpoint(atl: &Value) -> CliResult<Value> {
 /// [`CliError::EvidenceMissing`] where the log refuses, answers unusably, or answers about an
 /// entry other than the one submitted.
 pub fn anchor<F: Fetcher>(fetcher: &F, log: &str, envelope: &Value) -> CliResult<LogPosition> {
-    let bytes = jcs(envelope);
-    let expected = sha256_hex(&bytes);
+    let entry = sha256_hex(&jcs(envelope));
+    let (atl_entry_id, submitted_index) = submit(fetcher, log, envelope, &entry)?;
+    let mut position = retrieve(fetcher, log, &atl_entry_id, &entry)?;
+    // The two answers describe the same append and must agree on where it landed. They are
+    // separately signed objects from separately handled requests, so a disagreement is the log
+    // contradicting itself rather than a transient.
+    if position.entry_index != submitted_index {
+        return Err(CliError::EvidenceMissing(format!(
+            "the log placed the entry at index {submitted_index} when it accepted it and at \
+             index {} when asked for its receipt",
+            position.entry_index
+        )));
+    }
+    position.atl_entry_id = Some(atl_entry_id);
+    Ok(position)
+}
+
+/// `POST /v1/anchor` — submit the entry, and read back the identifier and index the log assigned.
+///
+/// The entry travels as the ATL **payload**: adaptor §4.1 makes `JCS(envelope)` the anchored
+/// bytes, and §4.2 makes their digest the ATL payload hash, so the AHL entry id and the ATL
+/// payload hash are the same value. The log's answer is checked against that value rather than
+/// taken on trust.
+fn submit<F: Fetcher>(
+    fetcher: &F,
+    log: &str,
+    envelope: &Value,
+    entry: &str,
+) -> CliResult<(String, u64)> {
     let request = Request::post(
         format!("{}/v1/anchor", log.trim_end_matches('/')),
         body(&json!({ "payload": envelope, "metadata": atl_metadata() }))?,
@@ -179,11 +214,77 @@ pub fn anchor<F: Fetcher>(fetcher: &F, log: &str, envelope: &Value) -> CliResult
         )));
     }
     let receipt = json_body(&response, "the log")?;
-    let payload_hash = receipt.pointer("/entry/payload_hash").and_then(Value::as_str);
-    if payload_hash != Some(expected.as_str()) {
+    check_entry_block(&receipt, entry)?;
+    let atl_entry_id = receipt
+        .pointer("/entry/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::EvidenceMissing(
+                "the log's submission answer carries no `entry.id`, so its Evidence Receipt \
+                 cannot be retrieved"
+                    .to_owned(),
+            )
+        })?
+        .to_owned();
+    let index = receipt.pointer("/proof/leaf_index").and_then(Value::as_u64).ok_or_else(|| {
+        CliError::EvidenceMissing("the log's submission answer carries no `leaf_index`".to_owned())
+    })?;
+    Ok((atl_entry_id, index))
+}
+
+/// `GET /v1/anchor/:id` — the ATL Evidence Receipt, and the promotion evidence it carries.
+///
+/// This is the interface adaptor §10.1 names for retrieval by ATL identifier, and what it
+/// returns is exactly what the mirror's promote step needs: the leaf index, a checkpoint in ATL
+/// form, and an inclusion proof. Using the retrieved receipt rather than the submission answer
+/// is deliberate — the submission answer is a courtesy, the receipt is the log's published
+/// evidence, and a deployment where the two disagree is one this refuses to build on.
+///
+/// Note the consequence of the log minting checkpoints per request: the checkpoint here is a
+/// **different signed object** from the one the submission answered with, over the same tree.
+/// That is the log's behaviour, not a fault of this code, and it is why the receipt carries the
+/// retrieved checkpoint alone rather than mixing the two.
+fn retrieve<F: Fetcher>(
+    fetcher: &F,
+    log: &str,
+    atl_entry_id: &str,
+    entry: &str,
+) -> CliResult<LogPosition> {
+    let request = Request::get(format!("{}/v1/anchor/{atl_entry_id}", log.trim_end_matches('/')));
+    let response = fetch(fetcher, &request)?;
+    if response.status != 200 {
         return Err(CliError::EvidenceMissing(format!(
-            "the log anchored payload hash {payload_hash:?}, the submitted entry digests to \
-             `{expected}`; adaptor §4.2 makes those the same value"
+            "the log answered {} for the Evidence Receipt of `{atl_entry_id}`",
+            response.status
+        )));
+    }
+    let receipt = json_body(&response, "the log")?;
+    check_entry_block(&receipt, entry)?;
+    let proof = receipt.get("proof").ok_or_else(|| {
+        CliError::EvidenceMissing("the log's Evidence Receipt carries no `proof`".to_owned())
+    })?;
+    let entry_index = proof.get("leaf_index").and_then(Value::as_u64).ok_or_else(|| {
+        CliError::EvidenceMissing("the log's Evidence Receipt carries no `leaf_index`".to_owned())
+    })?;
+    let checkpoint = ahl_checkpoint(proof.get("checkpoint").unwrap_or(&Value::Null))?;
+    let raw = checkpoint_raw(&checkpoint)?;
+    let inclusion_path = string_array(proof.get("inclusion_path"), "the log's inclusion path")?;
+    Ok(LogPosition { atl_entry_id: None, entry_index, checkpoint, raw, inclusion_path })
+}
+
+/// The `entry` block of an ATL Evidence Receipt must describe the entry that was submitted.
+///
+/// Both digests are load-bearing. The payload hash is the AHL entry id (§4.2), so a receipt
+/// naming another is a receipt about another entry. The metadata digest is the constant this
+/// profile pins, and "an entry whose ATL metadata is anything else is not an AHL entry under
+/// this profile" — an entry the log accepted under different metadata has a leaf that does not
+/// reconstruct from the envelope, however valid it is as an ATL entry.
+fn check_entry_block(receipt: &Value, entry: &str) -> CliResult<()> {
+    let payload_hash = receipt.pointer("/entry/payload_hash").and_then(Value::as_str);
+    if payload_hash != Some(entry) {
+        return Err(CliError::EvidenceMissing(format!(
+            "the log names payload hash {payload_hash:?}, the submitted entry digests to \
+             `{entry}`; adaptor §4.2 makes those the same value"
         )));
     }
     let metadata_hash = receipt.pointer("/entry/metadata_hash").and_then(Value::as_str);
@@ -195,18 +296,7 @@ pub fn anchor<F: Fetcher>(fetcher: &F, log: &str, envelope: &Value) -> CliResult
              profile"
         )));
     }
-    let proof = receipt.get("proof").ok_or_else(|| {
-        CliError::EvidenceMissing("the log's receipt carries no `proof`".to_owned())
-    })?;
-    let entry_index = proof.get("leaf_index").and_then(Value::as_u64).ok_or_else(|| {
-        CliError::EvidenceMissing("the log's receipt carries no `leaf_index`".to_owned())
-    })?;
-    let checkpoint = ahl_checkpoint(proof.get("checkpoint").unwrap_or(&Value::Null))?;
-    let raw = base64(&ahl_core::atl_checkpoint_blob_from_json(&checkpoint).map_err(|source| {
-        CliError::EvidenceMissing(format!("the log's checkpoint does not reassemble: {source}"))
-    })?);
-    let inclusion_path = string_array(proof.get("inclusion_path"), "the log's inclusion path")?;
-    Ok(LogPosition { entry_index, checkpoint, raw, inclusion_path })
+    Ok(())
 }
 
 /// Read a JSON array of `sha256:<hex>` family strings, rejecting anything else outright.

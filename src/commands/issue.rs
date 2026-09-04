@@ -82,6 +82,9 @@ pub struct Issued {
     pub claim_type: String,
     /// The subject's entry index in the bound Data Tree.
     pub entry_index: u64,
+    /// The ATL identifier the log assigned, where this run submitted the entry. The log's own
+    /// retrieval key, never an AHL identifier (adaptor §10.1.1).
+    pub atl_entry_id: Option<String>,
     /// Whether this run anchored the subject or found it already anchored.
     pub anchored_now: bool,
     /// The `log_id` the checkpoint carries.
@@ -123,6 +126,9 @@ impl Issued {
             self.entry_index,
             if self.anchored_now { "anchored by this run" } else { "already anchored" }
         );
+        if let Some(atl_entry_id) = &self.atl_entry_id {
+            let _ = writeln!(out, "ATL entry id: {atl_entry_id}");
+        }
         let _ = writeln!(out, "checkpoint tree size: {}", self.tree_size);
         let _ = writeln!(
             out,
@@ -287,6 +293,20 @@ pub fn run<F: Fetcher>(
     // log signed, the entry at that index must be the one whose bytes were handed over — or the
     // receipt would be about a different statement.
     assembly.require_subject(position.entry_index, &entry)?;
+    // Two sources, one geometry. The log served an inclusion proof with its Evidence Receipt;
+    // the mirror served the entries. Recomputing the path from the mirror's enumeration and
+    // comparing it with the log's proof is the one place those two independently obtained
+    // bodies of material are made to agree, and a deployment where they do not is one this
+    // refuses to issue a receipt against.
+    if !position.inclusion_path.is_empty()
+        && assembly.inclusion_path(position.entry_index)? != position.inclusion_path
+    {
+        return Err(CliError::EvidenceMissing(format!(
+            "the inclusion path the log served for entry {} does not match the one recomputed \
+             from the entries the mirror enumerated under the same checkpoint",
+            position.entry_index
+        )));
+    }
 
     let content = content_binding(options, limits)?;
     let record_subject = record_subject(options)?;
@@ -320,6 +340,7 @@ pub fn run<F: Fetcher>(
         boundary: BOUNDARY,
         claim_type: options.claim.clone(),
         entry_index: position.entry_index,
+        atl_entry_id: position.atl_entry_id,
         anchored_now,
         log_id,
         tree_size: size,
@@ -405,7 +426,13 @@ fn publish_existing<F: Fetcher>(
     let raw = producer::checkpoint_raw(&checkpoint)?;
     // The inclusion path is recomputed from the enumerated prefix during assembly; a path
     // carried here would be a second, unchecked copy of it.
-    Ok(producer::LogPosition { entry_index, checkpoint, raw, inclusion_path: Vec::new() })
+    Ok(producer::LogPosition {
+        atl_entry_id: None,
+        entry_index,
+        checkpoint,
+        raw,
+        inclusion_path: Vec::new(),
+    })
 }
 
 /// Fill in the parts of `claim_material` that come from the published state rather than from
