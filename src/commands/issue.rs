@@ -336,10 +336,11 @@ fn serve<F: Fetcher>(
 ///
 /// # Errors
 ///
-/// [`CliError::EvidenceMissing`] where the mirror serves no proof for the pair it published,
-/// where the proof does not open the two roots, or where the governing version is L3 and no
-/// witness cosigned the later checkpoint. [`CliError::Internal`] where the ceiling above did not
-/// hold the invariant it exists to establish.
+/// [`CliError::EvidenceMissing`] where the enumerated window does not recompute the root of
+/// the horizon checkpoint or of the later checkpoint, where the window and the published series
+/// disagree on the version in force at the later size, where the mirror serves no proof for the
+/// pair it published, where the proof does not open the two roots, or where the governing
+/// version is L3 and no witness cosigned the later checkpoint.
 fn continued_history<F: Fetcher>(
     fetcher: &F,
     endpoints: &Endpoints,
@@ -393,6 +394,24 @@ fn continued_history<F: Fetcher>(
         CliError::EvidenceMissing("the later checkpoint has no tree size".to_owned())
     })?;
 
+    // Bound a second time, to the checkpoint the receipt CARRIES. The horizon checkpoint is
+    // not carried, so a mirror forging its root together with a matching window would pass the
+    // check above unobserved; `later_checkpoint` is carried and the verifier checks its log
+    // signature, so the window is tied to a checkpoint the receipt's own reader trusts. The
+    // slice bound here is the one a witness is shown below — the same bytes, not a refetch.
+    let shown =
+        usize::try_from(later_size).ok().and_then(|at| entries.get(..at)).ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "the later checkpoint's tree size {later_size} lies outside the window \
+                 [0, {horizon}) the mirror enumerated"
+            ))
+        })?;
+    producer::authenticate_prefix(
+        &later,
+        shown,
+        &format!("the entries the mirror enumerated for [0, {later_size})"),
+    )?;
+
     // The invariant the ceiling exists to establish, checked rather than assumed: with no
     // manifest between the two tree sizes, the version in force at the later checkpoint IS the
     // one in force at the anchoring checkpoint — which is why the receipt's `keys.log[]` and
@@ -401,10 +420,11 @@ fn continued_history<F: Fetcher>(
     // checkpoint resolves under a version it does not carry.
     let (later_index, later_active) = published_governance.active_for_checkpoint(later_size)?;
     if later_index != active_index {
-        return Err(CliError::Internal(format!(
+        return Err(CliError::EvidenceMissing(format!(
             "the manifest version in force at tree size {later_size} is the one anchored at \
              entry {later_index}, not the one at entry {active_index} that governs this \
-             receipt's own checkpoint; no later checkpoint should have passed the ceiling"
+             receipt's own checkpoint; the window the mirror enumerated and the series it \
+             published disagree, and a receipt cannot be assembled on the pair"
         )));
     }
 
@@ -430,9 +450,7 @@ fn continued_history<F: Fetcher>(
         }
         // A witness cosigns what it is shown, and it has not been shown this one. It is shown
         // the prefix the LATER checkpoint commits, which the enumeration above covers.
-        let shown = usize::try_from(later_size).ok().and_then(|at| entries.get(..at));
-        let answer =
-            producer::cosign_later(fetcher, witness, log_id, &later, shown.unwrap_or_default())?;
+        let answer = producer::cosign_later(fetcher, witness, log_id, &later, shown)?;
         // A refusal is signed evidence about the log and is reported by the run that asked for
         // it; here it simply means this witness supplies no cosignature over the later state.
         if let Ok(entry) = producer::cosignature_entry(&answer) {
