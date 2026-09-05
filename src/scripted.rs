@@ -690,6 +690,9 @@ impl Stack {
         if mirror == "/v1/range" {
             return self.range_answer(request);
         }
+        if witness == "/v1/witness-key" {
+            return ok(&json!({ "witness_id": WITNESS_ID, "key_id": WITNESS_KEY }));
+        }
         if witness.starts_with("/v1/logs/") && witness.ends_with("/witness") {
             return self.witness_answer(request);
         }

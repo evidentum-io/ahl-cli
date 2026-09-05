@@ -503,6 +503,40 @@ pub fn cosign<F: Fetcher>(
     }
 }
 
+/// The identity one witness endpoint answers as.
+///
+/// Asked BEFORE anything is submitted to it, because what a submission may name depends on who
+/// is answering: a rotation is named only to a witness the outgoing version declared, and a
+/// checkpoint is submitted to a witness exactly once — a second submission of the same
+/// checkpoint is a fresh cosignature over a record the witness already holds, which it refuses
+/// as a conflict rather than filing twice. There is no room to learn the identity from a first
+/// submission and correct on a second.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the witness answers unusably or names no identity.
+pub fn witness_identity<F: Fetcher>(fetcher: &F, witness: &str) -> CliResult<String> {
+    let request = Request::get(format!("{}/v1/witness-key", witness.trim_end_matches('/')));
+    let response = fetch(fetcher, &request)?;
+    if response.status != 200 {
+        return Err(CliError::EvidenceMissing(format!(
+            "the witness answered {} to `GET /v1/witness-key`",
+            response.status
+        )));
+    }
+    json_body(&response, "the witness")?
+        .get("witness_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            CliError::EvidenceMissing(
+                "the witness names no `witness_id`, so nothing says which rotations are its to \
+                 attest"
+                    .to_owned(),
+            )
+        })
+}
+
 /// The rotating-manifest entry indexes a server reported the submitted checkpoint anchors.
 ///
 /// Both `POST /v1/checkpoints` and `POST /v1/logs/{log_id}/witness` answer with
@@ -551,6 +585,156 @@ pub fn offer_rotation_anchor<F: Fetcher>(
         )));
     }
     Ok(rotation_anchors(&json_body(&response, "the mirror")?))
+}
+
+/// Every checkpoint the mirror publishes as a SERIES-USABLE member, ascending by tree size.
+///
+/// The mirror annotates each published member with its own view of its state, and only a
+/// `series_usable` member can ground a consistency answer — the route that serves one refuses
+/// anything else. The annotation is a server label and is stripped before a checkpoint is
+/// carried: it is not covered by the log's signature and has no place in a receipt.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the mirror answers unusably.
+pub fn series_usable<F: Fetcher>(fetcher: &F, mirror: &str) -> CliResult<Vec<Value>> {
+    let request = Request::get(format!("{}/v1/checkpoints", mirror.trim_end_matches('/')));
+    let response = fetch(fetcher, &request)?;
+    if response.status != 200 {
+        return Err(CliError::EvidenceMissing(format!(
+            "the mirror answered {} for its checkpoint series",
+            response.status
+        )));
+    }
+    let value = json_body(&response, "the mirror")?;
+    let members = value.as_array().ok_or_else(|| {
+        CliError::EvidenceMissing("the checkpoint series is not an array".to_owned())
+    })?;
+    let mut usable: Vec<Value> = members
+        .iter()
+        .filter(|member| member.get("state").and_then(Value::as_str) == Some("series_usable"))
+        .map(strip_state)
+        .collect();
+    usable.sort_by_key(|member| member.get("tree_size").and_then(Value::as_u64).unwrap_or(0));
+    Ok(usable)
+}
+
+/// The mirror's consistency proof between two tree sizes (adaptor §8.3).
+///
+/// Adaptor §8.3 qualification 2 makes serving these a deployment obligation rather than
+/// something a client may compute for itself, and `GET /v1/consistency` is the interface it
+/// names. The path is carried in the order it is served: RFC 9162 §2.1.4 fixes that order, and
+/// re-sorting it would be re-deriving the proof rather than carrying it.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the mirror refuses, answers unusably, or serves anything
+/// but an array of strings.
+pub fn consistency_path<F: Fetcher>(
+    fetcher: &F,
+    mirror: &str,
+    from: u64,
+    to: u64,
+) -> CliResult<Vec<String>> {
+    let route = format!("/v1/consistency?from={from}&to={to}");
+    let request = Request::get(format!("{}{route}", mirror.trim_end_matches('/')));
+    let response = fetch(fetcher, &request)?;
+    if response.status != 200 {
+        return Err(CliError::EvidenceMissing(format!(
+            "the mirror answered {} to `GET {route}`; adaptor §8.3 qualification 2 makes \
+             serving a consistency proof a deployment obligation, and this build composes \
+             `continued_history` from that interface rather than from a proof of its own",
+            response.status
+        )));
+    }
+    let value = json_body(&response, "the mirror")?;
+    let served = value.get("consistency_path").and_then(Value::as_array).ok_or_else(|| {
+        CliError::EvidenceMissing(format!(
+            "the mirror served no `consistency_path` array for {from} to {to}"
+        ))
+    })?;
+    served
+        .iter()
+        .enumerate()
+        .map(|(at, element)| {
+            element.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                CliError::EvidenceMissing(format!(
+                    "element {at} of the consistency proof for {from} to {to} is not a string; \
+                     adaptor §8.3 serializes one as an array of `sha256:<hex>` family strings"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Whether a consistency path opens the pair of roots the two checkpoints commit.
+///
+/// This is the one check `issue` performs on the material before carrying it, and it is not a
+/// verification standing in for `verify`: a path that does not open the pair is not a proof,
+/// and carrying one would put a receipt into the world asserting a continuation that never
+/// held. RFC 9162 §2.1.4, through `ahl_core`, so the algorithm is never reimplemented here.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where a root or a path element is unreadable, or where the two
+/// sizes admit no proof at all.
+pub fn consistency_holds(from: &Value, to: &Value, path: &[String]) -> CliResult<bool> {
+    let unreadable =
+        |what: &str| CliError::EvidenceMissing(format!("consistency proof {what} is unreadable"));
+    let root = |checkpoint: &Value, what: &'static str| {
+        checkpoint
+            .get("root_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| unreadable(what))
+            .and_then(|hash| ahl_core::parse_hash_hex(hash).map_err(|_| unreadable(what)))
+    };
+    let proof = ahl_core::consistency_from_hex(tree_size(from)?, tree_size(to)?, path)
+        .map_err(|source| CliError::EvidenceMissing(format!("consistency proof: {source}")))?;
+    ahl_core::verify_consistency_proof(&proof, &root(from, "from-root")?, &root(to, "to-root")?)
+        .map_err(|source| CliError::EvidenceMissing(format!("consistency proof: {source}")))
+}
+
+/// The cosigned history one witness publishes for a log.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the witness answers unusably.
+pub fn cosigned_history<F: Fetcher>(
+    fetcher: &F,
+    witness: &str,
+    log_id: &str,
+) -> CliResult<Vec<Value>> {
+    let route = format!("/v1/logs/{log_id}/checkpoints");
+    let request = Request::get(format!("{}{route}", witness.trim_end_matches('/')));
+    let response = fetch(fetcher, &request)?;
+    if response.status != 200 {
+        return Err(CliError::EvidenceMissing(format!(
+            "the witness answered {} to `GET {route}`",
+            response.status
+        )));
+    }
+    let value = json_body(&response, "the witness")?;
+    value.as_array().cloned().ok_or_else(|| {
+        CliError::EvidenceMissing("the witness's cosigned history is not an array".to_owned())
+    })
+}
+
+/// The `anchoring.witnesses[]` element of a cosigned history that is over exactly `checkpoint`.
+///
+/// The whole six-member object is compared and not the tree size alone. A log may republish at
+/// one size, and a witness holds one record per `(tree_size, checkpoint_time)`, so matching on
+/// the size would pick a cosignature over a different checkpoint and the receipt would carry a
+/// signature over bytes it does not present.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the matching record is missing a member.
+pub fn cosignature_over(history: &[Value], checkpoint: &Value) -> CliResult<Option<Value>> {
+    history
+        .iter()
+        .find(|record| record.get("checkpoint") == Some(checkpoint))
+        .map(cosignature_entry)
+        .transpose()
 }
 
 /// The mirror's `governance.rotation_proofs[]` element for the rotation at

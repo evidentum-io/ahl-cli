@@ -199,26 +199,19 @@ fn submit<F: Fetcher>(
     let mut anchors: Vec<u64> = Vec::new();
     let mut cosignatures = Vec::new();
     for witness in &endpoints.witnesses {
-        // The ordinary submission first: it is what fetches the anchoring cosignature, and it
-        // is also what says which identity this endpoint answers as. A submission may name a
-        // rotation only to a witness the OUTGOING version declared, so the identity has to be
-        // in hand before any rotation is named.
-        let served = producer::cosign(fetcher, witness, log_id, position, entries, None)?;
+        // Exactly one submission per witness. A second one over the same checkpoint is a fresh
+        // cosignature over a record the witness already holds, and it refuses that as a
+        // conflict — rightly, since replacing a published cosignature is not something a
+        // submitter gets to ask for. So the identity is asked for first, and the one submission
+        // names the first rotation this witness is entitled to attest.
+        let witness_id = producer::witness_identity(fetcher, witness)?;
+        let named = anchored
+            .iter()
+            .find(|rotation| rotation.attesting.contains(&witness_id))
+            .map(|rotation| rotation.manifest_entry_index);
+        let served = producer::cosign(fetcher, witness, log_id, position, entries, named)?;
         record(&mut anchors, producer::rotation_anchors(&served));
-        let witness_id =
-            served.get("witness_id").and_then(Value::as_str).unwrap_or_default().to_owned();
         cosignatures.push(producer::cosignature_entry(&served)?);
-        for rotation in anchored.iter().filter(|entry| entry.attesting.contains(&witness_id)) {
-            let named = producer::cosign(
-                fetcher,
-                witness,
-                log_id,
-                position,
-                entries,
-                Some(rotation.manifest_entry_index),
-            )?;
-            record(&mut anchors, producer::rotation_anchors(&named));
-        }
     }
     // The mirror's ordinary ingest happened before the prefix was enumerated, which is the only
     // place the rotations are known, so the naming is a second offer of the same checkpoint.
