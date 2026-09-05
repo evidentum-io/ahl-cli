@@ -1064,6 +1064,50 @@ pub fn enumerate<F: Fetcher>(
     Ok(Prefix { material, entries })
 }
 
+/// Check an enumerated prefix against the checkpoint it is served under, and return its leaf
+/// preimages.
+///
+/// **Nothing a mirror enumerates is evidence until this has run.** The range response is parsed
+/// and index-checked by [`enumerate`], which establishes that the answer has the shape asked
+/// for and nothing else; a mirror that substitutes an entry, or serves a window one statement
+/// short, passes that and fails here. The root the leaves recompute to is compared with the one
+/// the checkpoint commits, so the material is bound to a tree the log signed rather than to a
+/// list a server chose.
+///
+/// `what` names the material in the failure, because the two callers fetch it for different
+/// reasons and a bare "the enumeration" would not say which one refused.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the prefix does not cover the checkpoint, where an entry
+/// is not an envelope, or where the root it recomputes to is not the one the checkpoint commits.
+pub fn authenticate_prefix(
+    checkpoint: &Value,
+    entries: &[Value],
+    what: &str,
+) -> CliResult<Vec<Vec<u8>>> {
+    let size = tree_size(checkpoint)?;
+    let carried = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    if carried != size {
+        return Err(CliError::EvidenceMissing(format!(
+            "{what} carries {carried} entries, the checkpoint commits {size}"
+        )));
+    }
+    let leaf_bytes = leaves(entries)?;
+    let recomputed = tree_root(&leaf_bytes);
+    let committed = checkpoint.get("root_hash").and_then(Value::as_str).ok_or_else(|| {
+        CliError::EvidenceMissing("the checkpoint carries no `root_hash`".to_owned())
+    })?;
+    if hash_hex(&recomputed) != committed {
+        return Err(CliError::EvidenceMissing(format!(
+            "the root recomputed from {what} is {}, the checkpoint commits {committed}; the \
+             checkpoint describes a tree this material is not",
+            hash_hex(&recomputed)
+        )));
+    }
+    Ok(leaf_bytes)
+}
+
 /// The log-tree leaf preimages of a prefix, under the ATL leaf construction of adaptor §4.2.
 fn leaves(entries: &[Value]) -> CliResult<Vec<Vec<u8>>> {
     entries
@@ -1122,25 +1166,7 @@ impl Assembly {
     /// [`CliError::EvidenceMissing`] where the enumeration does not cover the checkpoint, or
     /// where the root it recomputes to is not the one the checkpoint commits.
     pub fn new(checkpoint: Value, prefix: Prefix, cosignatures: Vec<Value>) -> CliResult<Self> {
-        let size = tree_size(&checkpoint)?;
-        let carried = u64::try_from(prefix.entries.len()).unwrap_or(u64::MAX);
-        if carried != size {
-            return Err(CliError::EvidenceMissing(format!(
-                "the enumeration carries {carried} entries, the checkpoint commits {size}"
-            )));
-        }
-        let leaf_bytes = leaves(&prefix.entries)?;
-        let recomputed = tree_root(&leaf_bytes);
-        let committed = checkpoint.get("root_hash").and_then(Value::as_str).ok_or_else(|| {
-            CliError::EvidenceMissing("the checkpoint carries no `root_hash`".to_owned())
-        })?;
-        if hash_hex(&recomputed) != committed {
-            return Err(CliError::EvidenceMissing(format!(
-                "the root recomputed from the enumerated prefix is {}, the checkpoint commits \
-                 {committed}; the checkpoint describes a tree this material is not",
-                hash_hex(&recomputed)
-            )));
-        }
+        let leaf_bytes = authenticate_prefix(&checkpoint, &prefix.entries, "the enumeration")?;
         Ok(Self {
             checkpoint,
             cosignatures,

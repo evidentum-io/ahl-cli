@@ -269,6 +269,10 @@ pub enum Discrepancy {
     CrookedPath,
     /// The log names one index when it accepts the entry and another when asked afterwards.
     MovedIndex,
+    /// The mirror answers a range reaching past the anchoring checkpoint with an entry
+    /// substituted, so the window does not recompute the root the checkpoint at that size
+    /// commits. The statement it pays most to hide is the governance one.
+    ForgedWindow,
 }
 
 /// A deterministic log, mirror and witness over one in-memory tree.
@@ -326,6 +330,13 @@ impl Stack {
     #[must_use]
     pub const fn with_crooked_path(mut self) -> Self {
         self.discrepancy = Discrepancy::CrookedPath;
+        self
+    }
+
+    /// The mirror serves a window past the anchoring checkpoint with an entry substituted.
+    #[must_use]
+    pub const fn with_forged_window(mut self) -> Self {
+        self.discrepancy = Discrepancy::ForgedWindow;
         self
     }
 
@@ -579,7 +590,19 @@ impl Stack {
             return bad_request();
         };
         let entries: Vec<Value> = (from..to)
-            .map(|index| json!({ "entry_index": index, "envelope": self.envelope_at(index) }))
+            .map(|index| {
+                // A forged window keeps the indices the caller asked for — that check is a
+                // shape check and passes — and substitutes what sits at the first index past
+                // the anchoring checkpoint.
+                let envelope = if self.discrepancy == Discrepancy::ForgedWindow
+                    && index == self.anchoring_size()
+                {
+                    envelope(statement("ingestion", json!({ "record": "substituted" })))
+                } else {
+                    self.envelope_at(index)
+                };
+                json!({ "entry_index": index, "envelope": envelope })
+            })
             .collect();
         ok(&json!({
             "range": { "from_index": from, "to_index": to },

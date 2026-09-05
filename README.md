@@ -314,13 +314,42 @@ which is a different fact and the one L3 turns on — so a witness that has not 
 later checkpoint is shown it, and a governing version at L3 with no cosignature over it is a
 refusal rather than a weaker claim.
 
-Two conditions bound which later checkpoint is taken. It must introduce no manifest version
-between the two tree sizes, because a receipt's `governance.chain[]` hops open against the
-ANCHORING checkpoint's root and a manifest past that size could not be carried at all. And the
-claim type must take declared governance currency: receipt format §2.1 wants governance material
-covering through the later tree size while §4 fixes enumerated material at exactly
-`[0, tree_size(anchoring.checkpoint))`, and no range satisfies both. Where neither holds, the
-receipt says `continued_history: false`. `--no-continued-history` declines the block outright.
+Two conditions bound which later checkpoint is taken.
+
+**No manifest version anchored between the two tree sizes.** A receipt's `governance.chain[]`
+hops carry inclusion paths that open against the ANCHORING checkpoint's root, so the chain stops
+at that tree size by construction. A manifest anchored past it could not be carried at all, and a
+verifier reading only the carried chain would then authenticate the later checkpoint under a
+version the log had already superseded — while receipt format §2.1 asks for governance material
+covering *through* `later_checkpoint.tree_size`.
+
+That bound cannot be read off the anchoring prefix, whose manifests are all below that size by
+definition. It is derived from the log: the entries up to the newest published series-usable
+member are enumerated at the mirror, and the smallest manifest entry index at or after the
+anchoring tree size is the ceiling. The enumeration is **authenticated against the checkpoint at
+that tree size** before a single manifest index is read out of it — the leaves are recomputed and
+required to be the tree it commits, because a range response that has merely been parsed and
+index-checked is a shape and not evidence, and the statement it would pay a mirror most to
+substitute is exactly the governance one that bounds the continuation. The prefix that is finally
+carried is authenticated a second time against `later_checkpoint` itself, which the receipt
+carries and whose log signature `verify` checks; those same bytes, and no refetch, are what a
+witness is shown when it has to be asked for a cosignature.
+
+With the ceiling in force the version governing the later checkpoint is by construction the one
+governing the anchoring checkpoint, so its keys are already listed in `keys.log[]` and
+`keys.witness[]`. The client checks that rather than assuming it, and judges the cosignatures
+against that version.
+
+**Declared governance currency.** Receipt format §2.1 wants governance material covering through
+the later tree size while §4 fixes enumerated material at exactly
+`[0, tree_size(anchoring.checkpoint))`, and no range satisfies both, so an enumerated claim type
+never takes a block.
+
+Where neither condition holds — including where a manifest sits exactly at the anchoring size,
+which empties the window — the receipt says `continued_history: false`. That is an omission and
+not a failure; only a proof that does not verify, an enumeration that does not recompute a
+published root, or an L3 version with no cosignature over the later state stops the run.
+`--no-continued-history` declines the block outright.
 
 ## Network behaviour
 

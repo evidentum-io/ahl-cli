@@ -353,15 +353,30 @@ fn continued_history<F: Fetcher>(
         .ok_or_else(|| CliError::EvidenceMissing("the checkpoint has no tree size".to_owned()))?;
     let published = producer::series_usable(fetcher, &endpoints.mirror)?;
     let tree_size = |member: &Value| member.get("tree_size").and_then(Value::as_u64);
-    let Some(horizon) = published.iter().rev().find_map(tree_size).filter(|newest| *newest > size)
+    let Some(furthest) =
+        published.iter().rev().find(|member| tree_size(member).is_some_and(|at| at > size))
     else {
         return Ok(None);
     };
+    let horizon = tree_size(furthest).ok_or_else(|| {
+        CliError::EvidenceMissing("the newest published checkpoint has no tree size".to_owned())
+    })?;
 
     // What the log did past the anchor, read from the log. Enumerated once and used twice: the
     // ceiling comes out of it, and so does the prefix a witness has to be shown to cosign the
     // later checkpoint.
+    //
+    // And AUTHENTICATED before either use. `enumerate` parses the answer and checks that the
+    // indices are the ones asked for; that is a shape check, not evidence. A mirror willing to
+    // answer with a window that quietly substitutes the intervening manifest would defeat the
+    // ceiling entirely — the very statement that bounds the continuation is the one it pays to
+    // hide — so the leaves are recomputed and required to be the tree this checkpoint commits.
     let entries = producer::enumerate(fetcher, &endpoints.mirror, horizon, horizon)?.entries;
+    producer::authenticate_prefix(
+        furthest,
+        &entries,
+        &format!("the entries the mirror enumerated for [0, {horizon})"),
+    )?;
     let published_governance = producer::Governance::read(&entries);
     let ceiling = published_governance
         .manifest_indices()
@@ -1462,6 +1477,28 @@ mod tests {
         assert!(receipt.pointer("/anchoring/consistency_path").is_none());
         assert!(receipt.pointer("/anchoring/later_witnesses").is_none());
         assert_eq!(receipt.pointer("/claim/assurance/continued_history"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn a_window_that_does_not_recompute_the_published_root_grounds_no_continuation() {
+        // The mirror answers the [0, 6) range with the manifest at entry 4 substituted, keeping
+        // the indices the request asked for. Left unauthenticated that hides the very statement
+        // the ceiling turns on, and a continuation past a superseded governance version would
+        // be issued. The window is bound to the root the published checkpoint commits instead.
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(manifest_at(4), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2))
+            .with_forged_window();
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect_err("the window is not the tree the checkpoint commits");
+
+        let text = error.to_string();
+        assert!(text.contains("the mirror enumerated for [0, 6)"), "{text}");
+        assert!(text.contains("describes a tree this material is not"), "{text}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
     }
 
     #[test]
