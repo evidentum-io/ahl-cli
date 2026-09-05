@@ -1520,6 +1520,37 @@ mod tests {
     }
 
     #[test]
+    fn a_later_checkpoint_the_authenticated_window_does_not_recompute_stops_the_run() {
+        // The manifest at entry 5 puts the ceiling below the newest published member, so the
+        // checkpoint the receipt would CARRY is the one over [0, 5) and not the [0, 6) one the
+        // window was enumerated under. The mirror publishes that carried member with a root its
+        // own tree does not commit, and keeps the newest member and the window honest — so
+        // binding the window once, to the horizon, passes and proves nothing about what the
+        // receipt would carry. A reader of the receipt sees only `later_checkpoint`, whose log
+        // signature it checks; issuing on a root no enumerated prefix opens would hand it a
+        // continuation resting on a tree that never existed.
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(manifest_at(5), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2))
+            .with_forged_later_root();
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect_err("the carried checkpoint is not the tree the window is");
+
+        let text = error.to_string();
+        // The window is bound to the CARRIED checkpoint, and the failure names that slice —
+        // not the [0, 6) horizon the first binding covered, and not the consistency proof,
+        // which is asked for only after this holds.
+        assert!(text.contains("the mirror enumerated for [0, 5)"), "{text}");
+        assert!(text.contains("describes a tree this material is not"), "{text}");
+        assert!(matches!(error, CliError::EvidenceMissing(_)), "{error}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert_eq!(error.outcome().exit_code(), 3);
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
     fn a_manifest_below_the_anchoring_size_leaves_the_later_checkpoint_eligible() {
         // The same corpus with the manifest one entry earlier, at 3. It is inside the anchoring
         // checkpoint's prefix, so the chain carries it and it governs BOTH checkpoints — which
