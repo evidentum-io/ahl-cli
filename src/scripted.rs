@@ -509,6 +509,7 @@ impl Stack {
         let anchoring = self.anchoring_size();
         let mut members = vec![
             (self.checkpoint_at(anchoring), "series_usable"),
+            (self.checkpoint_at(anchoring.saturating_sub(1)), "series_usable"),
             (self.checkpoint_at(anchoring.saturating_sub(2)), "authenticated"),
         ];
         if self.continuation.trailing() > 0 {
@@ -547,7 +548,9 @@ impl Stack {
 
     /// The cosigned history the witness publishes for this log.
     fn history_answer(&self) -> Vec<Value> {
-        let mut held = vec![self.checkpoint_at(self.anchoring_size())];
+        // Everything the witness has been shown so far, which is the series up to but NOT
+        // including the checkpoint a fresh run is about — that one it is about to be shown.
+        let mut held = vec![self.checkpoint_at(self.anchoring_size().saturating_sub(1))];
         if matches!(self.continuation, Continuation::Witnessed(_)) {
             held.push(self.checkpoint_at(self.size()));
         }

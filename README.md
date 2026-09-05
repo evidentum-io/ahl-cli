@@ -247,9 +247,18 @@ path computed in the wrong tree is not a path — and evaluates no claim-type ru
 walk and no other signature. Its output says so, and the receipt it wrote is not evidence of
 anything until `verify` has read it under a policy.
 
-It is idempotent: an entry a mirror already holds at a proven index is not submitted a second
-time. Retrieval is content-addressed, so that lookup cannot resolve to somebody else's entry,
-and a miss means "submit it" rather than "no such entry was ever anchored".
+It is idempotent, and idempotent in the strong sense: an entry a mirror already holds at a
+proven index is not submitted a second time, and a checkpoint a witness has already cosigned is
+not shown to it a second time — its published cosignature is read from the witness's own history
+instead. Retrieval is content-addressed, so the entry lookup cannot resolve to somebody else's
+entry, and a miss means "submit it" rather than "no such entry was ever anchored".
+
+An already-anchored entry is placed under the **earliest** series-usable checkpoint that commits
+everything the receipt is about, not under whatever is newest. The earliest is the log state
+that actually anchored the statement; a checkpoint published long afterwards commits it too but
+says nothing more about it, and anchoring there would make the same envelope yield a different
+receipt every time the log grows. What the growth since then is good for is `continued_history`
+below, which carries it as a proof rather than by quietly moving the anchor.
 
 ### Governance-key rotations
 

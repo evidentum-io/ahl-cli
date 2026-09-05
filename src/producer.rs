@@ -3284,8 +3284,13 @@ mod tests {
         // Only a series-usable member can ground a consistency answer, so an `authenticated`
         // one is not offered as a later checkpoint.
         let usable = series_usable(&stack, scripted::MIRROR).expect("the published series");
-        assert_eq!(usable.len(), 1);
+        assert_eq!(usable.len(), 2, "the `authenticated` member is not one of them");
         assert!(usable[0].get("state").is_none(), "a server label is never carried");
+        assert!(
+            usable[0].get("tree_size").and_then(Value::as_u64)
+                < usable[1].get("tree_size").and_then(Value::as_u64),
+            "ascending by tree size, whatever order the mirror listed them in"
+        );
 
         let refused = scripted::Canned::raw(503, "unavailable");
         let error = series_usable(&refused, scripted::MIRROR).expect_err("a refusal");

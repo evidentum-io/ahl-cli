@@ -209,11 +209,19 @@ fn submit<F: Fetcher>(
     let mut anchors: Vec<u64> = Vec::new();
     let mut cosignatures = Vec::new();
     for witness in &endpoints.witnesses {
-        // Exactly one submission per witness. A second one over the same checkpoint is a fresh
+        // A checkpoint is shown to a witness at most once, ever. A second submission is a fresh
         // cosignature over a record the witness already holds, and it refuses that as a
         // conflict — rightly, since replacing a published cosignature is not something a
-        // submitter gets to ask for. So the identity is asked for first, and the one submission
-        // names the first rotation this witness is entitled to attest.
+        // submitter gets to ask for. So its published history is read first, and a cosignature
+        // it already made is taken from there rather than asked for again.
+        let history = producer::cosigned_history(fetcher, witness, log_id)?;
+        if let Some(held) = producer::cosignature_over(&history, &position.checkpoint)? {
+            cosignatures.push(held);
+            continue;
+        }
+        // Which rotations this submission may name depends on who is answering: only a witness
+        // the OUTGOING version declared can attest a handover, and one told to record a
+        // rotation that is not its to attest refuses the submission saying so.
         let witness_id = producer::witness_identity(fetcher, witness)?;
         let named = anchored
             .iter()
@@ -523,7 +531,8 @@ pub fn run<F: Fetcher>(
     // to somebody else's entry, and absence is unavailability rather than a negative result.
     let (position, anchored_now) =
         if let Some(index) = producer::published_index(fetcher, &endpoints.mirror, &entry)? {
-            (publish_existing(fetcher, endpoints, index)?, false)
+            let covers = options.target_index.unwrap_or(0).max(index);
+            (publish_existing(fetcher, endpoints, index, covers)?, false)
         } else {
             let position = producer::anchor(fetcher, &endpoints.log, &envelope)?;
             producer::stage(fetcher, &endpoints.mirror, &envelope)?;
@@ -681,24 +690,36 @@ fn record_subject(options: &Options) -> CliResult<Option<(String, String)>> {
     }
 }
 
-/// The published position of an entry already anchored, taken from the mirror's newest
-/// checkpoint rather than from a fresh submission.
+/// The published position of an entry already anchored: the EARLIEST series-usable checkpoint
+/// the mirror publishes that commits everything the receipt is about, rather than a fresh
+/// submission.
+///
+/// `covers` is the highest entry index the receipt has to commit — the subject's, and for a
+/// `governance-state` claim the index it is about, which may be well past the subject.
+///
+/// Earliest and not newest, for two reasons. It is the log state that actually anchored the
+/// statement — a checkpoint published long afterwards commits it too, but says nothing more
+/// about it — and it makes issuance deterministic: under the newest, the same envelope yields a
+/// different receipt every time the log grows, for no gain. What the growth since then IS good
+/// for is `continued_history`, which carries it as a proof rather than by quietly moving the
+/// anchor (adaptor §8.3).
 fn publish_existing<F: Fetcher>(
     fetcher: &F,
     endpoints: &Endpoints,
     entry_index: u64,
+    covers: u64,
 ) -> CliResult<producer::LogPosition> {
-    let checkpoint = producer::newest_checkpoint(fetcher, &endpoints.mirror)?;
-    let size = checkpoint
-        .get("tree_size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| CliError::EvidenceMissing("the checkpoint has no tree size".to_owned()))?;
-    if entry_index >= size {
-        return Err(CliError::EvidenceMissing(format!(
-            "entry {entry_index} is not committed by the newest checkpoint the mirror publishes, \
-             whose tree size is {size}"
-        )));
-    }
+    let published = producer::series_usable(fetcher, &endpoints.mirror)?;
+    let checkpoint = published
+        .into_iter()
+        .find(|member| {
+            member.get("tree_size").and_then(Value::as_u64).is_some_and(|size| size > covers)
+        })
+        .ok_or_else(|| {
+            CliError::EvidenceMissing(format!(
+                "entry {covers} is committed by no series-usable checkpoint the mirror publishes"
+            ))
+        })?;
     let raw = producer::checkpoint_raw(&checkpoint)?;
     // The inclusion path is recomputed from the enumerated prefix during assembly; a path
     // carried here would be a second, unchecked copy of it.
@@ -1121,13 +1142,14 @@ mod tests {
         assert_eq!(issued.governance, "enumerated");
 
         let receipt = installed(dir.path());
-        assert_eq!(
-            receipt.pointer("/claim_material/checkpoint_C/tree_size"),
-            Some(&json!(stack.size()))
-        );
+        // Bounded at the receipt's OWN checkpoint, which for an already-anchored entry is the
+        // earliest series-usable member that commits it rather than whatever is newest.
+        let bound = receipt.pointer("/anchoring/checkpoint/tree_size").cloned();
+        assert_eq!(bound, Some(json!(5)));
+        assert_eq!(receipt.pointer("/claim_material/checkpoint_C/tree_size"), bound.as_ref());
         assert_eq!(
             receipt.pointer("/claim_material/competing/corpus_range/range/to_index"),
-            Some(&json!(stack.size()))
+            bound.as_ref()
         );
     }
 
@@ -1502,23 +1524,46 @@ mod tests {
     }
 
     #[test]
-    fn an_entry_the_newest_published_checkpoint_does_not_commit_is_not_placed_under_it() {
+    fn an_already_anchored_entry_is_placed_under_the_earliest_checkpoint_that_commits_it() {
+        let usable = |checkpoint: Value| {
+            let mut member = checkpoint;
+            if let Some(object) = member.as_object_mut() {
+                object.insert("state".to_owned(), json!("series_usable"));
+            }
+            member
+        };
         let stack = scripted::Stack::new();
-        let short = scripted::Canned::json(200, &json!([stack.checkpoint_at(1)]));
-        let error = publish_existing(&short, &endpoints(), scripted::APPENDED)
-            .expect_err("the checkpoint commits one entry, the mirror named the sixth");
-        assert!(error.to_string().contains("is not committed by the newest checkpoint"), "{error}");
 
-        let nameless = scripted::Canned::json(200, &json!([ { "log_id": scripted::log_id() } ]));
-        let error = publish_existing(&nameless, &endpoints(), 0).expect_err("no tree size");
-        assert!(error.to_string().contains("has no tree size"), "{error}");
-
-        let position = publish_existing(&stack, &endpoints(), scripted::INGESTION)
-            .expect("a position under the newest member");
+        // Earliest, not newest: the checkpoint that anchored the statement, so the same
+        // envelope yields the same receipt however far the log has grown since.
+        let series = scripted::Canned::json(
+            200,
+            &json!([usable(stack.checkpoint_at(4)), usable(stack.checkpoint_at(2))]),
+        );
+        let position =
+            publish_existing(&series, &endpoints(), scripted::INGESTION, scripted::INGESTION)
+                .expect("a position under the earliest member that commits it");
         assert_eq!(position.entry_index, scripted::INGESTION);
+        assert_eq!(position.checkpoint.get("tree_size"), Some(&json!(2)));
         assert!(
             position.inclusion_path.is_empty(),
             "the path is recomputed during assembly rather than carried unchecked"
         );
+
+        let short = scripted::Canned::json(200, &json!([usable(stack.checkpoint_at(1))]));
+        let error = publish_existing(&short, &endpoints(), scripted::APPENDED, scripted::APPENDED)
+            .expect_err("the checkpoint commits one entry, the mirror named the sixth");
+        assert!(error.to_string().contains("no series-usable checkpoint"), "{error}");
+
+        // A member the mirror publishes but does not call series-usable grounds nothing: the
+        // route that would serve a proof over it refuses one.
+        let unusable = scripted::Canned::json(200, &json!([stack.checkpoint_at(4)]));
+        let error = publish_existing(&unusable, &endpoints(), 0, 0).expect_err("not series-usable");
+        assert!(error.to_string().contains("no series-usable checkpoint"), "{error}");
+
+        let nameless =
+            scripted::Canned::json(200, &json!([usable(json!({ "log_id": scripted::log_id() }))]));
+        let error = publish_existing(&nameless, &endpoints(), 0, 0).expect_err("no tree size");
+        assert!(error.to_string().contains("no series-usable checkpoint"), "{error}");
     }
 }

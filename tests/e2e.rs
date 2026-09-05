@@ -177,6 +177,49 @@ fn inner(profile: &Path) -> Result<Pilot, String> {
     Ok(Pilot { stack, keys, genesis, policy, profile_hash, key_files, work })
 }
 
+/// The continued history is a proof and not a label: the receipt carries a later checkpoint,
+/// the mirror's consistency path between the two roots, and a cosignature over the later state,
+/// and `verify` recomputed all three before reporting `verified`.
+fn assert_continued_history(replay: &pilot::Replay) {
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(replay.get("statement-anchored-continued-history")).expect("the receipt"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        receipt["claim"]["assurance"]["continued_history"],
+        serde_json::json!(true),
+        "the pilot's mirror serves the §8.3 interface, so the assertion is available"
+    );
+    let anchored_at = receipt["anchoring"]["checkpoint"]["tree_size"].as_u64().expect("a size");
+    let later_at = receipt["anchoring"]["later_checkpoint"]["tree_size"].as_u64().expect("a size");
+    assert!(
+        later_at > anchored_at,
+        "a later checkpoint at tree size {later_at} is not later than {anchored_at}"
+    );
+    assert!(
+        !receipt["anchoring"]["consistency_path"].as_array().expect("a path").is_empty(),
+        "a consistency proof between two different tree sizes is not the empty path"
+    );
+    assert!(
+        !receipt["anchoring"]["later_witnesses"].as_array().expect("an array").is_empty(),
+        "at L3 a continued history rests on a witness having seen the later state"
+    );
+}
+
+/// The rotation proof carries the anchor the MIRROR served for it — the earliest checkpoint past
+/// the rotating manifest — and not the receipt's own anchoring checkpoint.
+fn assert_rotation_anchor(rotated: &serde_json::Value) {
+    let rotation_at = rotated["governance"]["rotation_proofs"][0]["checkpoint"]["tree_size"]
+        .as_u64()
+        .expect("a size");
+    let anchoring_at = rotated["anchoring"]["checkpoint"]["tree_size"].as_u64().expect("a size");
+    assert_eq!(rotation_at, 6, "the earliest checkpoint the rotating manifest at entry 5 is in");
+    assert!(
+        rotation_at < anchoring_at,
+        "the element carries the served anchor, not the receipt's own checkpoint"
+    );
+}
+
 /// The negative twins, each expected to fail for the reason the corpus names.
 fn negatives(pilot: &Pilot, replay: &pilot::Replay) -> Vec<String> {
     let mut failures = Vec::new();
@@ -280,6 +323,7 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         "disposition-effective",
         "propagation-complete",
         "governance-state",
+        "statement-anchored-continued-history",
     ];
     let mut failures = Vec::new();
     for name in positives {
@@ -345,6 +389,9 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         serde_json::json!(scenario::WITNESS_2),
         "assurance after the rotation rests on the incoming witness"
     );
+
+    assert_continued_history(&replay);
+    assert_rotation_anchor(&rotated);
 
     failures.extend(negatives(&pilot, &replay));
 
