@@ -177,6 +177,70 @@ fn inner(profile: &Path) -> Result<Pilot, String> {
     Ok(Pilot { stack, keys, genesis, policy, profile_hash, key_files, work })
 }
 
+/// The continued history is a proof and not a label: the receipt carries a later checkpoint,
+/// the mirror's consistency path between the two roots, and a cosignature over the later state,
+/// and `verify` recomputed all three before reporting `verified`.
+fn assert_continued_history(replay: &pilot::Replay) {
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(replay.get(name)).expect("the receipt"))
+            .expect("JSON")
+    };
+    let sizes = |receipt: &serde_json::Value| -> (u64, u64) {
+        assert_eq!(
+            receipt["claim"]["assurance"]["continued_history"],
+            serde_json::json!(true),
+            "the pilot's mirror serves the §8.3 interface, so the assertion is available"
+        );
+        assert!(
+            !receipt["anchoring"]["consistency_path"].as_array().expect("a path").is_empty(),
+            "a consistency proof between two different tree sizes is not the empty path"
+        );
+        assert!(
+            !receipt["anchoring"]["later_witnesses"].as_array().expect("an array").is_empty(),
+            "at L3 a continued history rests on a witness having seen the later state"
+        );
+        (
+            receipt["anchoring"]["checkpoint"]["tree_size"].as_u64().expect("a size"),
+            receipt["anchoring"]["later_checkpoint"]["tree_size"].as_u64().expect("a size"),
+        )
+    };
+
+    // Bounded: the `key` statement at entry 1 is anchored at tree size 2, and the manifest
+    // version at entry 5 is anchored between that and the head. The later checkpoint carried is
+    // the newest that manifest does NOT govern — past it the receipt's chain, which stops at
+    // its own anchoring root, would not carry the version the checkpoint resolves under.
+    let (anchored_at, later_at) = sizes(&read("statement-anchored-continued-history"));
+    assert_eq!(anchored_at, 2, "the earliest series-usable checkpoint committing entry 1");
+    assert_eq!(
+        later_at, 5,
+        "the manifest version at entry 5 bounds the continuation; a later checkpoint past it \
+         would be authenticated under a version this receipt does not carry"
+    );
+
+    // Unbounded: the ingestion at entry 6 is anchored above the last manifest version, so the
+    // newest series-usable member the mirror publishes is carried.
+    let (anchored_at, later_at) = sizes(&read("statement-anchored-continued-history-unbounded"));
+    assert!(anchored_at > 5, "anchored above the last manifest version, at {anchored_at}");
+    assert!(
+        later_at > anchored_at,
+        "a later checkpoint at tree size {later_at} is not later than {anchored_at}"
+    );
+}
+
+/// The rotation proof carries the anchor the MIRROR served for it — the earliest checkpoint past
+/// the rotating manifest — and not the receipt's own anchoring checkpoint.
+fn assert_rotation_anchor(rotated: &serde_json::Value) {
+    let rotation_at = rotated["governance"]["rotation_proofs"][0]["checkpoint"]["tree_size"]
+        .as_u64()
+        .expect("a size");
+    let anchoring_at = rotated["anchoring"]["checkpoint"]["tree_size"].as_u64().expect("a size");
+    assert_eq!(rotation_at, 6, "the earliest checkpoint the rotating manifest at entry 5 is in");
+    assert!(
+        rotation_at < anchoring_at,
+        "the element carries the served anchor, not the receipt's own checkpoint"
+    );
+}
+
 /// The negative twins, each expected to fail for the reason the corpus names.
 fn negatives(pilot: &Pilot, replay: &pilot::Replay) -> Vec<String> {
     let mut failures = Vec::new();
@@ -280,6 +344,8 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         "disposition-effective",
         "propagation-complete",
         "governance-state",
+        "statement-anchored-continued-history",
+        "statement-anchored-continued-history-unbounded",
     ];
     let mut failures = Vec::new();
     for name in positives {
@@ -345,6 +411,9 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
         serde_json::json!(scenario::WITNESS_2),
         "assurance after the rotation rests on the incoming witness"
     );
+
+    assert_continued_history(&replay);
+    assert_rotation_anchor(&rotated);
 
     failures.extend(negatives(&pilot, &replay));
 

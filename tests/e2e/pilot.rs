@@ -242,7 +242,7 @@ pub fn replay(pilot: &crate::Pilot) -> Replay {
     let p2 = key_files.get("producer-2").expect("the second producer seed");
     let issue = Issue::new(policy, stack, work);
     let mut receipts: Vec<(String, PathBuf)> = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
+    let skipped: Vec<(String, String)> = Vec::new();
 
     let ingestion = |record: &Record, batch: &str, manifest: &str| {
         scenario::payload(
@@ -676,12 +676,26 @@ pub fn replay(pilot: &crate::Pilot) -> Replay {
         issue.must("16-bad-signature", &bad_path, "statement-anchored", &[]),
     ));
 
-    skipped.push((
+    // --- two continued histories, over entries the log has long since grown past -----
+    // `issue` places an already-anchored entry under the EARLIEST series-usable checkpoint that
+    // commits it, so a re-issued statement is grounded where it actually was and the growth
+    // since is carried as `continued_history` — a later checkpoint, the mirror's consistency
+    // proof between the two, and a cosignature over the later state.
+    //
+    // The `key` statement at entry 1 is anchored at tree size 2, and the manifest version at
+    // entry 5 is anchored between that and the head of the log. The later checkpoint carried is
+    // therefore BOUNDED at tree size 5: past it the governing version is one this receipt's
+    // chain stops below and could not carry.
+    receipts.push((
         "statement-anchored-continued-history".to_owned(),
-        "the published `atl-server` HTTP surface serves no consistency proof (adaptor §8.3 \
-         qualification 2), and `issue` does not fabricate one from a mirror's answer, so \
-         `continued_history` is never raised in this pilot"
-            .to_owned(),
+        issue.must("17-continued-history", &key_envelope, "statement-anchored", &[]),
+    ));
+
+    // The ingestion at entry 6 is anchored above the last manifest version, so nothing bounds
+    // it and the newest series-usable checkpoint the mirror publishes is carried.
+    receipts.push((
+        "statement-anchored-continued-history-unbounded".to_owned(),
+        issue.must("18-continued-history-head", &c_envelope, "statement-anchored", &[]),
     ));
 
     Replay { receipts, skipped, reports: issue.reports.take() }

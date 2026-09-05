@@ -247,13 +247,109 @@ path computed in the wrong tree is not a path — and evaluates no claim-type ru
 walk and no other signature. Its output says so, and the receipt it wrote is not evidence of
 anything until `verify` has read it under a policy.
 
-It is idempotent: an entry a mirror already holds at a proven index is not submitted a second
-time. Retrieval is content-addressed, so that lookup cannot resolve to somebody else's entry,
-and a miss means "submit it" rather than "no such entry was ever anchored".
+It is idempotent, and idempotent in the strong sense: an entry a mirror already holds at a
+proven index is not submitted a second time, and a checkpoint a witness has already cosigned is
+not shown to it a second time — its published cosignature is read from the witness's own history
+instead. Retrieval is content-addressed, so the entry lookup cannot resolve to somebody else's
+entry, and a miss means "submit it" rather than "no such entry was ever anchored".
+
+An already-anchored entry is placed under the **earliest** series-usable checkpoint that commits
+everything the receipt is about, not under whatever is newest. The earliest is the log state
+that actually anchored the statement; a checkpoint published long afterwards commits it too but
+says nothing more about it, and anchoring there would make the same envelope yield a different
+receipt every time the log grows. What the growth since then is good for is `continued_history`
+below, which carries it as a proof rather than by quietly moving the anchor.
+
+### Governance-key rotations
+
+Where the carried governance chain rotates the log or the witness key set — I-D §7.1 makes a
+change to either set alone a rotation — the receipt owes one `governance.rotation_proofs[]`
+element per rotation, in ascending `manifest_entry_index` order, and `issue` assembles none of
+it from its own material. Each element is composed from two independently served halves:
+
+* the mirror's `GET /v1/rotation-proofs/{manifest_entry_index}`, which supplies the
+  rotation-anchoring `checkpoint` and the `inclusion_path` opening the rotating manifest to
+  **that** checkpoint's root, with `witnesses` empty because a mirror does not cosign;
+* each configured witness's `GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`,
+  which supplies the cosignatures over the same anchor.
+
+The two are joined only after their checkpoints are compared member for member. A cosignature is
+over one checkpoint, so halves naming different anchors are not joined into something that looks
+whole — the run is refused instead. A rotation for which no anchor is served is likewise a
+refusal naming the index and the route (exit `3`), never a receipt issued without the element:
+§7.1 makes it material the receipt MUST carry, and its absence is not a smaller claim.
+
+The outgoing keys are listed in `keys.log[]` and `keys.witness[]` bound to the **predecessor**
+version, which is §7.1's transition exception. One physical key therefore appears twice under
+two bindings wherever a rotation left it in place, which is legitimate and is what the verifier
+expects.
+
+Where a checkpoint `issue` submits is itself rotation-anchoring material — its `tree_size` is
+past the rotating manifest's entry index and it is signed by a key of the outgoing set — the
+submission names the rotation with `rotation_for`. Naming narrows nothing: both servers discover
+every rotation a checkpoint qualifies for either way. What it buys is the report — a named
+rotation the checkpoint does not in fact anchor comes back as a refusal saying why — and
+`issue`'s output carries the `rotation_anchors` the servers answered with beside the rotations
+the receipt itself proves.
 
 Plain HTTP needs `--allow-insecure-loopback`, and even then reaches a loopback peer only. The
 transport's resolved-peer rule is what stops such a request from leaving the machine; the flag
 exists so that making one is never an accident.
+
+### Continued history
+
+Where the mirror publishes a series-usable checkpoint later than the one a receipt is anchored
+under, `issue` carries the continuation rather than leaving `continued_history` permanently
+false. Adaptor §8.3 qualification 2 says a deployment MUST supply consistency proofs "through
+the interface of §10.3 or an equivalent published endpoint"; the mirror's
+`GET /v1/consistency?from=<size>&to=<size>` is that endpoint, so the block is composed from what
+the deployment published rather than manufactured here — and `verify` recomputes the proof
+against the two roots whoever served it.
+
+Three members travel together or not at all: `anchoring.later_checkpoint` (the six signed
+members, with the mirror's own state annotation dropped), `anchoring.consistency_path` in the
+order it was served, and `anchoring.later_witnesses[]`. The path establishes that the later
+checkpoint EXTENDS this one; only a cosignature establishes that a witness saw the later state,
+which is a different fact and the one L3 turns on — so a witness that has not been shown the
+later checkpoint is shown it, and a governing version at L3 with no cosignature over it is a
+refusal rather than a weaker claim.
+
+Two conditions bound which later checkpoint is taken.
+
+**No manifest version anchored between the two tree sizes.** A receipt's `governance.chain[]`
+hops carry inclusion paths that open against the ANCHORING checkpoint's root, so the chain stops
+at that tree size by construction. A manifest anchored past it could not be carried at all, and a
+verifier reading only the carried chain would then authenticate the later checkpoint under a
+version the log had already superseded — while receipt format §2.1 asks for governance material
+covering *through* `later_checkpoint.tree_size`.
+
+That bound cannot be read off the anchoring prefix, whose manifests are all below that size by
+definition. It is derived from the log: the entries up to the newest published series-usable
+member are enumerated at the mirror, and the smallest manifest entry index at or after the
+anchoring tree size is the ceiling. The enumeration is **authenticated against the checkpoint at
+that tree size** before a single manifest index is read out of it — the leaves are recomputed and
+required to be the tree it commits, because a range response that has merely been parsed and
+index-checked is a shape and not evidence, and the statement it would pay a mirror most to
+substitute is exactly the governance one that bounds the continuation. The prefix that is finally
+carried is authenticated a second time against `later_checkpoint` itself, which the receipt
+carries and whose log signature `verify` checks; those same bytes, and no refetch, are what a
+witness is shown when it has to be asked for a cosignature.
+
+With the ceiling in force the version governing the later checkpoint is by construction the one
+governing the anchoring checkpoint, so its keys are already listed in `keys.log[]` and
+`keys.witness[]`. The client checks that rather than assuming it, and judges the cosignatures
+against that version.
+
+**Declared governance currency.** Receipt format §2.1 wants governance material covering through
+the later tree size while §4 fixes enumerated material at exactly
+`[0, tree_size(anchoring.checkpoint))`, and no range satisfies both, so an enumerated claim type
+never takes a block.
+
+Where neither condition holds — including where a manifest sits exactly at the anchoring size,
+which empties the window — the receipt says `continued_history: false`. That is an omission and
+not a failure; only a proof that does not verify, an enumeration that does not recompute a
+published root, or an L3 version with no cosignature over the later state stops the run.
+`--no-continued-history` declines the block outright.
 
 ## Network behaviour
 

@@ -165,6 +165,9 @@ pub enum Command {
         /// Permit plain HTTP to a loopback peer. Refused for any other peer.
         #[arg(long)]
         allow_insecure_loopback: bool,
+        /// Assemble no continued-history block, whatever later checkpoint the mirror publishes.
+        #[arg(long)]
+        no_continued_history: bool,
         /// Install the receipt here, atomically and without clobbering.
         #[arg(long)]
         out: PathBuf,
@@ -424,6 +427,7 @@ fn run_issue(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
         target_index,
         note,
         allow_insecure_loopback,
+        no_continued_history,
         out,
         force,
     } = &cli.command
@@ -465,6 +469,7 @@ fn run_issue(cli: &Cli, stdout: &mut dyn Write) -> CliResult<Outcome> {
             target_index: *target_index,
             note: note.clone(),
             allow_insecure_loopback: *allow_insecure_loopback,
+            no_continued_history: *no_continued_history,
             out: out.clone(),
             force: *force,
         },
