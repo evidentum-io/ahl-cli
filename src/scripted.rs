@@ -210,6 +210,12 @@ pub fn tree_material() -> Value {
     })
 }
 
+/// The entry a discrepancy puts where an honest one belongs.
+#[must_use]
+fn substituted() -> Value {
+    envelope(statement("ingestion", json!({ "record": "substituted" })))
+}
+
 /// The cosigned answer the scripted witness returns.
 #[must_use]
 pub fn cosignature() -> Value {
@@ -273,6 +279,11 @@ pub enum Discrepancy {
     /// substituted, so the window does not recompute the root the checkpoint at that size
     /// commits. The statement it pays most to hide is the governance one.
     ForgedWindow,
+    /// The mirror publishes one more series-usable member, a size below the newest, whose
+    /// `root_hash` is not the root the log's own tree at that size commits. The newest member
+    /// and every window the mirror enumerates stay honest, so a window bound only to the newest
+    /// checkpoint passes and this member is still not the tree that window is.
+    ForgedLaterRoot,
 }
 
 /// A deterministic log, mirror and witness over one in-memory tree.
@@ -337,6 +348,13 @@ impl Stack {
     #[must_use]
     pub const fn with_forged_window(mut self) -> Self {
         self.discrepancy = Discrepancy::ForgedWindow;
+        self
+    }
+
+    /// The mirror publishes an intermediate series member with a root its tree does not commit.
+    #[must_use]
+    pub const fn with_forged_later_root(mut self) -> Self {
+        self.discrepancy = Discrepancy::ForgedLaterRoot;
         self
     }
 
@@ -526,6 +544,9 @@ impl Stack {
         if self.continuation.trailing() > 0 {
             members.insert(0, (self.checkpoint_at(self.size()), "series_usable"));
         }
+        if self.discrepancy == Discrepancy::ForgedLaterRoot {
+            members.push((self.forged_member(), "series_usable"));
+        }
         members
             .into_iter()
             .map(|(mut member, state)| {
@@ -535,6 +556,25 @@ impl Stack {
                 member
             })
             .collect()
+    }
+
+    /// A series member one size below the newest, carrying the root of a tree with its last
+    /// leaf substituted rather than the root the log's own tree at that size commits.
+    ///
+    /// Everything else about that member is what the mirror would publish, and every other
+    /// answer stays honest, so the deployment reads as one that publishes a series it cannot
+    /// stand behind at exactly one size.
+    fn forged_member(&self) -> Value {
+        let tree_size = self.size().saturating_sub(1);
+        let mut leaves = self.leaf_bytes(tree_size);
+        if let Some(last) = leaves.last_mut() {
+            *last = log_leaf_bytes_for(&substituted(), ATL_PROFILE).expect("a scripted envelope");
+        }
+        let mut member = self.checkpoint_at(tree_size);
+        if let Some(object) = member.as_object_mut() {
+            object.insert("root_hash".to_owned(), json!(hash_hex(&tree_root(&leaves))));
+        }
+        member
     }
 
     /// The consistency proof the mirror serves between two tree sizes.
@@ -597,7 +637,7 @@ impl Stack {
                 let envelope = if self.discrepancy == Discrepancy::ForgedWindow
                     && index == self.anchoring_size()
                 {
-                    envelope(statement("ingestion", json!({ "record": "substituted" })))
+                    substituted()
                 } else {
                     self.envelope_at(index)
                 };
