@@ -194,71 +194,44 @@ fn submit<F: Fetcher>(
     log_id: &str,
     position: &producer::LogPosition,
     entries: &[Value],
-    anchored: &[u64],
+    anchored: &[producer::AnchoredRotation],
 ) -> CliResult<Submitted> {
     let mut anchors: Vec<u64> = Vec::new();
     let mut cosignatures = Vec::new();
     for witness in &endpoints.witnesses {
-        // One submission per rotation this checkpoint anchors, so each is named and each is
-        // reported; the cosignature they all return is the same one, over the same checkpoint.
-        let mut answer = None;
-        for named in named_submissions(anchored) {
-            let served = producer::cosign(fetcher, witness, log_id, position, entries, named)?;
-            record(&mut anchors, producer::rotation_anchors(&served));
-            if answer.is_none() {
-                answer = Some(served);
-            }
-        }
-        if let Some(served) = answer {
-            cosignatures.push(producer::cosignature_entry(&served)?);
+        // The ordinary submission first: it is what fetches the anchoring cosignature, and it
+        // is also what says which identity this endpoint answers as. A submission may name a
+        // rotation only to a witness the OUTGOING version declared, so the identity has to be
+        // in hand before any rotation is named.
+        let served = producer::cosign(fetcher, witness, log_id, position, entries, None)?;
+        record(&mut anchors, producer::rotation_anchors(&served));
+        let witness_id =
+            served.get("witness_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        cosignatures.push(producer::cosignature_entry(&served)?);
+        for rotation in anchored.iter().filter(|entry| entry.attesting.contains(&witness_id)) {
+            let named = producer::cosign(
+                fetcher,
+                witness,
+                log_id,
+                position,
+                entries,
+                Some(rotation.manifest_entry_index),
+            )?;
+            record(&mut anchors, producer::rotation_anchors(&named));
         }
     }
     // The mirror's ordinary ingest happened before the prefix was enumerated, which is the only
     // place the rotations are known, so the naming is a second offer of the same checkpoint.
-    for index in anchored {
+    for rotation in anchored {
         let reported = producer::offer_rotation_anchor(
             fetcher,
             &endpoints.mirror,
             &position.checkpoint,
-            *index,
+            rotation.manifest_entry_index,
         )?;
         record(&mut anchors, reported);
     }
     Ok(Submitted { cosignatures, anchors })
-}
-
-/// The rotations this run's checkpoint is rotation-anchoring material for, ascending.
-///
-/// # Errors
-///
-/// [`CliError::EvidenceMissing`] where the prefix carries no manifest at a rotation's
-/// predecessor index.
-fn anchored_rotations(
-    governance: &producer::Governance<'_>,
-    rotations: &[producer::Rotation],
-    checkpoint: &Value,
-) -> CliResult<Vec<u64>> {
-    let mut anchored = Vec::new();
-    for rotation in rotations {
-        let outgoing = governance.manifest_at(rotation.outgoing_entry_index)?;
-        if rotation.anchored_by(checkpoint, outgoing) {
-            anchored.push(rotation.manifest_entry_index);
-        }
-    }
-    Ok(anchored)
-}
-
-/// The `rotation_for` values one witness submission run names.
-///
-/// Where the checkpoint anchors nothing, exactly one unnamed submission is made — the ordinary
-/// one that fetches the anchoring cosignature. Where it anchors rotations, one submission per
-/// rotation, so every one of them is named and reported rather than silently discovered.
-fn named_submissions(anchored: &[u64]) -> Vec<Option<u64>> {
-    if anchored.is_empty() {
-        vec![None]
-    } else {
-        anchored.iter().map(|index| Some(*index)).collect()
-    }
 }
 
 /// Fetch and join one `governance.rotation_proofs[]` element per rotation the chain carries.
@@ -432,7 +405,7 @@ pub fn run<F: Fetcher>(
     let governance = producer::Governance::read(&prefix.entries);
     let (_, active) = governance.active_for_checkpoint(size)?;
     let rotations = governance.rotations(&governance.carried_indices(size));
-    let anchored = anchored_rotations(&governance, &rotations, &position.checkpoint)?;
+    let anchored = governance.anchored_rotations(&rotations, &position.checkpoint)?;
 
     let submitted = submit(fetcher, endpoints, &log_id, &position, &prefix.entries, &anchored)?;
     let carried = producer::accounted_cosignatures(submitted.cosignatures, active);
@@ -1209,6 +1182,36 @@ mod tests {
             .expect_err("the halves do not pair");
         assert!(error.to_string().contains("different rotation-anchoring checkpoints"), "{error}");
         assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
+    fn a_rotation_is_named_only_to_a_witness_the_outgoing_version_declared() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let third_witness = "witness-3";
+        let third_key = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let entries = vec![
+            scripted::genesis(),
+            scripted::envelope(scripted::manifest(
+                scripted::WITNESS_ID_2,
+                scripted::WITNESS_KEY_2,
+                scripted::LOG_KEY,
+            )),
+            scripted::envelope(scripted::manifest(third_witness, third_key, scripted::LOG_KEY)),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+        ];
+        let stack = scripted::Stack::over(entries, 3);
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect("both rotations are served, and only one of them is this witness's to name");
+
+        // Both rotations are discovered and reported: what a checkpoint anchors is a fact about
+        // the log rather than about which of them the submitter was entitled to name.
+        assert_eq!(issued.rotation_anchors, vec![1, 2]);
+        assert_eq!(issued.rotation_proofs, vec![1, 2]);
+        // The scripted witness answers as `witness-1`, which the version preceding the rotation
+        // at entry 2 does not declare; naming that one to it is refused, so it is not named.
+        let receipt = installed(dir.path());
+        let proofs = receipt.pointer("/governance/rotation_proofs").and_then(Value::as_array);
+        assert_eq!(proofs.map(Vec::len), Some(2));
     }
 
     #[test]

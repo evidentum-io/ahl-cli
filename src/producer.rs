@@ -1167,6 +1167,31 @@ impl<'a> Governance<'a> {
         self.manifest_indices().into_iter().filter(|index| *index < tree_size).collect()
     }
 
+    /// The rotations `checkpoint` is rotation-anchoring material for, ascending, each with the
+    /// witness identities that can attest it.
+    ///
+    /// # Errors
+    ///
+    /// [`CliError::EvidenceMissing`] where the prefix carries no manifest at a rotation's
+    /// predecessor index.
+    pub fn anchored_rotations(
+        &self,
+        rotations: &[Rotation],
+        checkpoint: &Value,
+    ) -> CliResult<Vec<AnchoredRotation>> {
+        let mut anchored = Vec::new();
+        for rotation in rotations {
+            let outgoing = self.manifest_at(rotation.outgoing_entry_index)?;
+            if rotation.anchored_by(checkpoint, outgoing) {
+                anchored.push(AnchoredRotation {
+                    manifest_entry_index: rotation.manifest_entry_index,
+                    attesting: declared_witnesses(outgoing).into_keys().collect(),
+                });
+            }
+        }
+        Ok(anchored)
+    }
+
     /// The manifest versions in the carried chain that rotate the log or witness key set.
     ///
     /// I-D §7.1 requires one `governance.rotation_proofs[]` element per such version, in
@@ -1246,6 +1271,20 @@ fn witness_key_set(manifest: &Value) -> BTreeSet<WitnessKeyObject> {
         }
     }
     set
+}
+
+/// A rotation this run's checkpoint anchors, and who can attest it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredRotation {
+    /// Entry index of the rotating manifest version.
+    pub manifest_entry_index: u64,
+    /// The witness identities the OUTGOING version declares.
+    ///
+    /// Only these can attest the handover (I-D §7.1), and a witness told to record a rotation
+    /// it is not one of refuses the submission saying so — rightly, because a cosignature by a
+    /// witness the retiring version never declared attests nothing about the retirement. A
+    /// submission therefore names a rotation only to a witness in this set.
+    pub attesting: BTreeSet<String>,
 }
 
 /// A governance-key rotation the carried chain contains.

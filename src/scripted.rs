@@ -503,7 +503,11 @@ impl Stack {
                 .unwrap_or_default(),
             };
         }
-        let Some(anchors) = self.named_anchors(request) else { return not_rotation_material() };
+        // A witness records a rotation only where the OUTGOING version declared it, so naming
+        // one it cannot attest is refused rather than filed (I-D §7.1).
+        let Some(anchors) = self.named_anchors(request, Some(WITNESS_ID)) else {
+            return not_rotation_material();
+        };
         let mut answer = cosignature();
         if let Some(object) = answer.as_object_mut() {
             object.insert("status".to_owned(), json!("cosigned"));
@@ -538,8 +542,11 @@ impl Stack {
     }
 
     /// What a submission naming a rotation is answered with: the discovered anchors, or `None`
-    /// where the name is not among them and the server refuses the submission.
-    fn named_anchors(&self, request: &Request) -> Option<Vec<u64>> {
+    /// where the server refuses the name.
+    ///
+    /// `cosigning_as` is the identity a witness answers under, and `None` for the mirror, which
+    /// holds no witness identity and applies no such rule.
+    fn named_anchors(&self, request: &Request, cosigning_as: Option<&str>) -> Option<Vec<u64>> {
         let body = request
             .body
             .as_ref()
@@ -547,10 +554,25 @@ impl Stack {
             .unwrap_or(Value::Null);
         let checkpoint = body.get("checkpoint").cloned().unwrap_or_else(|| self.checkpoint());
         let anchors = self.anchors_for(&checkpoint);
-        match body.get("rotation_for").and_then(Value::as_u64) {
-            Some(named) if !anchors.contains(&named) => None,
-            _ => Some(anchors),
+        let Some(named) = body.get("rotation_for").and_then(Value::as_u64) else {
+            return Some(anchors);
+        };
+        if !anchors.contains(&named) {
+            return None;
         }
+        if let Some(witness_id) = cosigning_as {
+            let governance = Governance::read(&self.entries);
+            let attests = governance.snapshot_at(named).is_ok_and(|(_, outgoing)| {
+                outgoing
+                    .pointer("/witnesses/0/witness_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|declared| declared == witness_id)
+            });
+            if !attests {
+                return None;
+            }
+        }
+        Some(anchors)
     }
 
     /// The rotation-anchoring checkpoint the scripted deployment holds for a rotation: the
@@ -648,7 +670,7 @@ impl Stack {
         }
         if mirror == "/v1/checkpoints" {
             return if request.method == Method::Post {
-                self.named_anchors(request).map_or_else(not_rotation_material, |anchors| {
+                self.named_anchors(request, None).map_or_else(not_rotation_material, |anchors| {
                     created(&json!({ "series_member": true, "rotation_anchors": anchors }))
                 })
             } else {
