@@ -251,6 +251,38 @@ It is idempotent: an entry a mirror already holds at a proven index is not submi
 time. Retrieval is content-addressed, so that lookup cannot resolve to somebody else's entry,
 and a miss means "submit it" rather than "no such entry was ever anchored".
 
+### Governance-key rotations
+
+Where the carried governance chain rotates the log or the witness key set — I-D §7.1 makes a
+change to either set alone a rotation — the receipt owes one `governance.rotation_proofs[]`
+element per rotation, in ascending `manifest_entry_index` order, and `issue` assembles none of
+it from its own material. Each element is composed from two independently served halves:
+
+* the mirror's `GET /v1/rotation-proofs/{manifest_entry_index}`, which supplies the
+  rotation-anchoring `checkpoint` and the `inclusion_path` opening the rotating manifest to
+  **that** checkpoint's root, with `witnesses` empty because a mirror does not cosign;
+* each configured witness's `GET /v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}`,
+  which supplies the cosignatures over the same anchor.
+
+The two are joined only after their checkpoints are compared member for member. A cosignature is
+over one checkpoint, so halves naming different anchors are not joined into something that looks
+whole — the run is refused instead. A rotation for which no anchor is served is likewise a
+refusal naming the index and the route (exit `3`), never a receipt issued without the element:
+§7.1 makes it material the receipt MUST carry, and its absence is not a smaller claim.
+
+The outgoing keys are listed in `keys.log[]` and `keys.witness[]` bound to the **predecessor**
+version, which is §7.1's transition exception. One physical key therefore appears twice under
+two bindings wherever a rotation left it in place, which is legitimate and is what the verifier
+expects.
+
+Where a checkpoint `issue` submits is itself rotation-anchoring material — its `tree_size` is
+past the rotating manifest's entry index and it is signed by a key of the outgoing set — the
+submission names the rotation with `rotation_for`. Naming narrows nothing: both servers discover
+every rotation a checkpoint qualifies for either way. What it buys is the report — a named
+rotation the checkpoint does not in fact anchor comes back as a refusal saying why — and
+`issue`'s output carries the `rotation_anchors` the servers answered with beside the rotations
+the receipt itself proves.
+
 Plain HTTP needs `--allow-insecure-loopback`, and even then reaches a loopback peer only. The
 transport's resolved-peer rule is what stops such a request from leaving the machine; the flag
 exists so that making one is never an accident.

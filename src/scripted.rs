@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::checkpoint::ATL_PROFILE;
 use crate::net::{FetchFailure, Fetcher, Method, Request, Response};
+use crate::producer::{Governance, Rotation};
 
 /// Base URL the scripted log answers on.
 pub const LOG: &str = "https://log.example";
@@ -242,6 +243,12 @@ pub struct Stack {
     pub published: bool,
     /// Answer every cosignature request with a refusal.
     pub refusing_witness: bool,
+    /// Rotations neither the mirror nor the witness serves an anchor for, so a receipt that
+    /// needs one is refused rather than assembled without it.
+    pub unanchored: Vec<u64>,
+    /// The witness serves its rotation cosignatures over a checkpoint other than the one the
+    /// mirror's element carries, so the two halves do not pair.
+    pub rotation_mismatch: bool,
     /// What the log is set to contradict itself about.
     pub discrepancy: Discrepancy,
 }
@@ -261,6 +268,8 @@ impl Stack {
             subject_index: APPENDED,
             published: false,
             refusing_witness: false,
+            unanchored: Vec::new(),
+            rotation_mismatch: false,
             discrepancy: Discrepancy::None,
         }
     }
@@ -297,6 +306,20 @@ impl Stack {
     #[must_use]
     pub const fn with_disagreeing_index(mut self) -> Self {
         self.discrepancy = Discrepancy::MovedIndex;
+        self
+    }
+
+    /// Neither server holds a rotation-anchoring checkpoint for the rotation at `index`.
+    #[must_use]
+    pub fn without_anchor_for(mut self, index: u64) -> Self {
+        self.unanchored.push(index);
+        self
+    }
+
+    /// The witness cosigns a different checkpoint from the one the mirror's element carries.
+    #[must_use]
+    pub const fn with_rotation_checkpoint_mismatch(mut self) -> Self {
+        self.rotation_mismatch = true;
         self
     }
 
@@ -453,7 +476,7 @@ impl Stack {
         }))
     }
 
-    fn witness_answer(&self) -> Response {
+    fn witness_answer(&self, request: &Request) -> Response {
         if self.refusing_witness {
             return Response {
                 status: 409,
@@ -463,7 +486,112 @@ impl Stack {
                 .unwrap_or_default(),
             };
         }
-        created(&cosignature())
+        let Some(anchors) = self.named_anchors(request) else { return not_rotation_material() };
+        let mut answer = cosignature();
+        if let Some(object) = answer.as_object_mut() {
+            object.insert("status".to_owned(), json!("cosigned"));
+            object.insert("series_member".to_owned(), json!(true));
+            object.insert("rotation_anchors".to_owned(), json!(anchors));
+        }
+        created(&answer)
+    }
+
+    /// Every governance-key rotation the scripted corpus carries.
+    fn rotations(&self) -> Vec<Rotation> {
+        let governance = Governance::read(&self.entries);
+        let carried = governance.carried_indices(self.size());
+        governance.rotations(&carried)
+    }
+
+    /// The rotations a checkpoint is rotation-anchoring material for, ascending.
+    ///
+    /// The same two conditions the mirror and the witness apply: a `tree_size` greater than the
+    /// rotating manifest's entry index, and a signing key of the OUTGOING set.
+    fn anchors_for(&self, checkpoint: &Value) -> Vec<u64> {
+        let governance = Governance::read(&self.entries);
+        self.rotations()
+            .into_iter()
+            .filter(|rotation| {
+                governance
+                    .manifest_at(rotation.outgoing_entry_index)
+                    .is_ok_and(|outgoing| rotation.anchored_by(checkpoint, outgoing))
+            })
+            .map(|rotation| rotation.manifest_entry_index)
+            .collect()
+    }
+
+    /// What a submission naming a rotation is answered with: the discovered anchors, or `None`
+    /// where the name is not among them and the server refuses the submission.
+    fn named_anchors(&self, request: &Request) -> Option<Vec<u64>> {
+        let body = request
+            .body
+            .as_ref()
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+            .unwrap_or(Value::Null);
+        let checkpoint = body.get("checkpoint").cloned().unwrap_or_else(|| self.checkpoint());
+        let anchors = self.anchors_for(&checkpoint);
+        match body.get("rotation_for").and_then(Value::as_u64) {
+            Some(named) if !anchors.contains(&named) => None,
+            _ => Some(anchors),
+        }
+    }
+
+    /// The rotation-anchoring checkpoint the scripted deployment holds for a rotation: the
+    /// smallest tree size that commits the rotating manifest.
+    fn rotation_anchor(&self, index: u64) -> Option<Value> {
+        if self.unanchored.contains(&index)
+            || !self.rotations().iter().any(|rotation| rotation.manifest_entry_index == index)
+        {
+            return None;
+        }
+        let tree_size = index.checked_add(1)?;
+        (tree_size <= self.size()).then(|| self.checkpoint_at(tree_size))
+    }
+
+    /// The mirror's half of the element: three members, and `witnesses` empty because a mirror
+    /// does not cosign.
+    fn rotation_proof_answer(&self, index: u64) -> Response {
+        let Some(checkpoint) = self.rotation_anchor(index) else { return not_found() };
+        let Some(tree_size) = index.checked_add(1) else { return not_found() };
+        let at = usize::try_from(index).unwrap_or(usize::MAX);
+        let Ok(proof) = inclusion_proof(&self.leaf_bytes(tree_size), at) else {
+            return not_found();
+        };
+        ok(&json!({
+            "manifest_entry_index": index,
+            "checkpoint": checkpoint,
+            "inclusion_path": proof_path_hex(&proof),
+            "witnesses": [],
+        }))
+    }
+
+    /// The witness's half: the cosignatures it holds over that anchor, in the
+    /// `anchoring.witnesses[]` shape, alongside the checkpoint they are over.
+    fn rotation_cosignature_answer(&self, index: u64) -> Response {
+        let Some(checkpoint) = self.rotation_anchor(index) else { return not_found() };
+        // The rotation-anchoring checkpoint verifies under the OUTGOING state, so the witness
+        // that cosigned it is the one the version PRECEDING the rotating manifest declares.
+        let governance = Governance::read(&self.entries);
+        let Ok((_, outgoing)) = governance.snapshot_at(index) else { return not_found() };
+        let declared = outgoing.pointer("/witnesses/0");
+        let (Some(witness_id), Some(key_id)) = (
+            declared.and_then(|witness| witness.get("witness_id")).cloned(),
+            declared.and_then(|witness| witness.pointer("/keys/0/key_id")).cloned(),
+        ) else {
+            return not_found();
+        };
+        let served = if self.rotation_mismatch { self.checkpoint() } else { checkpoint };
+        ok(&json!({
+            "log_id": log_id(),
+            "manifest_entry_index": index,
+            "checkpoint": served,
+            "witnesses": [ {
+                "witness_id": witness_id,
+                "key_id": key_id,
+                "cosignature": "base64:cm90YXRpb24=",
+                "cosigned_at": TIME,
+            } ],
+        }))
     }
 
     fn answer(&self, request: &Request) -> Response {
@@ -496,10 +624,17 @@ impl Stack {
         }
         if mirror == "/v1/checkpoints" {
             return if request.method == Method::Post {
-                created(&json!({ "status": "ingested" }))
+                self.named_anchors(request).map_or_else(not_rotation_material, |anchors| {
+                    created(&json!({ "series_member": true, "rotation_anchors": anchors }))
+                })
             } else {
                 ok(&self.series())
             };
+        }
+        if let Some(index) = mirror.strip_prefix("/v1/rotation-proofs/") {
+            return index
+                .parse::<u64>()
+                .map_or_else(|_| bad_request(), |index| self.rotation_proof_answer(index));
         }
         if let Some(size) = mirror.strip_prefix("/v1/checkpoints/") {
             return size
@@ -510,7 +645,15 @@ impl Stack {
             return self.range_answer(request);
         }
         if witness.starts_with("/v1/logs/") && witness.ends_with("/witness") {
-            return self.witness_answer();
+            return self.witness_answer(request);
+        }
+        if let Some(rest) = witness.strip_prefix("/v1/logs/") {
+            if let Some((_, index)) = rest.split_once("/rotation-cosignatures/") {
+                return index.parse::<u64>().map_or_else(
+                    |_| bad_request(),
+                    |index| self.rotation_cosignature_answer(index),
+                );
+            }
         }
         not_found()
     }
@@ -581,4 +724,14 @@ fn not_found() -> Response {
 
 fn bad_request() -> Response {
     Response { status: 400, body: br#"{"error":"unusable request"}"#.to_vec() }
+}
+
+/// The refusal both servers answer a `rotation_for` naming a rotation the checkpoint does not
+/// in fact anchor with.
+fn not_rotation_material() -> Response {
+    Response {
+        status: 400,
+        body: br#"{"error":"the checkpoint is not rotation-anchoring material for that manifest entry index"}"#
+            .to_vec(),
+    }
 }

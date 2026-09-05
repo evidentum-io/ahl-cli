@@ -95,6 +95,17 @@ pub struct Issued {
     pub governance: &'static str,
     /// Witness identities whose cosignatures the receipt carries.
     pub witnesses: Vec<String>,
+    /// The rotating-manifest entry indexes the mirror and the witnesses reported this run's
+    /// checkpoint anchors (I-D §7.1's transition exception), ascending.
+    ///
+    /// Reported rather than left implicit: rotation material is held apart from the checkpoint
+    /// series at both servers, so a producer told only "created" could tell an ordinary
+    /// submission from one that recorded the evidence a later receipt's rotation proof is built
+    /// from only by looking for it afterwards.
+    pub rotation_anchors: Vec<u64>,
+    /// The rotating-manifest entry indexes the receipt carries a `governance.rotation_proofs[]`
+    /// element for, ascending.
+    pub rotation_proofs: Vec<u64>,
     /// Where the receipt was installed.
     pub written_to: String,
 }
@@ -135,9 +146,149 @@ impl Issued {
             "witness cosignatures carried: {}",
             if self.witnesses.is_empty() { "none".to_owned() } else { self.witnesses.join(", ") }
         );
+        let _ = writeln!(out, "rotation proofs carried: {}", indexes(&self.rotation_proofs));
+        let _ =
+            writeln!(out, "rotations this checkpoint anchors: {}", indexes(&self.rotation_anchors));
         let _ = writeln!(out, "receipt written to: {}", self.written_to);
         out
     }
+}
+
+/// Entry indexes for the human-readable report, or `none`.
+fn indexes(entries: &[u64]) -> String {
+    if entries.is_empty() {
+        "none".to_owned()
+    } else {
+        entries.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// Add every index not already recorded, keeping the list ascending and without repeats.
+fn record(into: &mut Vec<u64>, reported: Vec<u64>) {
+    for index in reported {
+        if let Err(at) = into.binary_search(&index) {
+            into.insert(at, index);
+        }
+    }
+}
+
+/// What one round of checkpoint submissions produced: a cosignature entry per witness, and the
+/// rotating-manifest entry indexes the servers reported the checkpoint anchors.
+struct Submitted {
+    /// One `anchoring.witnesses[]` element per witness that cosigned.
+    cosignatures: Vec<Value>,
+    /// The rotations the servers say this checkpoint anchors, ascending and without repeats.
+    anchors: Vec<u64>,
+}
+
+/// Submit this run's checkpoint to every witness and, where it anchors a rotation, offer it to
+/// the mirror as the rotation material it is.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where a witness answers unusably or refuses, or where a server
+/// refuses the checkpoint as material for a rotation this run named.
+fn submit<F: Fetcher>(
+    fetcher: &F,
+    endpoints: &Endpoints,
+    log_id: &str,
+    position: &producer::LogPosition,
+    entries: &[Value],
+    anchored: &[u64],
+) -> CliResult<Submitted> {
+    let mut anchors: Vec<u64> = Vec::new();
+    let mut cosignatures = Vec::new();
+    for witness in &endpoints.witnesses {
+        // One submission per rotation this checkpoint anchors, so each is named and each is
+        // reported; the cosignature they all return is the same one, over the same checkpoint.
+        let mut answer = None;
+        for named in named_submissions(anchored) {
+            let served = producer::cosign(fetcher, witness, log_id, position, entries, named)?;
+            record(&mut anchors, producer::rotation_anchors(&served));
+            if answer.is_none() {
+                answer = Some(served);
+            }
+        }
+        if let Some(served) = answer {
+            cosignatures.push(producer::cosignature_entry(&served)?);
+        }
+    }
+    // The mirror's ordinary ingest happened before the prefix was enumerated, which is the only
+    // place the rotations are known, so the naming is a second offer of the same checkpoint.
+    for index in anchored {
+        let reported = producer::offer_rotation_anchor(
+            fetcher,
+            &endpoints.mirror,
+            &position.checkpoint,
+            *index,
+        )?;
+        record(&mut anchors, reported);
+    }
+    Ok(Submitted { cosignatures, anchors })
+}
+
+/// The rotations this run's checkpoint is rotation-anchoring material for, ascending.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the prefix carries no manifest at a rotation's
+/// predecessor index.
+fn anchored_rotations(
+    governance: &producer::Governance<'_>,
+    rotations: &[producer::Rotation],
+    checkpoint: &Value,
+) -> CliResult<Vec<u64>> {
+    let mut anchored = Vec::new();
+    for rotation in rotations {
+        let outgoing = governance.manifest_at(rotation.outgoing_entry_index)?;
+        if rotation.anchored_by(checkpoint, outgoing) {
+            anchored.push(rotation.manifest_entry_index);
+        }
+    }
+    Ok(anchored)
+}
+
+/// The `rotation_for` values one witness submission run names.
+///
+/// Where the checkpoint anchors nothing, exactly one unnamed submission is made — the ordinary
+/// one that fetches the anchoring cosignature. Where it anchors rotations, one submission per
+/// rotation, so every one of them is named and reported rather than silently discovered.
+fn named_submissions(anchored: &[u64]) -> Vec<Option<u64>> {
+    if anchored.is_empty() {
+        vec![None]
+    } else {
+        anchored.iter().map(|index| Some(*index)).collect()
+    }
+}
+
+/// Fetch and join one `governance.rotation_proofs[]` element per rotation the chain carries.
+///
+/// Two halves from two kinds of server: the mirror serves the element with `witnesses` empty
+/// because a mirror does not cosign, and every configured witness serves its cosignatures over
+/// the same anchor. [`producer::compose_rotation_proof`] is where they are checked against each
+/// other and joined.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where a rotation has no served anchor, where the mirror and a
+/// witness disagree about which checkpoint anchors it, or where no cosignature was served.
+fn rotation_proofs<F: Fetcher>(
+    fetcher: &F,
+    endpoints: &Endpoints,
+    log_id: &str,
+    rotations: &[producer::Rotation],
+) -> CliResult<std::collections::BTreeMap<u64, Value>> {
+    let mut proofs = std::collections::BTreeMap::new();
+    for rotation in rotations {
+        let index = rotation.manifest_entry_index;
+        let element = producer::rotation_proof(fetcher, &endpoints.mirror, index)?;
+        let mut served = Vec::with_capacity(endpoints.witnesses.len());
+        for witness in &endpoints.witnesses {
+            served.push(producer::rotation_cosignatures(fetcher, witness, log_id, index)?);
+        }
+        proofs.insert(index, producer::compose_rotation_proof(index, &element, &served)?);
+    }
+    Ok(proofs)
 }
 
 /// Refuse a plain-HTTP endpoint the operator did not opt into, and one that is not loopback.
@@ -274,21 +425,25 @@ pub fn run<F: Fetcher>(
         .to_owned();
 
     let prefix = producer::enumerate(fetcher, &endpoints.mirror, size, size)?;
-    let mut cosignatures = Vec::new();
-    for witness in &endpoints.witnesses {
-        let answer = producer::cosign(fetcher, witness, &log_id, &position, &prefix.entries)?;
-        cosignatures.push(producer::cosignature_entry(&answer)?);
-    }
+
+    // The rotations are known only now: they are a fact about the ENUMERATED chain, and the
+    // checkpoint had to reach the mirror before the prefix under it could be served. Everything
+    // that names a rotation to a server therefore happens from here on.
     let governance = producer::Governance::read(&prefix.entries);
     let (_, active) = governance.active_for_checkpoint(size)?;
-    let (carried, outgoing) = producer::split_cosignatures(cosignatures, active);
+    let rotations = governance.rotations(&governance.carried_indices(size));
+    let anchored = anchored_rotations(&governance, &rotations, &position.checkpoint)?;
+
+    let submitted = submit(fetcher, endpoints, &log_id, &position, &prefix.entries, &anchored)?;
+    let carried = producer::accounted_cosignatures(submitted.cosignatures, active);
     let witnesses: Vec<String> = carried
         .iter()
         .filter_map(|entry| entry.get("witness_id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect();
+    let rotation_proofs = rotation_proofs(fetcher, endpoints, &log_id, &rotations)?;
 
-    let assembly = Assembly::new(position.checkpoint.clone(), prefix, carried, outgoing)?;
+    let assembly = Assembly::new(position.checkpoint.clone(), prefix, carried)?;
     // The index came from the mirror. Now that the prefix has been checked against the root the
     // log signed, the entry at that index must be the one whose bytes were handed over — or the
     // receipt would be about a different statement.
@@ -332,7 +487,7 @@ pub fn run<F: Fetcher>(
         }),
     };
 
-    let receipt = producer::assemble(&assembly, position.entry_index, &claim)?;
+    let receipt = producer::assemble(&assembly, position.entry_index, &claim, &rotation_proofs)?;
     let canonical = jcs(&receipt);
     install::install(&options.out, &canonical, if options.force { Force::Yes } else { Force::No })?;
 
@@ -346,6 +501,8 @@ pub fn run<F: Fetcher>(
         tree_size: size,
         governance: shape.governance,
         witnesses,
+        rotation_anchors: submitted.anchors,
+        rotation_proofs: rotation_proofs.keys().copied().collect(),
         written_to: options.out.display().to_string(),
     })
 }
@@ -955,6 +1112,117 @@ mod tests {
         assert!(error.to_string().contains("receipt.ahl"), "{error}");
         issue_against(&stack, dir.path(), "statement-anchored", |options| options.force = true)
             .expect("`--force` is still a no-replace install, into a freed name");
+    }
+
+    /// A corpus whose second manifest version rotates the named key set, with the subject the
+    /// statement anchored after it.
+    fn rotating_corpus(log_key: &str, witness_id: &str, witness_key: &str) -> Vec<Value> {
+        vec![
+            scripted::genesis(),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+            scripted::envelope(scripted::manifest(witness_id, witness_key, log_key)),
+            scripted::envelope(scripted::statement("ingestion", json!({}))),
+        ]
+    }
+
+    #[test]
+    fn a_rotating_chain_names_the_rotation_it_anchors_and_carries_the_element_served_for_it() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let entries =
+            rotating_corpus(scripted::LOG_KEY, scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2);
+        let stack = scripted::Stack::over(entries, 3);
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect("both interfaces serve the halves of the element");
+
+        assert_eq!(issued.rotation_proofs, vec![2], "one element per rotation the chain carries");
+        assert_eq!(
+            issued.rotation_anchors,
+            vec![2],
+            "the servers reported what the submitted checkpoint anchors"
+        );
+
+        let receipt = installed(dir.path());
+        let proofs = receipt
+            .pointer("/governance/rotation_proofs")
+            .and_then(Value::as_array)
+            .expect("the member is carried");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].get("manifest_entry_index"), Some(&json!(2)));
+        // The element's checkpoint is the one the MIRROR served for the rotation, which is not
+        // the receipt's own anchoring checkpoint over the whole tree.
+        assert_eq!(proofs[0].pointer("/checkpoint/tree_size"), Some(&json!(3)));
+        assert_eq!(receipt.pointer("/anchoring/checkpoint/tree_size"), Some(&json!(4)));
+        assert_eq!(
+            proofs[0].pointer("/witnesses/0/witness_id"),
+            Some(&json!(scripted::WITNESS_ID)),
+            "cosigned under the OUTGOING witness set"
+        );
+
+        let text = issued.to_text();
+        assert!(text.contains("rotation proofs carried: 2"), "{text}");
+        assert!(text.contains("rotations this checkpoint anchors: 2"), "{text}");
+    }
+
+    #[test]
+    fn a_log_key_rotation_is_issued_now_that_an_interface_serves_the_retired_key_anchor() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let rotated_log_key =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let entries = rotating_corpus(rotated_log_key, scripted::WITNESS_ID, scripted::WITNESS_KEY);
+        let stack = scripted::Stack::over(entries, 3);
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect("the mirror serves an anchor the retired log key signed");
+        assert_eq!(issued.rotation_proofs, vec![2]);
+
+        let receipt = installed(dir.path());
+        assert_eq!(
+            receipt.pointer("/governance/rotation_proofs/0/checkpoint/key_id"),
+            Some(&json!(scripted::LOG_KEY)),
+            "the OUTGOING log key, never the incoming one"
+        );
+        let log_keys = receipt.pointer("/keys/log").and_then(Value::as_array).unwrap();
+        assert_eq!(log_keys.len(), 2, "one key under two bindings, one version each");
+    }
+
+    #[test]
+    fn a_rotation_with_no_served_anchor_stops_the_run_naming_the_index_and_the_route() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let entries =
+            rotating_corpus(scripted::LOG_KEY, scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2);
+        let stack = scripted::Stack::over(entries, 3).without_anchor_for(2);
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect_err("no receipt is written without the element");
+        let text = error.to_string();
+        assert!(text.contains("entry 2"), "{text}");
+        assert!(text.contains("GET /v1/rotation-proofs/2"), "{text}");
+        assert_eq!(error.outcome(), crate::outcome::Outcome::Unverifiable);
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
+    fn a_mirror_and_a_witness_disagreeing_about_the_anchor_stop_the_run() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let entries =
+            rotating_corpus(scripted::LOG_KEY, scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2);
+        let stack = scripted::Stack::over(entries, 3).with_rotation_checkpoint_mismatch();
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect_err("the halves do not pair");
+        assert!(error.to_string().contains("different rotation-anchoring checkpoints"), "{error}");
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
+    fn a_chain_that_rotates_nothing_names_no_rotation_and_carries_no_element() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::new();
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect("the scripted corpus carries one manifest version");
+        assert!(issued.rotation_proofs.is_empty());
+        assert!(issued.rotation_anchors.is_empty());
+        // I-D §7.1 requires the member ABSENT rather than an empty array.
+        assert!(installed(dir.path()).pointer("/governance/rotation_proofs").is_none());
+        let text = issued.to_text();
+        assert!(text.contains("rotation proofs carried: none"), "{text}");
     }
 
     #[test]
