@@ -221,6 +221,34 @@ pub fn cosignature() -> Value {
     })
 }
 
+/// What the scripted log published after the checkpoint the subject is anchored under.
+///
+/// The number is how many entries were appended past that checkpoint, so the mirror carries a
+/// second series member at the larger tree size and a consistency proof between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continuation {
+    /// Nothing: the anchoring checkpoint is the newest the mirror publishes.
+    None,
+    /// A later checkpoint the witness has not been shown, so a cosignature has to be asked for.
+    Unwitnessed(u64),
+    /// A later checkpoint the witness already holds a cosignature over.
+    Witnessed(u64),
+    /// A later checkpoint whose served proof does not open the pair of roots.
+    BrokenProof(u64),
+}
+
+impl Continuation {
+    /// How many entries were appended past the anchoring checkpoint.
+    const fn trailing(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Unwitnessed(entries) | Self::Witnessed(entries) | Self::BrokenProof(entries) => {
+                entries
+            }
+        }
+    }
+}
+
 /// How the scripted mirror and witness answer for a rotation whose anchor the mirror holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationService {
@@ -259,6 +287,8 @@ pub struct Stack {
     pub unanchored: Vec<u64>,
     /// How the two interfaces answer for a rotation whose anchor they hold.
     pub rotation_service: RotationService,
+    /// What the log published past the checkpoint the subject is anchored under.
+    pub continuation: Continuation,
     /// What the log is set to contradict itself about.
     pub discrepancy: Discrepancy,
 }
@@ -280,6 +310,7 @@ impl Stack {
             refusing_witness: false,
             unanchored: Vec::new(),
             rotation_service: RotationService::Whole,
+            continuation: Continuation::None,
             discrepancy: Discrepancy::None,
         }
     }
@@ -340,6 +371,13 @@ impl Stack {
         self
     }
 
+    /// The log published a checkpoint past the one the subject is anchored under.
+    #[must_use]
+    pub const fn continuing(mut self, continuation: Continuation) -> Self {
+        self.continuation = continuation;
+        self
+    }
+
     /// A deployment over a caller-supplied corpus.
     #[must_use]
     pub fn over(entries: Vec<Value>, subject_index: u64) -> Self {
@@ -350,6 +388,13 @@ impl Stack {
     #[must_use]
     pub fn size(&self) -> u64 {
         u64::try_from(self.entries.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The tree size the subject's own checkpoint commits, which is the whole tree unless the
+    /// log went on appending past it.
+    #[must_use]
+    pub fn anchoring_size(&self) -> u64 {
+        self.size().saturating_sub(self.continuation.trailing())
     }
 
     /// The canonical bytes of the entry at `index` — what a producer holds in a file.
@@ -384,8 +429,8 @@ impl Stack {
     #[must_use]
     pub fn inclusion_path(&self, index: u64) -> Vec<String> {
         let at = usize::try_from(index).unwrap_or(usize::MAX);
-        let proof =
-            inclusion_proof(&self.leaf_bytes(self.size()), at).expect("an index inside the tree");
+        let proof = inclusion_proof(&self.leaf_bytes(self.anchoring_size()), at)
+            .expect("an index inside the tree");
         proof_path_hex(&proof)
     }
 
@@ -405,7 +450,7 @@ impl Stack {
     /// The checkpoint over the whole tree.
     #[must_use]
     pub fn checkpoint(&self) -> Value {
-        self.checkpoint_at(self.size())
+        self.checkpoint_at(self.anchoring_size())
     }
 
     /// The same checkpoint in the ATL form the log's own Evidence Receipt carries.
@@ -438,7 +483,7 @@ impl Stack {
             "proof": {
                 "leaf_index": leaf_index,
                 "inclusion_path": path,
-                "checkpoint": self.atl_checkpoint(self.size()),
+                "checkpoint": self.atl_checkpoint(self.anchoring_size()),
             },
         })
     }
@@ -457,17 +502,64 @@ impl Stack {
     }
 
     fn series(&self) -> Vec<Value> {
-        // Two members, out of size order and each carrying the mirror's own view of its state,
-        // so selecting the newest is a comparison rather than a read of the last element and
-        // the server annotation is something `strip_state` has to remove.
-        let mut newest = self.checkpoint();
-        let mut older = self.checkpoint_at(self.size().saturating_sub(2));
-        for member in [&mut newest, &mut older] {
-            if let Some(object) = member.as_object_mut() {
-                object.insert("state".to_owned(), json!("published"));
-            }
+        // Members out of size order, each carrying the mirror's own view of its state, so
+        // selecting the newest is a comparison rather than a read of the last element and the
+        // server annotation is something `strip_state` has to remove. The oldest is only
+        // `authenticated`, so a caller that needs a series-usable member has to filter.
+        let anchoring = self.anchoring_size();
+        let mut members = vec![
+            (self.checkpoint_at(anchoring), "series_usable"),
+            (self.checkpoint_at(anchoring.saturating_sub(2)), "authenticated"),
+        ];
+        if self.continuation.trailing() > 0 {
+            members.insert(0, (self.checkpoint_at(self.size()), "series_usable"));
         }
-        vec![older, newest]
+        members
+            .into_iter()
+            .map(|(mut member, state)| {
+                if let Some(object) = member.as_object_mut() {
+                    object.insert("state".to_owned(), json!(state));
+                }
+                member
+            })
+            .collect()
+    }
+
+    /// The consistency proof the mirror serves between two tree sizes.
+    fn consistency_answer(&self, from: u64, to: u64) -> Response {
+        // A deployment set to serve a path that does not open the pair serves the proof for
+        // another pair, which is what a broken or confused mirror looks like from outside.
+        let (from, to) = if self.continuation == Continuation::BrokenProof(to.saturating_sub(from))
+        {
+            (from.saturating_sub(1), to)
+        } else {
+            (from, to)
+        };
+        let Ok(proof) = ahl_core::consistency_proof(&self.leaf_bytes(self.size()), from, to) else {
+            return bad_request();
+        };
+        ok(&json!({
+            "from": from,
+            "to": to,
+            "consistency_path": ahl_core::consistency_path_hex(&proof),
+        }))
+    }
+
+    /// The cosigned history the witness publishes for this log.
+    fn history_answer(&self) -> Vec<Value> {
+        let mut held = vec![self.checkpoint_at(self.anchoring_size())];
+        if matches!(self.continuation, Continuation::Witnessed(_)) {
+            held.push(self.checkpoint_at(self.size()));
+        }
+        held.into_iter()
+            .map(|checkpoint| {
+                let mut record = cosignature();
+                if let Some(object) = record.as_object_mut() {
+                    object.insert("checkpoint".to_owned(), checkpoint);
+                }
+                record
+            })
+            .collect()
     }
 
     fn range_answer(&self, request: &Request) -> Response {
@@ -687,11 +779,27 @@ impl Stack {
                 .parse::<u64>()
                 .map_or_else(|_| bad_request(), |tree_size| ok(&self.checkpoint_at(tree_size)));
         }
+        if let Some(query) = mirror.strip_prefix("/v1/consistency?") {
+            let value = |name: &str| {
+                query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+            };
+            return match (value("from"), value("to")) {
+                (Some(from), Some(to)) => self.consistency_answer(from, to),
+                _ => bad_request(),
+            };
+        }
         if mirror == "/v1/range" {
             return self.range_answer(request);
         }
         if witness == "/v1/witness-key" {
             return ok(&json!({ "witness_id": WITNESS_ID, "key_id": WITNESS_KEY }));
+        }
+        if witness.starts_with("/v1/logs/") && witness.ends_with("/checkpoints") {
+            return ok(&self.history_answer());
         }
         if witness.starts_with("/v1/logs/") && witness.ends_with("/witness") {
             return self.witness_answer(request);

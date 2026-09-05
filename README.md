@@ -287,6 +287,32 @@ Plain HTTP needs `--allow-insecure-loopback`, and even then reaches a loopback p
 transport's resolved-peer rule is what stops such a request from leaving the machine; the flag
 exists so that making one is never an accident.
 
+### Continued history
+
+Where the mirror publishes a series-usable checkpoint later than the one a receipt is anchored
+under, `issue` carries the continuation rather than leaving `continued_history` permanently
+false. Adaptor §8.3 qualification 2 says a deployment MUST supply consistency proofs "through
+the interface of §10.3 or an equivalent published endpoint"; the mirror's
+`GET /v1/consistency?from=<size>&to=<size>` is that endpoint, so the block is composed from what
+the deployment published rather than manufactured here — and `verify` recomputes the proof
+against the two roots whoever served it.
+
+Three members travel together or not at all: `anchoring.later_checkpoint` (the six signed
+members, with the mirror's own state annotation dropped), `anchoring.consistency_path` in the
+order it was served, and `anchoring.later_witnesses[]`. The path establishes that the later
+checkpoint EXTENDS this one; only a cosignature establishes that a witness saw the later state,
+which is a different fact and the one L3 turns on — so a witness that has not been shown the
+later checkpoint is shown it, and a governing version at L3 with no cosignature over it is a
+refusal rather than a weaker claim.
+
+Two conditions bound which later checkpoint is taken. It must introduce no manifest version
+between the two tree sizes, because a receipt's `governance.chain[]` hops open against the
+ANCHORING checkpoint's root and a manifest past that size could not be carried at all. And the
+claim type must take declared governance currency: receipt format §2.1 wants governance material
+covering through the later tree size while §4 fixes enumerated material at exactly
+`[0, tree_size(anchoring.checkpoint))`, and no range satisfies both. Where neither holds, the
+receipt says `continued_history: false`. `--no-continued-history` declines the block outright.
+
 ## Network behaviour
 
 - **HTTPS only.** `--insecure` does not exist. Plain `http://` is accepted only when the

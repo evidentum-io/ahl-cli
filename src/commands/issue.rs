@@ -67,6 +67,8 @@ pub struct Options {
     pub note: Option<String>,
     /// Permit plain HTTP to a loopback peer.
     pub allow_insecure_loopback: bool,
+    /// Assemble no continued-history block, whatever the mirror publishes.
+    pub no_continued_history: bool,
     /// Where to install the receipt.
     pub out: PathBuf,
     /// Replace an existing destination. Still a no-replace install.
@@ -106,6 +108,9 @@ pub struct Issued {
     /// The rotating-manifest entry indexes the receipt carries a `governance.rotation_proofs[]`
     /// element for, ascending.
     pub rotation_proofs: Vec<u64>,
+    /// Whether the receipt carries a later checkpoint and a consistency proof that opens the
+    /// pair — `claim.assurance.continued_history`.
+    pub continued_history: bool,
     /// Where the receipt was installed.
     pub written_to: String,
 }
@@ -149,6 +154,11 @@ impl Issued {
         let _ = writeln!(out, "rotation proofs carried: {}", indexes(&self.rotation_proofs));
         let _ =
             writeln!(out, "rotations this checkpoint anchors: {}", indexes(&self.rotation_anchors));
+        let _ = writeln!(
+            out,
+            "continued history: {}",
+            if self.continued_history { "carried" } else { "not carried" }
+        );
         let _ = writeln!(out, "receipt written to: {}", self.written_to);
         out
     }
@@ -257,6 +267,159 @@ fn rotation_proofs<F: Fetcher>(
     Ok(proofs)
 }
 
+/// Everything the servers supply that assembly carries but does not compute: the composed
+/// rotation-proof elements, and the continued-history block where one holds.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where a rotation has no served anchor, where the halves of one
+/// do not pair, or where a served consistency proof does not open the pair of roots.
+fn serve<F: Fetcher>(
+    fetcher: &F,
+    endpoints: &Endpoints,
+    log_id: &str,
+    governance: &producer::Governance<'_>,
+    position: &producer::LogPosition,
+    rotations: &[producer::Rotation],
+    options: &Options,
+) -> CliResult<producer::Served> {
+    let size =
+        position.checkpoint.get("tree_size").and_then(Value::as_u64).ok_or_else(|| {
+            CliError::EvidenceMissing("the checkpoint has no tree size".to_owned())
+        })?;
+    let (_, active) = governance.active_for_checkpoint(size)?;
+    let enumerated = producer::claim_shape(&options.claim)?.governance == "enumerated";
+    Ok(producer::Served {
+        rotation_proofs: rotation_proofs(fetcher, endpoints, log_id, rotations)?,
+        continued_history: if options.no_continued_history || enumerated {
+            None
+        } else {
+            continued_history(fetcher, endpoints, log_id, governance, &position.checkpoint, active)?
+        },
+    })
+}
+
+/// Compose the continued-history block, where the mirror publishes a later checkpoint this
+/// receipt's governance can carry.
+///
+/// Adaptor §8.3 qualification 2 makes serving consistency proofs a deployment obligation
+/// discharged "through the interface of §10.3 or an equivalent published endpoint". The
+/// mirror's `GET /v1/consistency` IS that endpoint, so composing the block from it is carrying
+/// evidence the deployment published rather than manufacturing it — and `verify` recomputes the
+/// proof against the two roots regardless of who served it.
+///
+/// Which later checkpoint is chosen is not simply the newest. The receipt has to carry
+/// governance material covering through that tree size, and its `governance.chain[]` hops open
+/// against the ANCHORING checkpoint's root — so a manifest anchored between the two sizes could
+/// not be carried at all. The newest series-usable member that introduces no such manifest is
+/// therefore what is taken, and where none exists the receipt says `continued_history: false`
+/// rather than claiming a continuation it cannot ground.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the mirror serves no proof for the pair it published,
+/// where the proof does not open the two roots, or where the governing version is L3 and no
+/// witness cosigned the later checkpoint.
+fn continued_history<F: Fetcher>(
+    fetcher: &F,
+    endpoints: &Endpoints,
+    log_id: &str,
+    governance: &producer::Governance<'_>,
+    checkpoint: &Value,
+    active: &Value,
+) -> CliResult<Option<producer::ContinuedHistory>> {
+    let size = checkpoint
+        .get("tree_size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::EvidenceMissing("the checkpoint has no tree size".to_owned()))?;
+    // A manifest at or after the anchoring size fixes a ceiling: past it the version active for
+    // the later checkpoint is one the receipt's chain does not carry and could not open anyway,
+    // because every chain hop's path runs to the ANCHORING checkpoint's root.
+    let ceiling =
+        governance.manifest_indices().into_iter().find(|index| *index >= size).unwrap_or(u64::MAX);
+    let published = producer::series_usable(fetcher, &endpoints.mirror)?;
+    let Some(later) = published.into_iter().rfind(|member| {
+        member.get("tree_size").and_then(Value::as_u64).is_some_and(|at| at > size && at <= ceiling)
+    }) else {
+        return Ok(None);
+    };
+    let later_size = later.get("tree_size").and_then(Value::as_u64).ok_or_else(|| {
+        CliError::EvidenceMissing("the later checkpoint has no tree size".to_owned())
+    })?;
+
+    let path = producer::consistency_path(fetcher, &endpoints.mirror, size, later_size)?;
+    if !producer::consistency_holds(checkpoint, &later, &path)? {
+        return Err(CliError::EvidenceMissing(format!(
+            "the consistency proof the mirror served for tree size {size} to {later_size} does \
+             not open the pair of roots the two checkpoints commit; a path that does not open \
+             the pair is not a proof, and a receipt asserting a continuation on it would assert \
+             one that never held"
+        )));
+    }
+
+    // The path establishes that the later checkpoint EXTENDS this one. Only a cosignature
+    // establishes that a witness saw the later state, which is a different fact and the one L3
+    // turns on.
+    let mut prefix: Option<Vec<Value>> = None;
+    let mut cosignatures = Vec::new();
+    for witness in &endpoints.witnesses {
+        let history = producer::cosigned_history(fetcher, witness, log_id)?;
+        if let Some(held) = producer::cosignature_over(&history, &later)? {
+            cosignatures.push(held);
+            continue;
+        }
+        // A witness cosigns what it is shown, and it has not been shown this one.
+        if prefix.is_none() {
+            prefix = Some(
+                producer::enumerate(fetcher, &endpoints.mirror, later_size, later_size)?.entries,
+            );
+        }
+        let entries = prefix.as_deref().unwrap_or_default();
+        let answer = producer::cosign_later(fetcher, witness, log_id, &later, entries)?;
+        // A refusal is signed evidence about the log and is reported by the run that asked for
+        // it; here it simply means this witness supplies no cosignature over the later state.
+        if let Ok(entry) = producer::cosignature_entry(&answer) {
+            cosignatures.push(entry);
+        }
+    }
+    let later_witnesses = producer::accounted_cosignatures(cosignatures, active);
+    if later_witnesses.is_empty() && active.get("level").and_then(Value::as_str) == Some("L3") {
+        return Err(CliError::EvidenceMissing(format!(
+            "the governing manifest version is L3, and no witness it declares cosigned the \
+             later checkpoint at tree size {later_size}; at L3 a continued history rests on a \
+             witness having seen the later state, and a consistency path alone does not say so"
+        )));
+    }
+    Ok(Some(producer::ContinuedHistory {
+        later_checkpoint: later,
+        consistency_path: path,
+        later_witnesses,
+    }))
+}
+
+/// Refuse a deployment `issue` will not assemble against before anything is fetched from it.
+///
+/// # Errors
+///
+/// [`CliError::Usage`] for a plain-HTTP endpoint the operator did not opt into, one that is not
+/// loopback, or a witness set that is empty.
+fn check_endpoints(endpoints: &Endpoints, allow_loopback: bool) -> CliResult<()> {
+    for url in std::iter::once(&endpoints.log)
+        .chain(std::iter::once(&endpoints.mirror))
+        .chain(endpoints.witnesses.iter())
+    {
+        check_endpoint(url, allow_loopback)?;
+    }
+    if endpoints.witnesses.is_empty() {
+        return Err(CliError::Usage(
+            "no witness endpoint is configured; a receipt carrying no cosignature raises no \
+             assurance, and `issue` does not assemble one silently"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a plain-HTTP endpoint the operator did not opt into, and one that is not loopback.
 ///
 /// The transport checks the **resolved peer** per connection, which is what closes DNS
@@ -350,19 +513,7 @@ pub fn run<F: Fetcher>(
     options: &Options,
 ) -> CliResult<Issued> {
     let shape = producer::claim_shape(&options.claim)?;
-    for url in std::iter::once(&endpoints.log)
-        .chain(std::iter::once(&endpoints.mirror))
-        .chain(endpoints.witnesses.iter())
-    {
-        check_endpoint(url, options.allow_insecure_loopback)?;
-    }
-    if endpoints.witnesses.is_empty() {
-        return Err(CliError::Usage(
-            "no witness endpoint is configured; a receipt carrying no cosignature raises no \
-             assurance, and `issue` does not assemble one silently"
-                .to_owned(),
-        ));
-    }
+    check_endpoints(endpoints, options.allow_insecure_loopback)?;
 
     let envelope = read_envelope(&options.envelope, limits)?;
     let entry = entry_id(&envelope);
@@ -407,7 +558,8 @@ pub fn run<F: Fetcher>(
         .filter_map(|entry| entry.get("witness_id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect();
-    let rotation_proofs = rotation_proofs(fetcher, endpoints, &log_id, &rotations)?;
+    let served = serve(fetcher, endpoints, &log_id, &governance, &position, &rotations, options)?;
+    let continued = served.continued_history.is_some();
 
     let assembly = Assembly::new(position.checkpoint.clone(), prefix, carried)?;
     // The index came from the mirror. Now that the prefix has been checked against the root the
@@ -453,7 +605,7 @@ pub fn run<F: Fetcher>(
         }),
     };
 
-    let receipt = producer::assemble(&assembly, position.entry_index, &claim, &rotation_proofs)?;
+    let receipt = producer::assemble(&assembly, position.entry_index, &claim, &served)?;
     let canonical = jcs(&receipt);
     install::install(&options.out, &canonical, if options.force { Force::Yes } else { Force::No })?;
 
@@ -468,7 +620,8 @@ pub fn run<F: Fetcher>(
         governance: shape.governance,
         witnesses,
         rotation_anchors: submitted.anchors,
-        rotation_proofs: rotation_proofs.keys().copied().collect(),
+        rotation_proofs: served.rotation_proofs.keys().copied().collect(),
+        continued_history: continued,
         written_to: options.out.display().to_string(),
     })
 }
@@ -690,6 +843,7 @@ mod tests {
             target_index: None,
             note: None,
             allow_insecure_loopback: false,
+            no_continued_history: true,
             out: dir.join("receipt.ahl"),
             force: false,
         }
@@ -1175,6 +1329,118 @@ mod tests {
             .expect_err("the halves do not pair");
         assert!(error.to_string().contains("different rotation-anchoring checkpoints"), "{error}");
         assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    /// A corpus long enough for the log to have gone on appending past the subject.
+    fn continuing_corpus() -> Vec<Value> {
+        let mut entries = vec![scripted::genesis()];
+        for _ in 0..5 {
+            entries.push(scripted::envelope(scripted::statement("ingestion", json!({}))));
+        }
+        entries
+    }
+
+    #[test]
+    fn a_later_series_member_is_carried_with_the_proof_that_it_extends_this_one() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(continuing_corpus(), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2));
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect("the mirror serves a later member and a proof that opens the pair");
+        assert!(issued.continued_history);
+
+        let receipt = installed(dir.path());
+        let anchoring = receipt.get("anchoring").expect("an anchoring block");
+        assert_eq!(anchoring.pointer("/checkpoint/tree_size"), Some(&json!(4)));
+        assert_eq!(anchoring.pointer("/later_checkpoint/tree_size"), Some(&json!(6)));
+        // The three members travel together (I-D §7.1), and the assurance follows from them
+        // rather than from anything the caller asserted.
+        assert!(anchoring.get("consistency_path").and_then(Value::as_array).is_some());
+        assert_eq!(
+            anchoring.pointer("/later_witnesses/0/witness_id"),
+            Some(&json!(scripted::WITNESS_ID)),
+            "a path says the log extended; only a cosignature says a witness saw it"
+        );
+        assert_eq!(receipt.pointer("/claim/assurance/continued_history"), Some(&json!(true)));
+        // The later checkpoint is carried as the six signed members, with no server annotation.
+        let later = anchoring.pointer("/later_checkpoint").and_then(Value::as_object).unwrap();
+        assert_eq!(later.len(), 6, "the mirror's `state` label is not a receipt member");
+
+        let text = issued.to_text();
+        assert!(text.contains("continued history: carried"), "{text}");
+    }
+
+    #[test]
+    fn a_later_checkpoint_the_witness_already_holds_is_not_submitted_again() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(continuing_corpus(), 1)
+            .continuing(scripted::Continuation::Witnessed(2));
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect("the witness's published history already carries the cosignature");
+        assert!(issued.continued_history);
+        assert_eq!(
+            installed(dir.path()).pointer("/anchoring/later_checkpoint/tree_size"),
+            Some(&json!(6))
+        );
+    }
+
+    #[test]
+    fn a_proof_that_does_not_open_the_pair_stops_the_run() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(continuing_corpus(), 1)
+            .continuing(scripted::Continuation::BrokenProof(2));
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect_err("a path that does not open the pair is not a proof");
+        let text = error.to_string();
+        assert!(text.contains("does not open the pair of roots"), "{text}");
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
+    fn no_later_member_means_the_receipt_says_so_rather_than_claiming_one() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::new();
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect("the anchoring checkpoint is the newest the mirror publishes");
+        assert!(!issued.continued_history);
+        let receipt = installed(dir.path());
+        assert!(receipt.pointer("/anchoring/later_checkpoint").is_none());
+        assert!(receipt.pointer("/anchoring/consistency_path").is_none());
+        assert!(receipt.pointer("/anchoring/later_witnesses").is_none());
+        assert_eq!(receipt.pointer("/claim/assurance/continued_history"), Some(&json!(false)));
+        assert!(issued.to_text().contains("continued history: not carried"));
+    }
+
+    #[test]
+    fn the_flag_keeps_the_old_behaviour_and_enumerated_currency_never_takes_one() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(continuing_corpus(), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2));
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = true;
+        })
+        .expect("the operator asked for none");
+        assert!(!issued.continued_history);
+
+        // Receipt format §2.1 wants governance covering through the later tree size and §4 fixes
+        // enumerated material at the anchoring one, so an enumerated claim never takes a block —
+        // and asking `assemble` for one anyway is refused rather than assembled.
+        let dir = tempfile::tempdir().expect("a working directory");
+        let issued = issue_against(&stack, dir.path(), "governance-state", |options| {
+            options.no_continued_history = false;
+            options.target_index = Some(0);
+        })
+        .expect("an enumerated claim, assembled without a continued history");
+        assert_eq!(issued.governance, "enumerated");
+        assert!(!issued.continued_history);
     }
 
     #[test]

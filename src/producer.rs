@@ -478,12 +478,51 @@ pub fn cosign<F: Fetcher>(
     prefix: &[Value],
     rotation_for: Option<u64>,
 ) -> CliResult<Value> {
+    submit_checkpoint(
+        fetcher,
+        witness,
+        log_id,
+        &position.checkpoint,
+        &position.raw,
+        prefix,
+        rotation_for,
+    )
+}
+
+/// Submit a checkpoint the receipt will carry as `anchoring.later_checkpoint` to one witness,
+/// and read the cosignature back.
+///
+/// A witness cosigns what it is shown, so a later checkpoint it never saw has to be shown to
+/// it. Nothing about that checkpoint is asserted by doing so: the witness applies its own rules
+/// and may refuse, and a refusal comes back to the caller the way any other does.
+///
+/// # Errors
+///
+/// [`CliError::EvidenceMissing`] where the checkpoint does not reassemble into its framing, or
+/// the witness answers unusably.
+pub fn cosign_later<F: Fetcher>(
+    fetcher: &F,
+    witness: &str,
+    log_id: &str,
+    checkpoint: &Value,
+    prefix: &[Value],
+) -> CliResult<Value> {
+    let raw = checkpoint_raw(checkpoint)?;
+    submit_checkpoint(fetcher, witness, log_id, checkpoint, &raw, prefix, None)
+}
+
+/// One `POST /v1/logs/{log_id}/witness`.
+fn submit_checkpoint<F: Fetcher>(
+    fetcher: &F,
+    witness: &str,
+    log_id: &str,
+    checkpoint: &Value,
+    raw: &str,
+    prefix: &[Value],
+    rotation_for: Option<u64>,
+) -> CliResult<Value> {
     let entries: Vec<String> = prefix.iter().map(|entry| base64(&jcs(entry))).collect();
-    let mut submission = json!({
-        "checkpoint": position.checkpoint,
-        "raw": position.raw,
-        "entries": entries,
-    });
+    let mut submission = json!({ "checkpoint": checkpoint, "raw": raw, "entries": entries });
     if let Some(index) = rotation_for {
         set(&mut submission, "rotation_for", json!(index))?;
     }
@@ -1676,26 +1715,53 @@ pub struct ContentBinding {
     pub binding: &'static str,
 }
 
+/// A later checkpoint the log published, with the proof that it extends the receipt's own.
+#[derive(Debug, Clone)]
+pub struct ContinuedHistory {
+    /// The later checkpoint, in the receipt-borne six-member form.
+    pub later_checkpoint: Value,
+    /// The RFC 9162 §2.1.4 path from the anchoring checkpoint's root to this one's, in the
+    /// order the mirror served it.
+    pub consistency_path: Vec<String>,
+    /// Cosignatures over the LATER checkpoint, in the `anchoring.witnesses[]` shape.
+    pub later_witnesses: Vec<Value>,
+}
+
+/// Everything the servers supplied that assembly carries but did not compute.
+#[derive(Debug, Default)]
+pub struct Served {
+    /// One composed `governance.rotation_proofs[]` element per rotation, by rotating entry
+    /// index.
+    pub rotation_proofs: BTreeMap<u64, Value>,
+    /// The continued-history block, where a later checkpoint was obtained and its proof held.
+    pub continued_history: Option<ContinuedHistory>,
+}
+
 /// Assemble one Evidence Receipt.
 ///
-/// `rotation_proofs` maps a rotating manifest's entry index to the element composed for it by
-/// [`compose_rotation_proof`]. Assembly does not fetch: the caller obtained the halves from the
-/// mirror and the witnesses and joined them, and what happens here is the last two steps I-D
-/// §7.1 puts on the producer — filtering the cosignatures down to the witnesses the OUTGOING
-/// version declares, and listing the outgoing keys in `keys` bound to that predecessor version.
+/// [`Served::rotation_proofs`] maps a rotating manifest's entry index to the element composed
+/// for it by [`compose_rotation_proof`]. Assembly does not fetch: the caller obtained the halves
+/// from the mirror and the witnesses and joined them, and what happens here is the last two
+/// steps I-D §7.1 puts on the producer — filtering the cosignatures down to the witnesses the
+/// OUTGOING version declares, and listing the outgoing keys in `keys` bound to that predecessor
+/// version. [`Served::continued_history`] is carried the same way: the proof was obtained and
+/// checked before it got here, and `assurance.continued_history` follows from whether one is
+/// present rather than from anything the caller asserts.
 ///
 /// # Errors
 ///
 /// [`CliError::EvidenceMissing`] where the material the claim needs is not in the prefix or no
 /// element was composed for a rotation the chain carries, and [`CliError::Usage`] where the
-/// caller asked for a claim type this build does not assemble.
+/// caller asked for a claim type this build does not assemble or for a continued history under
+/// enumerated governance.
 #[allow(clippy::too_many_lines)] // One receipt, member by member; splitting it hides the order.
 pub fn assemble(
     assembly: &Assembly,
     subject_index: u64,
     claim: &Claim,
-    rotation_proofs: &BTreeMap<u64, Value>,
+    served: &Served,
 ) -> CliResult<Value> {
+    let rotation_proofs = &served.rotation_proofs;
     let shape = claim_shape(&claim.claim_type)?;
     let enumerated = shape.governance == "enumerated";
     let size = assembly.size()?;
@@ -1753,11 +1819,23 @@ pub fn assemble(
         )
     })?;
 
+    // Receipt format §2.1 wants governance material covering through `later_checkpoint`'s tree
+    // size, and §4 fixes enumerated material at exactly `[0, tree_size(anchoring.checkpoint))`.
+    // No range satisfies both, so the combination is refused here rather than assembled into a
+    // receipt whose own verifier rejects it for a conflict the producer created.
+    if served.continued_history.is_some() && enumerated {
+        return Err(CliError::Usage(format!(
+            "claim type `{}` takes enumerated governance currency, which cannot cover a later \
+             checkpoint (receipt format §2.1 against §4); `continued_history` is not assembled \
+             for it",
+            claim.claim_type
+        )));
+    }
     let mut assurance = json!({
         "governance": shape.governance,
         "competing_triggers": shape.competing_triggers,
         "witnessed": !assembly.cosignatures.is_empty(),
-        "continued_history": false,
+        "continued_history": served.continued_history.is_some(),
         "content_binding": claim.content.as_ref().map_or("none", |content| content.binding),
     });
     if let Some(content) = &claim.content {
@@ -1806,21 +1884,29 @@ pub fn assemble(
             "material": if enumerated { assembly.material.clone() } else { json!({}) },
         },
     });
-    let receipt_skeleton = json!({
+    let mut anchoring = json!({
+        "adaptor": adaptor,
+        "checkpoint": assembly.checkpoint.clone(),
+        "inclusion_path": assembly.inclusion_path(subject_index)?,
+        "witnesses": assembly.cosignatures,
+    });
+    // The three members travel together or not at all (I-D §7.1): a later checkpoint without a
+    // path proves no continuation, a path without the checkpoint it runs to describes nothing,
+    // and `later_witnesses` says which witnesses saw the later state — the path never does.
+    if let Some(continued) = &served.continued_history {
+        set(&mut anchoring, "later_checkpoint", continued.later_checkpoint.clone())?;
+        set(&mut anchoring, "consistency_path", json!(continued.consistency_path))?;
+        set(&mut anchoring, "later_witnesses", json!(continued.later_witnesses))?;
+    }
+    let mut receipt = json!({
         "ahl_receipt_version": RECEIPT_VERSION,
         "spec_version": SPEC_VERSION,
         "claim": claim_block,
         "subject": subject_block,
         "envelope": subject,
-        "anchoring": {
-            "adaptor": adaptor,
-            "checkpoint": assembly.checkpoint.clone(),
-            "inclusion_path": assembly.inclusion_path(subject_index)?,
-            "witnesses": assembly.cosignatures,
-        },
+        "anchoring": anchoring,
         "claim_material": material,
     });
-    let mut receipt = receipt_skeleton;
 
     // I-D §7.1: `rotation_proofs` is present if and only if the carried chain contains a
     // governance-key rotation, one element per rotation in ascending order, and the outgoing
@@ -2284,7 +2370,12 @@ mod tests {
 
     /// `assemble` over a chain that rotates nothing, so no element is composed for it.
     fn assembled(assembly: &Assembly, subject_index: u64, claim: &Claim) -> CliResult<Value> {
-        assemble(assembly, subject_index, claim, &BTreeMap::new())
+        assemble(assembly, subject_index, claim, &Served::default())
+    }
+
+    /// A `Served` carrying only rotation proofs.
+    fn served(rotation_proofs: BTreeMap<u64, Value>) -> Served {
+        Served { rotation_proofs, continued_history: None }
     }
 
     /// The rotation proofs a scripted deployment serves for every rotation its corpus carries,
@@ -2985,8 +3076,9 @@ mod tests {
             "cosigned_at": scripted::TIME,
         });
         let assembly = assembly_over(&stack, vec![incoming]);
-        let receipt = assemble(&assembly, 3, &claim_of("statement-anchored", None), &proofs)
-            .expect("a rotation both interfaces serve");
+        let receipt =
+            assemble(&assembly, 3, &claim_of("statement-anchored", None), &served(proofs))
+                .expect("a rotation both interfaces serve");
         let carried = receipt
             .pointer("/governance/rotation_proofs")
             .and_then(Value::as_array)
@@ -3016,8 +3108,9 @@ mod tests {
         let stack = scripted::Stack::over(entries, 3);
         let proofs = scripted_rotation_proofs(&stack).expect("both halves are served");
         let assembly = assembly_over(&stack, vec![scripted::cosignature()]);
-        let receipt = assemble(&assembly, 3, &claim_of("statement-anchored", None), &proofs)
-            .expect("the mirror serves the anchor a retired log key signed");
+        let receipt =
+            assemble(&assembly, 3, &claim_of("statement-anchored", None), &served(proofs))
+                .expect("the mirror serves the anchor a retired log key signed");
         let carried = receipt
             .pointer("/governance/rotation_proofs")
             .and_then(Value::as_array)
@@ -3062,8 +3155,9 @@ mod tests {
             "cosigned_at": scripted::TIME,
         });
         let assembly = assembly_over(&stack, vec![cosignature]);
-        let receipt = assemble(&assembly, 3, &claim_of("statement-anchored", None), &proofs)
-            .expect("two rotations, two elements");
+        let receipt =
+            assemble(&assembly, 3, &claim_of("statement-anchored", None), &served(proofs))
+                .expect("two rotations, two elements");
         let carried = receipt
             .pointer("/governance/rotation_proofs")
             .and_then(Value::as_array)
@@ -3099,8 +3193,9 @@ mod tests {
 
         // And assembly itself refuses rather than emitting a receipt without the element.
         let assembly = assembly_over(&stack, vec![scripted::cosignature()]);
-        let error = assemble(&assembly, 3, &claim_of("statement-anchored", None), &BTreeMap::new())
-            .expect_err("the element is material the receipt MUST carry");
+        let error =
+            assemble(&assembly, 3, &claim_of("statement-anchored", None), &Served::default())
+                .expect_err("the element is material the receipt MUST carry");
         assert!(error.to_string().contains("no rotation proof was composed"), "{error}");
     }
 
@@ -3162,6 +3257,117 @@ mod tests {
                 .map(|object| object.keys().collect::<Vec<_>>()),
             "a cosignature carries the four members `anchoring.witnesses[]` carries"
         );
+    }
+
+    #[test]
+    fn enumerated_currency_and_a_later_checkpoint_are_refused_rather_than_assembled_together() {
+        let stack = scripted::Stack::new();
+        let assembly = assembly_over(&stack, vec![scripted::cosignature()]);
+        let served = Served {
+            rotation_proofs: BTreeMap::new(),
+            continued_history: Some(ContinuedHistory {
+                later_checkpoint: stack.checkpoint_at(stack.size()),
+                consistency_path: Vec::new(),
+                later_witnesses: vec![scripted::cosignature()],
+            }),
+        };
+        let error =
+            assemble(&assembly, scripted::APPENDED, &claim_of("governance-state", None), &served)
+                .expect_err("no enumerated range covers a later checkpoint");
+        assert!(error.to_string().contains("cannot cover a later checkpoint"), "{error}");
+    }
+
+    #[test]
+    fn a_continuation_the_servers_do_not_publish_is_read_out_of_what_they_answer() {
+        let stack = scripted::Stack::new();
+
+        // Only a series-usable member can ground a consistency answer, so an `authenticated`
+        // one is not offered as a later checkpoint.
+        let usable = series_usable(&stack, scripted::MIRROR).expect("the published series");
+        assert_eq!(usable.len(), 1);
+        assert!(usable[0].get("state").is_none(), "a server label is never carried");
+
+        let refused = scripted::Canned::raw(503, "unavailable");
+        let error = series_usable(&refused, scripted::MIRROR).expect_err("a refusal");
+        assert!(error.to_string().contains("checkpoint series"), "{error}");
+        let not_an_array = scripted::Canned::json(200, &json!({}));
+        let error = series_usable(&not_an_array, scripted::MIRROR).expect_err("not an array");
+        assert!(error.to_string().contains("not an array"), "{error}");
+
+        // Adaptor §8.3 qualification 2: no served proof, no continued history.
+        let error = consistency_path(&refused, scripted::MIRROR, 2, 4).expect_err("a refusal");
+        assert!(error.to_string().contains("deployment obligation"), "{error}");
+        let no_member = scripted::Canned::json(200, &json!({ "from": 2, "to": 4 }));
+        let error = consistency_path(&no_member, scripted::MIRROR, 2, 4).expect_err("no member");
+        assert!(error.to_string().contains("no `consistency_path` array"), "{error}");
+        let not_strings = scripted::Canned::json(200, &json!({ "consistency_path": [ 7 ] }));
+        let error =
+            consistency_path(&not_strings, scripted::MIRROR, 2, 4).expect_err("not strings");
+        assert!(error.to_string().contains("is not a string"), "{error}");
+    }
+
+    #[test]
+    fn a_path_is_carried_only_where_it_opens_the_pair_of_roots_the_checkpoints_commit() {
+        let stack = scripted::Stack::over(scripted::corpus(), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2));
+        let from = stack.checkpoint();
+        let to = stack.checkpoint_at(stack.size());
+        let path = consistency_path(&stack, scripted::MIRROR, 4, 6).expect("a served proof");
+        assert!(consistency_holds(&from, &to, &path).expect("a readable proof"));
+
+        // The proof for another pair is structurally a proof and opens nothing here.
+        let other = consistency_path(&stack, scripted::MIRROR, 3, 6).expect("a served proof");
+        assert!(!consistency_holds(&from, &to, &other).expect("a readable proof"));
+
+        let unreadable = consistency_holds(&json!({ "tree_size": 4 }), &to, &path);
+        assert!(unreadable.expect_err("no root").to_string().contains("unreadable"), "no root");
+    }
+
+    #[test]
+    fn a_cosignature_over_a_later_checkpoint_is_matched_on_the_whole_object() {
+        let stack = scripted::Stack::over(scripted::corpus(), 1)
+            .continuing(scripted::Continuation::Witnessed(2));
+        let history =
+            cosigned_history(&stack, scripted::WITNESS, &scripted::log_id()).expect("a history");
+        assert_eq!(history.len(), 2);
+
+        let later = stack.checkpoint_at(stack.size());
+        let held = cosignature_over(&history, &later).expect("a readable record");
+        assert_eq!(
+            held.and_then(|entry| entry.get("witness_id").cloned()),
+            Some(json!(scripted::WITNESS_ID))
+        );
+
+        // One member changed is a different checkpoint, and a cosignature over it is not this
+        // one's — matching on the tree size alone would carry a signature over other bytes.
+        let mut moved = later;
+        moved["root_hash"] = json!(format!("sha256:{}", "cd".repeat(32)));
+        assert!(cosignature_over(&history, &moved).expect("a readable record").is_none());
+
+        let refused = scripted::Canned::raw(500, "boom");
+        let error =
+            cosigned_history(&refused, scripted::WITNESS, &scripted::log_id()).expect_err("a 500");
+        assert!(error.to_string().contains("answered 500"), "{error}");
+        let not_an_array = scripted::Canned::json(200, &json!({}));
+        let error = cosigned_history(&not_an_array, scripted::WITNESS, &scripted::log_id())
+            .expect_err("not an array");
+        assert!(error.to_string().contains("not an array"), "{error}");
+    }
+
+    #[test]
+    fn a_witness_is_asked_who_it_is_before_it_is_told_what_to_record() {
+        let stack = scripted::Stack::new();
+        assert_eq!(
+            witness_identity(&stack, scripted::WITNESS).expect("an identity"),
+            scripted::WITNESS_ID
+        );
+
+        let refused = scripted::Canned::raw(404, "no such route");
+        let error = witness_identity(&refused, scripted::WITNESS).expect_err("a 404");
+        assert!(error.to_string().contains("/v1/witness-key"), "{error}");
+        let nameless = scripted::Canned::json(200, &json!({ "key_id": scripted::WITNESS_KEY }));
+        let error = witness_identity(&nameless, scripted::WITNESS).expect_err("no identity");
+        assert!(error.to_string().contains("names no `witness_id`"), "{error}");
     }
 
     #[test]
