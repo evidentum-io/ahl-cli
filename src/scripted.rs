@@ -221,6 +221,17 @@ pub fn cosignature() -> Value {
     })
 }
 
+/// How the scripted mirror and witness answer for a rotation whose anchor the mirror holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationService {
+    /// Both halves are served, over the same checkpoint, and they pair.
+    Whole,
+    /// The witness cosigns a checkpoint other than the one the mirror's element carries.
+    MismatchedCheckpoint,
+    /// The mirror serves the anchor and no witness holds a cosignature over it.
+    NoCosignature,
+}
+
 /// A way the scripted log is set to contradict itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Discrepancy {
@@ -246,9 +257,8 @@ pub struct Stack {
     /// Rotations neither the mirror nor the witness serves an anchor for, so a receipt that
     /// needs one is refused rather than assembled without it.
     pub unanchored: Vec<u64>,
-    /// The witness serves its rotation cosignatures over a checkpoint other than the one the
-    /// mirror's element carries, so the two halves do not pair.
-    pub rotation_mismatch: bool,
+    /// How the two interfaces answer for a rotation whose anchor they hold.
+    pub rotation_service: RotationService,
     /// What the log is set to contradict itself about.
     pub discrepancy: Discrepancy,
 }
@@ -269,7 +279,7 @@ impl Stack {
             published: false,
             refusing_witness: false,
             unanchored: Vec::new(),
-            rotation_mismatch: false,
+            rotation_service: RotationService::Whole,
             discrepancy: Discrepancy::None,
         }
     }
@@ -319,7 +329,14 @@ impl Stack {
     /// The witness cosigns a different checkpoint from the one the mirror's element carries.
     #[must_use]
     pub const fn with_rotation_checkpoint_mismatch(mut self) -> Self {
-        self.rotation_mismatch = true;
+        self.rotation_service = RotationService::MismatchedCheckpoint;
+        self
+    }
+
+    /// The mirror serves the anchor and the witness holds no cosignature over it.
+    #[must_use]
+    pub const fn without_rotation_cosignatures(mut self) -> Self {
+        self.rotation_service = RotationService::NoCosignature;
         self
     }
 
@@ -568,6 +585,9 @@ impl Stack {
     /// The witness's half: the cosignatures it holds over that anchor, in the
     /// `anchoring.witnesses[]` shape, alongside the checkpoint they are over.
     fn rotation_cosignature_answer(&self, index: u64) -> Response {
+        if self.rotation_service == RotationService::NoCosignature {
+            return not_found();
+        }
         let Some(checkpoint) = self.rotation_anchor(index) else { return not_found() };
         // The rotation-anchoring checkpoint verifies under the OUTGOING state, so the witness
         // that cosigned it is the one the version PRECEDING the rotating manifest declares.
@@ -580,7 +600,11 @@ impl Stack {
         ) else {
             return not_found();
         };
-        let served = if self.rotation_mismatch { self.checkpoint() } else { checkpoint };
+        let served = if self.rotation_service == RotationService::MismatchedCheckpoint {
+            self.checkpoint()
+        } else {
+            checkpoint
+        };
         ok(&json!({
             "log_id": log_id(),
             "manifest_entry_index": index,

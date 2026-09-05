@@ -284,7 +284,7 @@ fn rotation_proofs<F: Fetcher>(
         let element = producer::rotation_proof(fetcher, &endpoints.mirror, index)?;
         let mut served = Vec::with_capacity(endpoints.witnesses.len());
         for witness in &endpoints.witnesses {
-            served.push(producer::rotation_cosignatures(fetcher, witness, log_id, index)?);
+            served.extend(producer::rotation_cosignatures(fetcher, witness, log_id, index)?);
         }
         proofs.insert(index, producer::compose_rotation_proof(index, &element, &served)?);
     }
@@ -1208,6 +1208,20 @@ mod tests {
         let error = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
             .expect_err("the halves do not pair");
         assert!(error.to_string().contains("different rotation-anchoring checkpoints"), "{error}");
+        assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
+    }
+
+    #[test]
+    fn a_witness_holding_no_cosignature_is_not_fatal_until_none_of_them_holds_one() {
+        let dir = tempfile::tempdir().expect("a working directory");
+        let entries =
+            rotating_corpus(scripted::LOG_KEY, scripted::WITNESS_ID_2, scripted::WITNESS_KEY_2);
+        let stack = scripted::Stack::over(entries, 3).without_rotation_cosignatures();
+        let error = issue_against(&stack, dir.path(), "statement-anchored", |_| {})
+            .expect_err("the mirror serves the anchor and nothing cosigned it");
+        let text = error.to_string();
+        assert!(text.contains("no witness served a cosignature"), "{text}");
+        assert!(text.contains("entry 2"), "{text}");
         assert!(!dir.path().join("receipt.ahl").exists(), "nothing was installed");
     }
 

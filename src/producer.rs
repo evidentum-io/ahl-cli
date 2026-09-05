@@ -587,32 +587,37 @@ pub fn rotation_proof<F: Fetcher>(
 }
 
 /// One witness's cosignatures over the rotation-anchoring checkpoint for
-/// `manifest_entry_index`, in the `anchoring.witnesses[]` shape.
+/// `manifest_entry_index`, in the `anchoring.witnesses[]` shape, or `None` where this witness
+/// holds none.
 ///
 /// The answer carries the `checkpoint` those cosignatures are over, which is what makes the
 /// pairing checkable without a second request.
 ///
+/// A `404` is not a failure of the run. What a rotation proof needs is one cosignature by a
+/// witness the OUTGOING version declared, and in a set of several only some will have seen the
+/// anchor; treating "this one holds nothing" as fatal would make a deployment's redundancy a
+/// liability. The refusal comes later, from the composition, where NO witness served one.
+///
 /// # Errors
 ///
-/// [`CliError::EvidenceMissing`] where the witness holds none, naming the index and the route,
-/// or answers unusably.
+/// [`CliError::EvidenceMissing`] where the witness answers unusably.
 pub fn rotation_cosignatures<F: Fetcher>(
     fetcher: &F,
     witness: &str,
     log_id: &str,
     manifest_entry_index: u64,
-) -> CliResult<Value> {
+) -> CliResult<Option<Value>> {
     let route = format!("/v1/logs/{log_id}/rotation-cosignatures/{manifest_entry_index}");
     let request = Request::get(format!("{}{route}", witness.trim_end_matches('/')));
     let response = fetch(fetcher, &request)?;
-    if response.status != 200 {
-        return Err(CliError::EvidenceMissing(format!(
-            "the witness answered {} for the rotation at entry {manifest_entry_index}: `GET \
-             {route}` serves no cosignature over a rotation-anchoring checkpoint for it",
-            response.status
-        )));
+    match response.status {
+        200 => json_body(&response, "the witness").map(Some),
+        404 => Ok(None),
+        status => Err(CliError::EvidenceMissing(format!(
+            "the witness answered {status} to `GET {route}`, asked for its cosignatures over \
+             the rotation-anchoring checkpoint at entry {manifest_entry_index}"
+        ))),
     }
-    json_body(&response, "the witness")
 }
 
 /// Compose one `governance.rotation_proofs[]` element from the mirror's element and the
@@ -2069,7 +2074,8 @@ mod tests {
             let element = rotation_proof(stack, scripted::MIRROR, index)?;
             let served =
                 rotation_cosignatures(stack, scripted::WITNESS, &scripted::log_id(), index)?;
-            proofs.insert(index, compose_rotation_proof(index, &element, &[served])?);
+            let served: Vec<Value> = served.into_iter().collect();
+            proofs.insert(index, compose_rotation_proof(index, &element, &served)?);
         }
         Ok(proofs)
     }
