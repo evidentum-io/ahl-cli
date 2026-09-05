@@ -295,14 +295,14 @@ fn serve<F: Fetcher>(
         position.checkpoint.get("tree_size").and_then(Value::as_u64).ok_or_else(|| {
             CliError::EvidenceMissing("the checkpoint has no tree size".to_owned())
         })?;
-    let (_, active) = governance.active_for_checkpoint(size)?;
+    let (active_index, _) = governance.active_for_checkpoint(size)?;
     let enumerated = producer::claim_shape(&options.claim)?.governance == "enumerated";
     Ok(producer::Served {
         rotation_proofs: rotation_proofs(fetcher, endpoints, log_id, rotations)?,
         continued_history: if options.no_continued_history || enumerated {
             None
         } else {
-            continued_history(fetcher, endpoints, log_id, governance, &position.checkpoint, active)?
+            continued_history(fetcher, endpoints, log_id, &position.checkpoint, active_index)?
         },
     })
 }
@@ -316,44 +316,82 @@ fn serve<F: Fetcher>(
 /// evidence the deployment published rather than manufacturing it — and `verify` recomputes the
 /// proof against the two roots regardless of who served it.
 ///
-/// Which later checkpoint is chosen is not simply the newest. The receipt has to carry
-/// governance material covering through that tree size, and its `governance.chain[]` hops open
-/// against the ANCHORING checkpoint's root — so a manifest anchored between the two sizes could
-/// not be carried at all. The newest series-usable member that introduces no such manifest is
-/// therefore what is taken, and where none exists the receipt says `continued_history: false`
-/// rather than claiming a continuation it cannot ground.
+/// Which later checkpoint is chosen is not simply the newest, and the bound cannot be read off
+/// the anchoring prefix. A receipt's `governance.chain[]` hops carry inclusion paths that open
+/// against the ANCHORING checkpoint's root, so the chain stops at that tree size by
+/// construction; a manifest version anchored past it could not be carried at all, and the
+/// verifier — seeing only the carried chain — would then authenticate the later checkpoint under
+/// a version the log had already superseded. Receipt format §2.1 asks instead for governance
+/// material covering THROUGH `later_checkpoint.tree_size`, and the only way to know whether the
+/// carried chain does is to look at the entries past the anchor.
+///
+/// So the ceiling is derived from the log rather than assumed: the entries `[0, horizon)` are
+/// enumerated at the mirror, where `horizon` is the newest series-usable member later than the
+/// anchoring one, and the smallest manifest entry index at or after the anchoring tree size is
+/// the ceiling. The newest series-usable member at or below it is carried; where none exists —
+/// including where a manifest sits exactly at the anchoring size — the receipt says
+/// `continued_history: false` rather than claiming a continuation it cannot ground. That is an
+/// omission and not a failure; only a proof that does not verify, or an L3 version with no
+/// cosignature over the later state, stops the run.
 ///
 /// # Errors
 ///
 /// [`CliError::EvidenceMissing`] where the mirror serves no proof for the pair it published,
 /// where the proof does not open the two roots, or where the governing version is L3 and no
-/// witness cosigned the later checkpoint.
+/// witness cosigned the later checkpoint. [`CliError::Internal`] where the ceiling above did not
+/// hold the invariant it exists to establish.
 fn continued_history<F: Fetcher>(
     fetcher: &F,
     endpoints: &Endpoints,
     log_id: &str,
-    governance: &producer::Governance<'_>,
     checkpoint: &Value,
-    active: &Value,
+    active_index: u64,
 ) -> CliResult<Option<producer::ContinuedHistory>> {
     let size = checkpoint
         .get("tree_size")
         .and_then(Value::as_u64)
         .ok_or_else(|| CliError::EvidenceMissing("the checkpoint has no tree size".to_owned()))?;
-    // A manifest at or after the anchoring size fixes a ceiling: past it the version active for
-    // the later checkpoint is one the receipt's chain does not carry and could not open anyway,
-    // because every chain hop's path runs to the ANCHORING checkpoint's root.
-    let ceiling =
-        governance.manifest_indices().into_iter().find(|index| *index >= size).unwrap_or(u64::MAX);
     let published = producer::series_usable(fetcher, &endpoints.mirror)?;
-    let Some(later) = published.into_iter().rfind(|member| {
-        member.get("tree_size").and_then(Value::as_u64).is_some_and(|at| at > size && at <= ceiling)
-    }) else {
+    let tree_size = |member: &Value| member.get("tree_size").and_then(Value::as_u64);
+    let Some(horizon) = published.iter().rev().find_map(tree_size).filter(|newest| *newest > size)
+    else {
         return Ok(None);
     };
-    let later_size = later.get("tree_size").and_then(Value::as_u64).ok_or_else(|| {
+
+    // What the log did past the anchor, read from the log. Enumerated once and used twice: the
+    // ceiling comes out of it, and so does the prefix a witness has to be shown to cosign the
+    // later checkpoint.
+    let entries = producer::enumerate(fetcher, &endpoints.mirror, horizon, horizon)?.entries;
+    let published_governance = producer::Governance::read(&entries);
+    let ceiling = published_governance
+        .manifest_indices()
+        .into_iter()
+        .find(|index| *index >= size)
+        .unwrap_or(u64::MAX);
+    let Some(later) = published
+        .into_iter()
+        .rfind(|member| tree_size(member).is_some_and(|at| at > size && at <= ceiling))
+    else {
+        return Ok(None);
+    };
+    let later_size = tree_size(&later).ok_or_else(|| {
         CliError::EvidenceMissing("the later checkpoint has no tree size".to_owned())
     })?;
+
+    // The invariant the ceiling exists to establish, checked rather than assumed: with no
+    // manifest between the two tree sizes, the version in force at the later checkpoint IS the
+    // one in force at the anchoring checkpoint — which is why the receipt's `keys.log[]` and
+    // `keys.witness[]` entries already bind it, and why the cosignatures below are judged
+    // against that version. A build where this does not hold would emit a receipt whose later
+    // checkpoint resolves under a version it does not carry.
+    let (later_index, later_active) = published_governance.active_for_checkpoint(later_size)?;
+    if later_index != active_index {
+        return Err(CliError::Internal(format!(
+            "the manifest version in force at tree size {later_size} is the one anchored at \
+             entry {later_index}, not the one at entry {active_index} that governs this \
+             receipt's own checkpoint; no later checkpoint should have passed the ceiling"
+        )));
+    }
 
     let path = producer::consistency_path(fetcher, &endpoints.mirror, size, later_size)?;
     if !producer::consistency_holds(checkpoint, &later, &path)? {
@@ -368,7 +406,6 @@ fn continued_history<F: Fetcher>(
     // The path establishes that the later checkpoint EXTENDS this one. Only a cosignature
     // establishes that a witness saw the later state, which is a different fact and the one L3
     // turns on.
-    let mut prefix: Option<Vec<Value>> = None;
     let mut cosignatures = Vec::new();
     for witness in &endpoints.witnesses {
         let history = producer::cosigned_history(fetcher, witness, log_id)?;
@@ -376,25 +413,23 @@ fn continued_history<F: Fetcher>(
             cosignatures.push(held);
             continue;
         }
-        // A witness cosigns what it is shown, and it has not been shown this one.
-        if prefix.is_none() {
-            prefix = Some(
-                producer::enumerate(fetcher, &endpoints.mirror, later_size, later_size)?.entries,
-            );
-        }
-        let entries = prefix.as_deref().unwrap_or_default();
-        let answer = producer::cosign_later(fetcher, witness, log_id, &later, entries)?;
+        // A witness cosigns what it is shown, and it has not been shown this one. It is shown
+        // the prefix the LATER checkpoint commits, which the enumeration above covers.
+        let shown = usize::try_from(later_size).ok().and_then(|at| entries.get(..at));
+        let answer =
+            producer::cosign_later(fetcher, witness, log_id, &later, shown.unwrap_or_default())?;
         // A refusal is signed evidence about the log and is reported by the run that asked for
         // it; here it simply means this witness supplies no cosignature over the later state.
         if let Ok(entry) = producer::cosignature_entry(&answer) {
             cosignatures.push(entry);
         }
     }
-    let later_witnesses = producer::accounted_cosignatures(cosignatures, active);
-    if later_witnesses.is_empty() && active.get("level").and_then(Value::as_str) == Some("L3") {
+    let later_witnesses = producer::accounted_cosignatures(cosignatures, later_active);
+    if later_witnesses.is_empty() && later_active.get("level").and_then(Value::as_str) == Some("L3")
+    {
         return Err(CliError::EvidenceMissing(format!(
-            "the governing manifest version is L3, and no witness it declares cosigned the \
-             later checkpoint at tree size {later_size}; at L3 a continued history rests on a \
+            "the manifest version in force at tree size {later_size} is L3, and no witness it \
+             declares cosigned the later checkpoint; at L3 a continued history rests on a \
              witness having seen the later state, and a consistency path alone does not say so"
         )));
     }
@@ -1392,6 +1427,65 @@ mod tests {
 
         let text = issued.to_text();
         assert!(text.contains("continued history: carried"), "{text}");
+    }
+
+    /// The continuing corpus with a manifest version anchored at `at`, restating the key sets
+    /// the genesis manifest declares — a version, and deliberately not a rotation.
+    fn manifest_at(at: usize) -> Vec<Value> {
+        let mut entries = continuing_corpus();
+        entries[at] = scripted::envelope(scripted::manifest(
+            scripted::WITNESS_ID,
+            scripted::WITNESS_KEY,
+            scripted::LOG_KEY,
+        ));
+        entries
+    }
+
+    #[test]
+    fn a_manifest_between_the_two_tree_sizes_stops_the_later_checkpoint_being_carried() {
+        // The anchoring checkpoint commits [0, 4) and the log has published one over [0, 6).
+        // A manifest version at entry 4 governs that later checkpoint and cannot be carried:
+        // every `governance.chain[]` hop opens against the ANCHORING root, so the receipt's
+        // chain stops below it, and a verifier reading only the carried chain would
+        // authenticate the later checkpoint under a version the log had already superseded.
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(manifest_at(4), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2));
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect("an omission, not a failure");
+
+        assert!(!issued.continued_history);
+        let receipt = installed(dir.path());
+        assert!(receipt.pointer("/anchoring/later_checkpoint").is_none());
+        assert!(receipt.pointer("/anchoring/consistency_path").is_none());
+        assert!(receipt.pointer("/anchoring/later_witnesses").is_none());
+        assert_eq!(receipt.pointer("/claim/assurance/continued_history"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn a_manifest_below_the_anchoring_size_leaves_the_later_checkpoint_eligible() {
+        // The same corpus with the manifest one entry earlier, at 3. It is inside the anchoring
+        // checkpoint's prefix, so the chain carries it and it governs BOTH checkpoints — which
+        // is the invariant the ceiling exists to establish.
+        let dir = tempfile::tempdir().expect("a working directory");
+        let stack = scripted::Stack::over(manifest_at(3), 1)
+            .continuing(scripted::Continuation::Unwitnessed(2));
+        let issued = issue_against(&stack, dir.path(), "statement-anchored", |options| {
+            options.no_continued_history = false;
+        })
+        .expect("no manifest sits between the two tree sizes");
+
+        assert!(issued.continued_history);
+        let receipt = installed(dir.path());
+        assert_eq!(receipt.pointer("/anchoring/checkpoint/tree_size"), Some(&json!(4)));
+        assert_eq!(receipt.pointer("/anchoring/later_checkpoint/tree_size"), Some(&json!(6)));
+        // The version at entry 3 is carried, so the keys the later checkpoint resolves under
+        // are in the receipt.
+        let chain = receipt.pointer("/governance/chain").and_then(Value::as_array).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].get("entry_index"), Some(&json!(3)));
     }
 
     #[test]

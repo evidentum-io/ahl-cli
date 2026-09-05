@@ -676,16 +676,26 @@ pub fn replay(pilot: &crate::Pilot) -> Replay {
         issue.must("16-bad-signature", &bad_path, "statement-anchored", &[]),
     ));
 
-    // --- the continued history, over an entry the log has long since grown past ------
-    // The `key` statement at entry 1 was anchored under the checkpoint of tree size 2 and is
-    // re-issued here, at the end, with the log seventeen entries long. `issue` places an
-    // already-anchored entry under the EARLIEST series-usable checkpoint that commits it, so
-    // the receipt is grounded where the statement actually was, and the growth since is carried
-    // as `continued_history` — a later checkpoint, the mirror's consistency proof between the
-    // two, and a cosignature over the later state.
+    // --- two continued histories, over entries the log has long since grown past -----
+    // `issue` places an already-anchored entry under the EARLIEST series-usable checkpoint that
+    // commits it, so a re-issued statement is grounded where it actually was and the growth
+    // since is carried as `continued_history` — a later checkpoint, the mirror's consistency
+    // proof between the two, and a cosignature over the later state.
+    //
+    // The `key` statement at entry 1 is anchored at tree size 2, and the manifest version at
+    // entry 5 is anchored between that and the head of the log. The later checkpoint carried is
+    // therefore BOUNDED at tree size 5: past it the governing version is one this receipt's
+    // chain stops below and could not carry.
     receipts.push((
         "statement-anchored-continued-history".to_owned(),
         issue.must("17-continued-history", &key_envelope, "statement-anchored", &[]),
+    ));
+
+    // The ingestion at entry 6 is anchored above the last manifest version, so nothing bounds
+    // it and the newest series-usable checkpoint the mirror publishes is carried.
+    receipts.push((
+        "statement-anchored-continued-history-unbounded".to_owned(),
+        issue.must("18-continued-history-head", &c_envelope, "statement-anchored", &[]),
     ));
 
     Replay { receipts, skipped, reports: issue.reports.take() }
