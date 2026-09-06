@@ -6,15 +6,21 @@
 //! runs "identical" would not be a property of the CLI at all. This binary is how that
 //! transcript comes to exist.
 //!
-//! It has no clock read and no randomness: everything comes from the committed `ahl-core`
-//! conformance corpus and the published test key seeds, so two consecutive runs leave
-//! `tests/fixtures/` byte-identical. If they do not, that is a bug.
+//! It has no clock read and no randomness: everything comes from the `ahl-core` conformance
+//! corpus and the published test key seeds, so two consecutive runs leave `tests/fixtures/`
+//! byte-identical. If they do not, that is a bug.
+//!
+//! The corpus is named, never guessed. This is an installable binary, and an installed binary
+//! has no sibling working tree to fall back to:
 //!
 //! ```text
-//! cargo run --bin gen_fixtures
+//! cargo run --bin gen_fixtures -- --corpus /path/to/ahl-core/test_data
+//! AHL_CORE_TEST_DATA=/path/to/ahl-core/test_data cargo run --bin gen_fixtures
 //! ```
+//!
+//! The argument wins over the variable. With neither, the run stops and says what to set.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ahl_cli::commands::{closure, reconstruct};
 use ahl_cli::evaluation::EvaluationTime;
@@ -34,58 +40,66 @@ use ahl_cli::testing::{tree_material, MirrorFixture};
 /// by a key this corpus does not authorize, a manifest version declaring a log key that is not
 /// active yet, one whose log key object files a public key under another party's id, and one
 /// that moves `cadence_epoch`.
-fn fixtures() -> Option<Vec<(&'static str, MirrorFixture)>> {
+fn fixtures(corpus: &Path) -> Option<Vec<(&'static str, MirrorFixture)>> {
+    let built = || MirrorFixture::from_corpus(corpus);
     Some(vec![
-        ("mirror-transcript.json", MirrorFixture::conformance()?),
-        (
-            "mirror-transcript-equivocating.json",
-            MirrorFixture::conformance()?.with_equivocation_at(13),
-        ),
-        (
-            "mirror-transcript-foreign-key.json",
-            MirrorFixture::conformance()?.with_foreign_log_key(8),
-        ),
-        ("mirror-transcript-tampered.json", MirrorFixture::conformance()?.with_tampered_entry(3)),
-        (
-            "mirror-transcript-forged-manifest.json",
-            MirrorFixture::conformance()?.with_forged_manifest(),
-        ),
-        (
-            "mirror-transcript-unknown-statement.json",
-            MirrorFixture::conformance()?.with_unknown_statement_type(),
-        ),
-        (
-            "mirror-transcript-withheld-predecessor.json",
-            MirrorFixture::conformance()?.with_series_from(13),
-        ),
-        (
-            "mirror-transcript-foreign-divergence.json",
-            MirrorFixture::conformance()?.with_foreign_divergence_at(13),
-        ),
-        (
-            "mirror-transcript-divergence-below.json",
-            MirrorFixture::conformance()?.with_foreign_divergence_at(8),
-        ),
-        (
-            "mirror-transcript-forged-key-transition.json",
-            MirrorFixture::conformance()?.with_forged_key_transition(),
-        ),
-        (
-            "mirror-transcript-inactive-log-key.json",
-            MirrorFixture::conformance()?.with_future_activated_log_key(),
-        ),
-        (
-            "mirror-transcript-mismatched-key-id.json",
-            MirrorFixture::conformance()?.with_mismatched_log_key_id(),
-        ),
-        (
-            "mirror-transcript-moved-epoch.json",
-            MirrorFixture::conformance()?.with_moved_cadence_epoch(),
-        ),
+        ("mirror-transcript.json", built()?),
+        ("mirror-transcript-equivocating.json", built()?.with_equivocation_at(13)),
+        ("mirror-transcript-foreign-key.json", built()?.with_foreign_log_key(8)),
+        ("mirror-transcript-tampered.json", built()?.with_tampered_entry(3)),
+        ("mirror-transcript-forged-manifest.json", built()?.with_forged_manifest()),
+        ("mirror-transcript-unknown-statement.json", built()?.with_unknown_statement_type()),
+        ("mirror-transcript-withheld-predecessor.json", built()?.with_series_from(13)),
+        ("mirror-transcript-foreign-divergence.json", built()?.with_foreign_divergence_at(13)),
+        ("mirror-transcript-divergence-below.json", built()?.with_foreign_divergence_at(8)),
+        ("mirror-transcript-forged-key-transition.json", built()?.with_forged_key_transition()),
+        ("mirror-transcript-inactive-log-key.json", built()?.with_future_activated_log_key()),
+        ("mirror-transcript-mismatched-key-id.json", built()?.with_mismatched_log_key_id()),
+        ("mirror-transcript-moved-epoch.json", built()?.with_moved_cadence_epoch()),
     ])
 }
 
+/// The corpus root: `--corpus <path>` where it is given, otherwise `AHL_CORE_TEST_DATA`.
+///
+/// The argument wins, so a run can be pointed at a corpus without disturbing an environment
+/// that is set for something else.
+///
+/// # Errors
+///
+/// Where neither is given, where `--corpus` carries no value, or where what either names is not
+/// an existing directory. The message says what to set.
+fn corpus_root() -> Result<PathBuf, String> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == *"--corpus" {
+            let Some(value) = args.next() else {
+                return Err(
+                    "`--corpus` needs the path of the corpus `test_data/` directory".to_owned()
+                );
+            };
+            let root = PathBuf::from(value);
+            return if root.is_dir() {
+                Ok(root)
+            } else {
+                Err(format!("`--corpus {}` is not a directory", root.display()))
+            };
+        }
+    }
+    MirrorFixture::corpus_root()
+}
+
 fn main() -> std::process::ExitCode {
+    let corpus = match corpus_root() {
+        Ok(corpus) => corpus,
+        Err(reason) => {
+            eprintln!("gen_fixtures: {reason}");
+            eprintln!(
+                "gen_fixtures: pass `--corpus <path>` or set `AHL_CORE_TEST_DATA` to the \
+                 `test_data/` directory of the `ahl-core` conformance corpus"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     if let Err(error) = std::fs::create_dir_all(&out) {
         eprintln!("gen_fixtures: cannot create {}: {error}", out.display());
@@ -101,8 +115,11 @@ fn main() -> std::process::ExitCode {
     // cannot exercise: a divergent series, a checkpoint signed by a key no manifest declares,
     // a mirror serving bytes the checkpoint does not commit, a forged later manifest, and an
     // anchored statement of a type core §2.3 does not define.
-    let Some(fixtures) = fixtures() else {
-        eprintln!("gen_fixtures: the conformance corpus publishes no usable key seeds");
+    let Some(fixtures) = fixtures(&corpus) else {
+        eprintln!(
+            "gen_fixtures: `{}` publishes none of the key seeds the fixtures sign with",
+            corpus.display()
+        );
         return std::process::ExitCode::FAILURE;
     };
 
@@ -139,9 +156,10 @@ fn main() -> std::process::ExitCode {
         );
     }
 
-    let written = fixtures.iter().map(|(name, fixture)| (*name, fixture.transcript())).chain(
-        std::iter::once(("tree-material.json", tree_material(&MirrorFixture::corpus_root()))),
-    );
+    let written = fixtures
+        .iter()
+        .map(|(name, fixture)| (*name, fixture.transcript()))
+        .chain(std::iter::once(("tree-material.json", tree_material(&corpus))));
     for (name, value) in written {
         let Ok(mut bytes) = serde_json::to_vec_pretty(&value) else {
             eprintln!("gen_fixtures: cannot serialize {name}");

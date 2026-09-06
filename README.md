@@ -741,11 +741,14 @@ The recorded network transcripts under `tests/fixtures/` are generated from the 
 conformance corpus, with no clock read and no randomness:
 
 ```sh
+cargo run --bin gen_fixtures -- --corpus /path/to/ahl-core/test_data
 AHL_CORE_TEST_DATA=/path/to/ahl-core/test_data cargo run --bin gen_fixtures
 ```
 
-`gen_fixtures` is the one place that needs the corpus named: set `AHL_CORE_TEST_DATA`, or run it
-beside an `ahl-core` checkout. The tests need no such thing — see below.
+`gen_fixtures` is the one place that needs the corpus named, and it is named rather than guessed:
+the argument wins over the variable, and with neither the run stops and says what to set. This is
+an installable binary, and an installed binary has no sibling working tree to fall back to. The
+tests need no such thing — see below.
 
 Two consecutive runs must leave `tests/fixtures/` byte-identical. If they do not, that is a bug.
 

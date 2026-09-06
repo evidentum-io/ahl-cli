@@ -109,6 +109,9 @@ pub struct MirrorFixture {
     foreign_key_at: Option<u64>,
     /// Serve different bytes for this entry index.
     tampered: Option<usize>,
+    /// The corpus this fixture was built from, so a later read of it needs no second lookup and
+    /// cannot land on a different corpus than the one the fixture's material came from.
+    corpus: PathBuf,
 
     recorded: Mutex<Vec<Recorded>>,
 }
@@ -132,35 +135,57 @@ fn synthetic(name: &'static str, byte: &str) -> Option<TestKey> {
 impl MirrorFixture {
     /// Where [`Self::conformance`] looks for the `ahl-core` conformance corpus.
     ///
-    /// `AHL_CORE_TEST_DATA` first, wherever this is compiled. Under `cfg(test)` — the crate's
-    /// own test build — the corpus is then located from the `ahl-core` package `cargo` actually
-    /// resolved, which is correct for a registry dependency and for an outside contributor
-    /// holding no second checkout. That lookup runs `cargo metadata`, so it is compiled into
-    /// test code only: the shipped library and the binaries never spawn a subprocess, and fall
-    /// back to `test_data/` beside an `ahl-core` working tree checked out next to this one —
-    /// the layout `src/bin/gen_fixtures.rs` is run in when the transcripts are regenerated.
-    #[must_use]
-    pub fn corpus_root() -> PathBuf {
-        if let Some(explicit) = std::env::var_os("AHL_CORE_TEST_DATA") {
-            return PathBuf::from(explicit);
-        }
+    /// **No relative path is ever tried.** An installed package has no sibling working tree,
+    /// so assuming one would make this succeed on the author's machine and nowhere else.
+    ///
+    /// Outside the crate's own test build — that is, in the shipped library and in
+    /// `src/bin/gen_fixtures.rs` — the corpus is whatever `AHL_CORE_TEST_DATA` names, and
+    /// nothing else. Under `cfg(test)` it is located from the `ahl-core` package `cargo`
+    /// actually resolved, which is correct for a registry dependency and for an outside
+    /// contributor holding no second checkout; that lookup runs `cargo metadata`, so it is
+    /// compiled into test code only and nothing shipped spawns a subprocess.
+    ///
+    /// # Errors
+    ///
+    /// Where `AHL_CORE_TEST_DATA` is unset or does not name an existing directory, and — under
+    /// `cfg(test)` — where the resolved `ahl-core` carries no corpus. The message says what to
+    /// set.
+    pub fn corpus_root() -> Result<PathBuf, String> {
         #[cfg(test)]
         {
-            crate::test_corpus::corpus_dir()
+            crate::test_corpus::locate()
         }
         #[cfg(not(test))]
         {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+            let Some(named) = std::env::var_os("AHL_CORE_TEST_DATA") else {
+                return Err("`AHL_CORE_TEST_DATA` is not set; it must name the `test_data/` \
+                            directory of the `ahl-core` conformance corpus"
+                    .to_owned());
+            };
+            let root = PathBuf::from(named);
+            if root.is_dir() {
+                Ok(root)
+            } else {
+                Err(format!(
+                    "`AHL_CORE_TEST_DATA` is set to `{}`, which is not a directory; it must name \
+                     the `test_data/` directory of the `ahl-core` conformance corpus",
+                    root.display()
+                ))
+            }
         }
     }
 
-    /// Build the fixture from the conformance corpus.
+    /// Build the fixture from the conformance corpus [`Self::corpus_root`] names.
     ///
-    /// `None` where the corpus does not publish the key seeds the fixture signs with; see
-    /// [`Self::from_corpus`].
-    #[must_use]
-    pub fn conformance() -> Option<Self> {
-        Self::from_corpus(&Self::corpus_root())
+    /// # Errors
+    ///
+    /// Whatever [`Self::corpus_root`] reports, or a statement that the corpus found publishes
+    /// none of the key seeds this fixture signs with; see [`Self::from_corpus`].
+    pub fn conformance() -> Result<Self, String> {
+        let root = Self::corpus_root()?;
+        Self::from_corpus(&root).ok_or_else(|| {
+            format!("`{}` publishes none of the key seeds the fixture signs with", root.display())
+        })
     }
 
     /// Build the fixture from a corpus at `root`.
@@ -194,6 +219,7 @@ impl MirrorFixture {
 
         Some(Self {
             policy: corpus_policy(root),
+            corpus: root.to_path_buf(),
             entries,
             log_keys: [seed(root, "log-1")?, seed(root, "log-2")?],
             outgoing_log_key: false,
@@ -803,23 +829,25 @@ impl MirrorFixture {
     /// `(dataset, record)` of the corpus record retracted at entries 22, 23, 28, 29 and 31.
     #[must_use]
     pub fn record_f(&self) -> (String, String) {
-        Self::record_named("22-retraction-f-authorized")
+        self.record_named("22-retraction-f-authorized")
     }
 
     /// `(dataset, record)` of a corpus record no trigger names.
     #[must_use]
     pub fn record_b(&self) -> (String, String) {
-        Self::record_named("02-ingestion-customers-b")
+        self.record_named("02-ingestion-customers-b")
     }
 
     /// `(dataset, record)` of the record the correction at entry 6 names.
     #[must_use]
     pub fn record_a(&self) -> (String, String) {
-        Self::record_named("06-correction-a-to-a2")
+        self.record_named("06-correction-a-to-a2")
     }
 
-    fn record_named(file: &str) -> (String, String) {
-        let path = Self::corpus_root().join("vectors/statements").join(format!("{file}.json"));
+    /// Read from the corpus this fixture was built from, never from a fresh lookup: the names
+    /// a caller gets back must come from the same material the fixture signs over.
+    fn record_named(&self, file: &str) -> (String, String) {
+        let path = self.corpus.join("vectors/statements").join(format!("{file}.json"));
         std::fs::read(path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1115,17 +1143,18 @@ pub fn tree_material(root: &Path) -> Value {
 /// everything before the first statement whose roots [`tree_material`] does not carry keeps the
 /// sequence dense. The rule is the material, never a file name, so a corpus that later publishes
 /// those roots extends the prefix here with no edit.
+#[cfg(test)]
 #[must_use]
-pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
-    statements_with_published_tree_material_in(&MirrorFixture::corpus_root(), dir)
+pub(crate) fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
+    statements_with_published_tree_material_in(&crate::test_corpus::corpus_dir(), dir)
 }
 
-/// [`statements_with_published_tree_material`] over a corpus named by the caller.
+/// The longest prefix of `root`'s statements a closure can be answered over, copied into
+/// `dir`; see [`tree_material`] for what "published material" means here.
 ///
-/// An integration test is a separate crate: it links this one without `cfg(test)`, so
-/// [`MirrorFixture::corpus_root`] would fall back to a sibling working tree there. Such a
-/// caller locates the corpus for itself — from the `ahl-core` package `cargo` resolved — and
-/// passes it here, so the corpus a test reads is never decided behind its back.
+/// The corpus is the caller's to name. An integration test is a separate crate, linking this
+/// one without `cfg(test)`, so it locates the corpus for itself — from the `ahl-core` package
+/// `cargo` resolved — and passes it here rather than having one chosen behind its back.
 #[must_use]
 pub fn statements_with_published_tree_material_in(root: &Path, dir: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1216,13 +1245,16 @@ fn tree_material_reaches(payload: &Value, material: &Value) -> bool {
 /// The file name is unique per call: callers routinely pass a shared temporary directory, and
 /// two tests running in parallel writing one name is how a reader ends up seeing a
 /// half-written file.
+#[cfg(test)]
 #[must_use]
-pub fn tree_material_file(dir: &Path) -> PathBuf {
-    tree_material_file_in(&MirrorFixture::corpus_root(), dir)
+pub(crate) fn tree_material_file(dir: &Path) -> PathBuf {
+    tree_material_file_in(&crate::test_corpus::corpus_dir(), dir)
 }
 
-/// [`tree_material_file`] over a corpus named by the caller; see
-/// [`statements_with_published_tree_material_in`] for why a caller names it.
+/// Write [`tree_material`] for the corpus at `root` into `dir` and return the path.
+///
+/// The file name is unique per call, and the corpus is the caller's to name — see
+/// [`statements_with_published_tree_material_in`] for why.
 #[must_use]
 pub fn tree_material_file_in(root: &Path, dir: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1316,11 +1348,12 @@ mod tests {
         // Counted from the corpus rather than pinned to a number: what this asserts is that
         // every published statement is loaded and that the newest checkpoint covers all of
         // them, and a corpus that grows must not turn either into a failure.
-        let published = std::fs::read_dir(MirrorFixture::corpus_root().join("vectors/statements"))
-            .expect("statement vectors")
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-            .count();
+        let published =
+            std::fs::read_dir(crate::test_corpus::corpus_dir().join("vectors/statements"))
+                .expect("statement vectors")
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count();
         let fixture = MirrorFixture::conformance()
             .expect("the conformance corpus publishes the key seeds the fixture signs with");
         assert!(published >= 30, "the corpus should carry 30+ statements, got {published}");
@@ -1436,7 +1469,7 @@ mod tests {
 
     #[test]
     fn the_corpus_policy_carries_the_published_anchor_and_dataset_key() {
-        let policy = corpus_policy(&MirrorFixture::corpus_root());
+        let policy = corpus_policy(&crate::test_corpus::corpus_dir());
         assert!(policy.trust.genesis_entry_id.starts_with("sha256:"));
         assert_eq!(
             policy.trust.genesis_key_ids.as_ref().map(std::collections::BTreeSet::len),
