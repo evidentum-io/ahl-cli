@@ -705,7 +705,7 @@ mod tests {
 
     /// The `ahl-core` conformance corpus, as a foreign implementation would read it.
     fn corpus() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+        crate::test_corpus::corpus_dir()
     }
 
     /// The main toy log's receipt set: `receipts/`.

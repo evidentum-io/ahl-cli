@@ -636,7 +636,7 @@ mod tests {
             .expect("the conformance corpus publishes the key seeds the fixture signs with");
         let vector: Value = serde_json::from_slice(
             &std::fs::read(
-                MirrorFixture::corpus_root()
+                crate::test_corpus::corpus_dir()
                     .join("vectors/closure/non-retroactive-retraction.json"),
             )
             .expect("vector"),

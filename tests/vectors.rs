@@ -284,7 +284,7 @@ fn the_toy_corpus_walks_in_topology_mode_through_the_binary() {
         "closure",
         "--unauthenticated",
         "--corpus",
-        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+        &ahl_cli::testing::statements_with_published_tree_material_in(&corpus(), dir.path())
             .display()
             .to_string(),
         "--tree-material",

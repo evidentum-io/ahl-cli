@@ -460,7 +460,7 @@ mod tests {
         // `toy-corpus` vector is the point: closure is not stable across checkpoints.
         let vector: Value = serde_json::from_slice(
             &std::fs::read(
-                MirrorFixture::corpus_root()
+                crate::test_corpus::corpus_dir()
                     .join("vectors/closure/descendant-enlargement-past-declared-checkpoint.json"),
             )
             .expect("vector"),
@@ -484,8 +484,10 @@ mod tests {
     #[test]
     fn a_trigger_can_be_named_by_statement_id_as_well_as_by_entry_index() {
         let vector: Value = serde_json::from_slice(
-            &std::fs::read(MirrorFixture::corpus_root().join("vectors/closure/toy-corpus.json"))
-                .expect("vector"),
+            &std::fs::read(
+                crate::test_corpus::corpus_dir().join("vectors/closure/toy-corpus.json"),
+            )
+            .expect("vector"),
         )
         .expect("parses");
         let statement_id = vector["trigger"]["statement_id"].as_str().expect("id").to_owned();
@@ -586,8 +588,10 @@ mod tests {
     #[test]
     fn the_authenticated_result_matches_the_published_closure_vector() {
         let vector: Value = serde_json::from_slice(
-            &std::fs::read(MirrorFixture::corpus_root().join("vectors/closure/toy-corpus.json"))
-                .expect("vector"),
+            &std::fs::read(
+                crate::test_corpus::corpus_dir().join("vectors/closure/toy-corpus.json"),
+            )
+            .expect("vector"),
         )
         .expect("parses");
         let expected: Vec<RecordOut> = vector["expected_affected"]

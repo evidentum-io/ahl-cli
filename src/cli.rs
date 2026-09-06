@@ -509,7 +509,6 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::testing::MirrorFixture;
 
     fn argv(args: &[&str]) -> Vec<OsString> {
         std::iter::once(OsString::from("ahl-cli")).chain(args.iter().map(OsString::from)).collect()
@@ -533,7 +532,7 @@ mod tests {
     }
 
     fn corpus() -> PathBuf {
-        MirrorFixture::corpus_root()
+        crate::test_corpus::corpus_dir()
     }
 
     /// A policy file pointing at the conformance corpus, written owner-only.

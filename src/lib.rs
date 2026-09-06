@@ -122,6 +122,10 @@ pub mod report;
 #[cfg(test)]
 mod scripted;
 pub mod secure;
+// The conformance corpus locator, compiled into test code only: nothing shipped spawns
+// `cargo`. Shared by `#[path]` with `tests/common/mod.rs` and the fuzz crate.
+#[cfg(test)]
+mod test_corpus;
 pub mod testing;
 pub mod transcript;
 pub mod witness;

@@ -41,8 +41,8 @@ cargo +nightly fuzz run response fuzz/corpus/response fuzz/seeds/response -- -ma
 The seeds are derived from committed material. `seeds/policy/` holds nine policy files written
 from the corpus trust anchor in `ahl-core/test_data/receipts/index.json`, one per section an
 operator may write. `seeds/receipt/` holds one verifying and one rejecting receipt per claim
-type, across all nine claim types; pass `../ahl-core/test_data/receipts` as a further corpus
-directory to start from the whole committed corpus of 88. `seeds/topology/` holds every published
+type, across all nine claim types; pass the `receipts/` directory of the `ahl-core` corpus as a
+further corpus directory to start from the whole published corpus of 88. `seeds/topology/` holds every published
 statement vector plus the array form a topology run is pointed at. `seeds/response/` holds the
 recorded bodies from `tests/fixtures/mirror-transcript*.json`, deduplicated by content — every
 checkpoint series and consistency body, and the six smallest range bodies, since a range
