@@ -130,11 +130,28 @@ fn synthetic(name: &'static str, byte: &str) -> Option<TestKey> {
 }
 
 impl MirrorFixture {
-    /// The path of the sibling `ahl-core` conformance corpus this repository is developed
-    /// against.
+    /// Where [`Self::conformance`] looks for the `ahl-core` conformance corpus.
+    ///
+    /// `AHL_CORE_TEST_DATA` first, wherever this is compiled. Under `cfg(test)` — the crate's
+    /// own test build — the corpus is then located from the `ahl-core` package `cargo` actually
+    /// resolved, which is correct for a registry dependency and for an outside contributor
+    /// holding no second checkout. That lookup runs `cargo metadata`, so it is compiled into
+    /// test code only: the shipped library and the binaries never spawn a subprocess, and fall
+    /// back to `test_data/` beside an `ahl-core` working tree checked out next to this one —
+    /// the layout `src/bin/gen_fixtures.rs` is run in when the transcripts are regenerated.
     #[must_use]
     pub fn corpus_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+        if let Some(explicit) = std::env::var_os("AHL_CORE_TEST_DATA") {
+            return PathBuf::from(explicit);
+        }
+        #[cfg(test)]
+        {
+            crate::test_corpus::corpus_dir()
+        }
+        #[cfg(not(test))]
+        {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+        }
     }
 
     /// Build the fixture from the conformance corpus.
@@ -1100,13 +1117,23 @@ pub fn tree_material(root: &Path) -> Value {
 /// those roots extends the prefix here with no edit.
 #[must_use]
 pub fn statements_with_published_tree_material(dir: &Path) -> PathBuf {
+    statements_with_published_tree_material_in(&MirrorFixture::corpus_root(), dir)
+}
+
+/// [`statements_with_published_tree_material`] over a corpus named by the caller.
+///
+/// An integration test is a separate crate: it links this one without `cfg(test)`, so
+/// [`MirrorFixture::corpus_root`] would fall back to a sibling working tree there. Such a
+/// caller locates the corpus for itself — from the `ahl-core` package `cargo` resolved — and
+/// passes it here, so the corpus a test reads is never decided behind its back.
+#[must_use]
+pub fn statements_with_published_tree_material_in(root: &Path, dir: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let out = dir.join(format!("statements.{}.{unique}", std::process::id()));
     let _ = std::fs::create_dir_all(&out);
 
-    let root = MirrorFixture::corpus_root();
-    let material = tree_material(&root);
+    let material = tree_material(root);
     let published = |value: &Value| -> bool {
         let Some(payload) = value.get("envelope").and_then(|e| e.get("payload")) else {
             return true;
@@ -1191,11 +1218,17 @@ fn tree_material_reaches(payload: &Value, material: &Value) -> bool {
 /// half-written file.
 #[must_use]
 pub fn tree_material_file(dir: &Path) -> PathBuf {
+    tree_material_file_in(&MirrorFixture::corpus_root(), dir)
+}
+
+/// [`tree_material_file`] over a corpus named by the caller; see
+/// [`statements_with_published_tree_material_in`] for why a caller names it.
+#[must_use]
+pub fn tree_material_file_in(root: &Path, dir: &Path) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("tree-material.{}.{unique}.json", std::process::id()));
-    let bytes = serde_json::to_vec(&tree_material(&MirrorFixture::corpus_root()))
-        .unwrap_or_else(|_| b"{}".to_vec());
+    let bytes = serde_json::to_vec(&tree_material(root)).unwrap_or_else(|_| b"{}".to_vec());
     let _ = std::fs::write(&path, bytes);
     path
 }

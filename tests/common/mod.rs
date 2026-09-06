@@ -23,9 +23,17 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Shared with the crate's own unit tests rather than copied, so the two can never disagree
+// about where the corpus is. An integration test is a separate crate and cannot reach a
+// `#[cfg(test)]` module of the library.
+#[path = "../../src/test_corpus.rs"]
+mod test_corpus;
+
 /// The `ahl-core` conformance corpus this repository is developed against.
+///
+/// Located from the resolved dependency, never from a relative path — see [`test_corpus`].
 pub fn corpus() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+    test_corpus::corpus_dir()
 }
 
 /// The recorded fixtures directory.

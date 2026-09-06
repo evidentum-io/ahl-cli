@@ -1,30 +1,55 @@
 //! Shared fixtures for the `ahl-cli` fuzz targets.
 //!
-//! The policy text is baked in at build time with `include_str!`-style constants, so a target
-//! builds its fixture once and reads no file per input. Every accessor returns an `Option`
-//! rather than asserting: a fixture that failed to build must not be reported as a crash in
-//! the code under test.
+//! The fixture is built once per process and then read from memory, so a target reads no file
+//! per input. Every accessor returns an `Option` rather than asserting: a fixture that failed
+//! to build must not be reported as a crash in the code under test.
 //!
-//! The one path that does touch the filesystem is the adaptor profile document. The client
-//! resolves a pinned profile from local possession **at the point of use**, hashing the bytes
-//! that run read, and that is the behaviour under test; the document is therefore named by an
-//! absolute path fixed at build time rather than held in the policy.
+//! The corpus behind the fixture is `test_data/` inside the resolved `ahl-core`, found at
+//! process start rather than at build time — see [`test_corpus`]. Building it at compile time
+//! would put a sibling working tree between this crate and its own compilation, which a
+//! registry dependency does not provide and an outside contributor does not have. Where the
+//! corpus cannot be found the reason is printed once and every accessor reports `None`.
+//!
+//! The one path that stays a path is the adaptor profile document. The client resolves a
+//! pinned profile from local possession **at the point of use**, hashing the bytes that run
+//! read, and that is the behaviour under test; the document is therefore named by an absolute
+//! path in the fixture policy rather than held in it.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ahl_cli::evaluation::EvaluationTime;
 use ahl_cli::policy::{LoadedPolicy, LocalLimits, NetworkLimits};
 use serde_json::Value;
 
-/// The published conformance corpus this client is tested against.
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ahl-core/test_data");
+// Shared with the crate under test rather than copied, so the two can never disagree about
+// where the corpus is.
+#[path = "../../src/test_corpus.rs"]
+mod test_corpus;
 
-/// The corpus receipt index, which carries the trust anchor the corpus outcomes assume.
-const RECEIPT_INDEX: &str = include_str!("../../../ahl-core/test_data/receipts/index.json");
+/// The published conformance corpus this client is tested against, or `None` with the reason
+/// reported once on stderr.
+///
+/// A fuzz target that silently fuzzed nothing would be worse than one that stops, so the
+/// failure is said out loud; it is not a panic, because a panic raised by the harness itself
+/// would be reported as a finding against the code under test.
+fn corpus() -> Option<&'static Path> {
+    static CORPUS: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CORPUS
+        .get_or_init(|| match test_corpus::locate() {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                eprintln!("ahl-cli-fuzz: {reason}");
+                None
+            }
+        })
+        .as_deref()
+}
 
-/// The dataset HMAC key an authorized verifier holds for the `customers` dataset. Carried
-/// inline as `hex` so the fixture policy names no key file.
-const DATASET_KEY: &str = include_str!("../../../ahl-core/test_data/keys/dataset_customers.key");
+/// A corpus file's text, or `None` where the corpus or the file is unavailable.
+fn corpus_text(relative: &str) -> Option<String> {
+    std::fs::read_to_string(corpus()?.join(relative)).ok()
+}
 
 /// A fixed instant, so no target reads a clock and two runs of one input agree.
 const FIXED_TIME: &str = "2026-08-16T12:00:00Z";
@@ -78,20 +103,22 @@ fn quoted(values: Option<&Vec<Value>>) -> String {
 /// Built from `test_data/receipts/index.json` — never from any receipt — so the fixture and
 /// the corpus cannot drift apart. The dataset key is carried as `hex` rather than as `file`,
 /// so parsing this text opens nothing.
-fn policy_text() -> &'static str {
-    static TEXT: OnceLock<String> = OnceLock::new();
+fn policy_text() -> Option<&'static str> {
+    static TEXT: OnceLock<Option<String>> = OnceLock::new();
     TEXT.get_or_init(|| {
-        let index = parse(RECEIPT_INDEX).unwrap_or(Value::Null);
+        let corpus = corpus()?.display().to_string();
+        let index = parse(&corpus_text("receipts/index.json")?).unwrap_or(Value::Null);
+        let dataset_key = corpus_text("keys/dataset_customers.key")?;
         let policy = index.get("policy").unwrap_or(&Value::Null).clone();
         let profile = policy.pointer("/adaptor_profiles/ahl-test-log-v1");
 
-        format!(
+        Some(format!(
             "[policy]\n\
              genesis_entry_id = \"{genesis}\"\n\
              genesis_key_ids = [{key_ids}]\n\n\
              [policy.adaptor_profiles.{PROFILE_ID}]\n\
              hash = \"{hash}\"\n\
-             path = \"{CORPUS}/adaptor/{PROFILE_ID}.md\"\n\
+             path = \"{corpus}/adaptor/{PROFILE_ID}.md\"\n\
              checkpoint_raw = {raw}\n\
              consistency_proofs = {consistency}\n\n\
              [policy.dataset_keys.customers]\n\
@@ -113,9 +140,10 @@ fn policy_text() -> &'static str {
                 .and_then(|entry| entry.pointer("/capabilities/consistency_proofs"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            key = DATASET_KEY.trim(),
-        )
+            key = dataset_key.trim(),
+        ))
     })
+    .as_deref()
 }
 
 /// The corpus trust policy, with the tightened limits of [`network_limits`].
@@ -127,8 +155,7 @@ pub fn policy() -> Option<&'static LoadedPolicy> {
     static POLICY: OnceLock<Option<LoadedPolicy>> = OnceLock::new();
     POLICY
         .get_or_init(|| {
-            let mut loaded =
-                ahl_cli::policy::from_toml_str(policy_text(), std::path::Path::new(CORPUS)).ok()?;
+            let mut loaded = ahl_cli::policy::from_toml_str(policy_text()?, corpus()?).ok()?;
             loaded.network = network_limits();
             loaded.local = local_limits();
             Some(loaded)

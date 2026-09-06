@@ -287,7 +287,7 @@ mod tests {
     use crate::policy::{Endpoints, LocalLimits, NetworkLimits};
 
     fn corpus() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ahl-core/test_data")
+        crate::test_corpus::corpus_dir()
     }
 
     fn policy() -> LoadedPolicy {

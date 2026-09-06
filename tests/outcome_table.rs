@@ -1184,7 +1184,7 @@ fn row_a_rule_violation_inside_a_topology_corpus_keeps_the_outcome_at_three() {
         "closure",
         "--unauthenticated",
         "--corpus",
-        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+        &ahl_cli::testing::statements_with_published_tree_material_in(&corpus(), dir.path())
             .display()
             .to_string(),
         "--tree-material",
@@ -1535,7 +1535,7 @@ fn the_boundary_between_cannot_parse_topology_input_and_parsed_input_with_violat
         "closure",
         "--unauthenticated",
         "--corpus",
-        &ahl_cli::testing::statements_with_published_tree_material(dir.path())
+        &ahl_cli::testing::statements_with_published_tree_material_in(&corpus(), dir.path())
             .display()
             .to_string(),
         "--tree-material",

@@ -3240,8 +3240,8 @@ mod tests {
         // The oracle is the corpus, not this crate's own idea of the shape: I-D §7.1 closes the
         // element to four members and `ahl-core` rejects a fifth, so the element assembled here
         // is compared with the one the published log-key-rotation vector carries.
-        let vector = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../ahl-core/test_data/receipts/statement-anchored-log-key-rotation.ahl");
+        let vector = crate::test_corpus::corpus_dir()
+            .join("receipts/statement-anchored-log-key-rotation.ahl");
         let bytes = std::fs::read(&vector).expect("the published rotation vector");
         let published: Value = serde_json::from_slice(&bytes).expect("a JSON receipt");
         let published = published

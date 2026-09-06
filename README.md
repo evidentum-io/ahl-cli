@@ -737,19 +737,30 @@ cargo +nightly fuzz build
 The fuzz targets are built on every pull request and run on demand; `fuzz/README.md` gives the
 run commands and says what each target covers.
 
-The recorded network transcripts under `tests/fixtures/` are generated from the committed
-`ahl-core` conformance corpus, with no clock read and no randomness:
+The recorded network transcripts under `tests/fixtures/` are generated from the `ahl-core`
+conformance corpus, with no clock read and no randomness:
 
 ```sh
-cargo run --bin gen_fixtures
+AHL_CORE_TEST_DATA=/path/to/ahl-core/test_data cargo run --bin gen_fixtures
 ```
+
+`gen_fixtures` is the one place that needs the corpus named: set `AHL_CORE_TEST_DATA`, or run it
+beside an `ahl-core` checkout. The tests need no such thing — see below.
 
 Two consecutive runs must leave `tests/fixtures/` byte-identical. If they do not, that is a bug.
 
-Every receipt, closure, statement, checkpoint, Merkle and witness vector in
-`../ahl-core/test_data` is exercised **end-to-end through the built binary** in `tests/`, not
-only through the library: a verifier whose rules are only ever exercised in-process has never
+Every receipt, closure, statement, checkpoint, Merkle and witness vector in the `ahl-core`
+conformance corpus is exercised **end-to-end through the built binary** in `tests/`, not only
+through the library: a verifier whose rules are only ever exercised in-process has never
 demonstrated that its exit codes carry them, and the exit code is what a pipeline reads.
+
+The corpus is `test_data/` inside the `ahl-core` release this crate depends on, and the tests
+find it through the **resolved dependency** rather than through a relative path: `cargo
+metadata` is asked which `ahl-core` was resolved, and the corpus is read from beside its
+manifest — the unpacked registry source in the ordinary case. So `git clone && cargo test` is
+the whole setup, with no second checkout and no environment to arrange. `AHL_CORE_TEST_DATA`
+overrides the lookup where `cargo` is not reachable at run time, or to test against a corpus
+that is not the resolved one.
 
 ## License
 

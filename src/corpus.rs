@@ -448,8 +448,7 @@ mod tests {
     use super::*;
 
     fn corpus_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../ahl-core/test_data/vectors/statements")
+        crate::test_corpus::corpus_dir().join("vectors/statements")
     }
 
     fn limits() -> LocalLimits {
