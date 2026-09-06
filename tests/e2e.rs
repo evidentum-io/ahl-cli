@@ -14,13 +14,14 @@
 //!
 //! * `cargo` and a Rust toolchain able to build the three server crates.
 //! * The sibling checkouts `../ahl-mirror`, `../ahl-witness` and
-//!   `../../evidentum.io/atl-server`, each buildable with `cargo build --release`. The first
-//!   build of `atl-server` needs network access, because its `atl-core` dependency comes from
-//!   crates.io.
-//! * The adaptor profile document `../docs-md/ahl-adaptor-atl-v1.md`. It is read at run time
-//!   and never committed to this crate; the pilot skips with a message naming the path when it
-//!   is absent.
+//!   `../../evidentum.io/atl-server`, each buildable with `cargo build --release`. Building
+//!   them needs network access, because `ahl-core` and `atl-core` come from crates.io.
 //! * Four free loopback ports, and permission to spawn processes.
+//!
+//! The adaptor profile document is **not** among them: the pilot takes the released
+//! `ahl-adaptor-atl-v1` artifact from `ahl_core::ATL_PROFILE_DOCUMENT` and checks its digest
+//! against `ahl_core::ATL_PROFILE_DIGEST` before pinning it, so the profile the pilot verifies
+//! under is the released one and nothing on disk is read to obtain it.
 //!
 //! # What it never touches
 //!
@@ -50,16 +51,32 @@ mod scenario;
 mod stack;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Whether the pilot runs at all. Absent the flag, every test returns without doing anything.
 fn enabled() -> bool {
     std::env::var("AHL_E2E").ok().as_deref() == Some("1")
 }
 
-/// The adaptor profile document, read at run time and never committed here.
-fn profile_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs-md/ahl-adaptor-atl-v1.md")
+/// The released adaptor profile document, and its digest, taken from `ahl-core`.
+///
+/// Adaptor §14 makes a profile its bytes, so the pilot pins bytes it holds rather than a path
+/// into a working tree. The bytes are the released artifact the crate ships, and the digest is
+/// recomputed over them here rather than transcribed: a constant that disagreed with the
+/// document beside it would pin one profile and verify under another.
+///
+/// # Panics
+///
+/// Where the recomputed digest is not [`ahl_core::ATL_PROFILE_DIGEST`].
+fn released_profile() -> (&'static [u8], String) {
+    let bytes = ahl_core::ATL_PROFILE_DOCUMENT;
+    let digest = ahl_core::sha256_hex(bytes);
+    assert_eq!(
+        digest,
+        ahl_core::ATL_PROFILE_DIGEST,
+        "`ATL_PROFILE_DOCUMENT` does not hash to `ATL_PROFILE_DIGEST`"
+    );
+    (bytes, digest)
 }
 
 /// `cadence_epoch`, taken from the clock a second before the run.
@@ -110,21 +127,17 @@ pub enum Start {
 ///
 /// # Errors
 ///
-/// [`Start::Skip`] where a checkout or the adaptor profile document is absent;
-/// [`Start::Failed`] for a build failure, a server that never became ready, or anything else
-/// that goes wrong once the prerequisites are in place.
+/// [`Start::Skip`] where a sibling checkout is absent; [`Start::Failed`] for a build failure, a
+/// server that never became ready, or anything else that goes wrong once the prerequisites are
+/// in place.
 pub fn start() -> Result<Pilot, Start> {
-    let profile = profile_path();
-    stack::preflight(&profile).map_err(Start::Skip)?;
-    inner(&profile).map_err(Start::Failed)
+    stack::preflight().map_err(Start::Skip)?;
+    inner().map_err(Start::Failed)
 }
 
 /// Everything after the prerequisite check, where a failure is a failure.
-fn inner(profile: &Path) -> Result<Pilot, String> {
-    let profile = profile.to_path_buf();
-    let profile_bytes = std::fs::read(&profile)
-        .map_err(|source| format!("cannot read `{}`: {source}", profile.display()))?;
-    let profile_hash = ahl_core::sha256_hex(&profile_bytes);
+fn inner() -> Result<Pilot, String> {
+    let (profile_bytes, profile_hash) = released_profile();
 
     let keys = scenario::Keys::load();
     let epoch = cadence_epoch();
@@ -159,12 +172,11 @@ fn inner(profile: &Path) -> Result<Pilot, String> {
     let work = stack.dir.path().join("work");
     std::fs::create_dir_all(&work)
         .map_err(|source| format!("cannot create a work dir: {source}"))?;
-    // The policy holds a SNAPSHOT of the profile document, not a path into a working tree.
-    // Adaptor §14 makes a profile its bytes, and the bytes a policy pins are the ones it
-    // possesses; reading them live would let an edit made while the run is in flight break a
-    // pin that was correct when it was taken — which is exactly what happened once here.
+    // The policy holds the released profile document on disk, because a policy pins the bytes
+    // it possesses. They come from the crate rather than a working tree, so no edit made while
+    // the run is in flight can break a pin that was correct when it was taken.
     let held = work.join("ahl-adaptor-atl-v1.md");
-    std::fs::write(&held, &profile_bytes)
+    std::fs::write(&held, profile_bytes)
         .map_err(|source| format!("cannot hold the profile document: {source}"))?;
     let policy = scenario::policy_file(&work, &genesis, &keys, &held, &profile_hash, &stack);
     let mut key_files = BTreeMap::new();
@@ -175,6 +187,27 @@ fn inner(profile: &Path) -> Result<Pilot, String> {
     }
 
     Ok(Pilot { stack, keys, genesis, policy, profile_hash, key_files, work })
+}
+
+/// Every receipt the pilot issued pins the RELEASED adaptor profile.
+///
+/// `anchoring.adaptor.hash` is the value a verifier's policy is matched against, so a receipt
+/// that carried anything else would be verified under a profile the pilot never held.
+fn assert_released_profile_pin(replay: &pilot::Replay) {
+    for (name, path) in &replay.receipts {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("the receipt")).expect("JSON");
+        assert_eq!(
+            receipt["anchoring"]["adaptor"]["id"],
+            serde_json::json!(ahl_core::ATL_PROFILE_ID),
+            "`{name}` names another adaptor profile"
+        );
+        assert_eq!(
+            receipt["anchoring"]["adaptor"]["hash"],
+            serde_json::json!(ahl_core::ATL_PROFILE_DIGEST),
+            "`{name}` does not pin the released `ahl-adaptor-atl-v1` digest"
+        );
+    }
 }
 
 /// The continued history is a proof and not a label: the receipt carries a later checkpoint,
@@ -414,6 +447,7 @@ fn the_corpus_story_replays_into_the_live_stack_and_verify_agrees_with_the_oracl
 
     assert_continued_history(&replay);
     assert_rotation_anchor(&rotated);
+    assert_released_profile_pin(&replay);
 
     failures.extend(negatives(&pilot, &replay));
 
@@ -467,10 +501,14 @@ fn the_live_stack_starts_and_binds_to_the_log_the_harness_derived() {
         assert_eq!(cosigned["checkpoint"]["tree_size"], serde_json::json!(1));
     }
 
-    // The policy pins the profile document held on disk this run.
+    // The policy pins the released profile document held on disk this run.
     let policy = std::fs::read_to_string(&pilot.policy).expect("the policy is readable");
     assert!(policy.contains(&pilot.profile_hash), "the policy does not pin the digest it computed");
-    assert!(policy.contains("PILOT-ONLY"), "the pilot-only pin is not stated in the policy");
+    assert_eq!(
+        pilot.profile_hash,
+        ahl_core::ATL_PROFILE_DIGEST,
+        "the pin is not the released `ahl-adaptor-atl-v1` digest"
+    );
     assert_pristine(&before);
     assert_committed_graph(&pilot);
 }

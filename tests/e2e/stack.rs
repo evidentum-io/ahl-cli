@@ -20,7 +20,7 @@
 //! cleared environment, so a stray `ATL_*` in the developer's shell cannot redirect it back.
 
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -38,12 +38,14 @@ const PORT_ATTEMPTS: usize = 5;
 
 /// The sibling checkouts this pilot runs against, relative to this crate's manifest directory.
 const ATL_SERVER: &str = "../../evidentum.io/atl-server";
-const CORE: &str = "../ahl-core";
 const MIRROR: &str = "../ahl-mirror";
 const WITNESS: &str = "../ahl-witness";
 
 /// Every checkout the pilot reads, in the order the pristine check reports them.
-pub const CHECKOUTS: [&str; 4] = [ATL_SERVER, CORE, MIRROR, WITNESS];
+///
+/// `ahl-core` is not among them: `ahl-mirror` and `ahl-witness` take it from the registry, so
+/// the pilot neither reads nor copies a core checkout.
+pub const CHECKOUTS: [&str; 3] = [ATL_SERVER, MIRROR, WITNESS];
 
 /// A running server, its base URL, and the file its output went to.
 pub struct Server {
@@ -189,10 +191,10 @@ fn archive_into(relative: &str, dest: &Path) -> Result<(), String> {
 ///
 /// `--locked` first, because a pilot should run against the graph the repositories committed.
 /// It is not the guarantee that keeps a checkout pristine, though — the scratch copy is — so a
-/// lock that merely needs regenerating is not a reason to refuse to run. That happens routinely
-/// here: `ahl-mirror` and `ahl-witness` depend on `../ahl-core` by path, so a version bump in
-/// `ahl-core` makes both their committed locks stale until someone regenerates them, and the
-/// harness would otherwise be unusable for the whole of that window.
+/// lock that merely needs regenerating is not a reason to refuse to run. That happens whenever
+/// `ahl-mirror` or `ahl-witness` moves its `ahl-core` requirement to a newer release before its
+/// committed lock is regenerated, and the harness would otherwise be unusable for the whole of
+/// that window.
 ///
 /// The fallback is `--offline`, never a plain build: the lock is updated inside the copy, no
 /// network is consulted, and the run says on stderr which graph it used and why. A build that
@@ -385,9 +387,8 @@ fn offline_allowed() -> bool {
 
 /// Build one group of checkouts from scratch copies, and return the named binaries.
 ///
-/// The group travels together because path dependencies do: `ahl-mirror` and `ahl-witness`
-/// depend on `../ahl-core`, so the copies have to keep their siblinghood. The cache key is
-/// every member's `HEAD` tree, so a change to `ahl-core` rebuilds the two that depend on it.
+/// A group is built and cached as one: the cache key is every member's `HEAD` tree, so a change
+/// to any member rebuilds the whole group rather than half of it.
 fn build_group(
     label: &str,
     members: &[&'static str],
@@ -642,11 +643,11 @@ pub fn build_all(
         scratch,
         stale,
     )?;
-    // `ahl-mirror` and `ahl-witness` are path-dependent on `../ahl-core`, so the three copies
-    // keep their siblinghood and share one cache key.
+    // Both take `ahl-core` from the registry, so no core checkout travels with them; they share
+    // one cache key because they are released and moved together.
     let ahl = build_group(
         "ahl",
-        &[CORE, MIRROR, WITNESS],
+        &[MIRROR, WITNESS],
         &[(MIRROR, "ahl-mirror"), (WITNESS, "ahl-witness")],
         cache.as_deref(),
         scratch,
@@ -713,23 +714,18 @@ pub fn start(
     Ok(Stack { stale_locks, dir, log, mirror, witnesses })
 }
 
-/// Whether the pilot may run at all: the three checkouts and the profile document must be here.
-pub fn preflight(profile: &Path) -> Result<(), String> {
+/// Whether the pilot may run at all: the three server checkouts must be here.
+///
+/// The adaptor profile document is not checked, because it is not on disk: the pilot takes the
+/// released artifact from `ahl_core::ATL_PROFILE_DOCUMENT`.
+pub fn preflight() -> Result<(), String> {
     for relative in CHECKOUTS {
         let root = checkout(relative);
         if !root.join("Cargo.toml").is_file() {
             return Err(format!("sibling checkout `{}` is absent", root.display()));
         }
     }
-    match std::fs::metadata(profile) {
-        Ok(_) => Ok(()),
-        Err(source) if source.kind() == ErrorKind::NotFound => Err(format!(
-            "the adaptor profile document `{}` is absent; it is read at run time and never \
-             committed to this crate, so the pilot cannot pin it",
-            profile.display()
-        )),
-        Err(source) => Err(format!("cannot read `{}`: {source}", profile.display())),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
